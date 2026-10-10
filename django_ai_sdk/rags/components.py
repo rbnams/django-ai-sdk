@@ -182,7 +182,7 @@ class BaseMultiQueryRetriever(MultiQueryDeduplicationMixin):
         @component
         class MultiQueryBM25Retriever(BaseMultiQueryRetriever):
             def __init__(self, document_store, top_k=3):
-                super().__init__(document_store, top_k)
+                BaseMultiQueryRetriever.__init__(self, document_store, top_k)
                 from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
                 self._retriever = InMemoryBM25Retriever(
                     document_store=document_store, top_k=top_k
@@ -275,7 +275,9 @@ class MultiQueryBM25Retriever(BaseMultiQueryRetriever):
         document_store: Any,
         top_k: int = 3,
     ) -> None:
-        super().__init__(document_store, top_k)
+        # Named, not super(): @component re-creates the class, so the zero-argument
+        # form names a class this instance is not an instance of.
+        BaseMultiQueryRetriever.__init__(self, document_store, top_k)
 
         self._retriever = InMemoryBM25Retriever(
             document_store=document_store,
