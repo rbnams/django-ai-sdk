@@ -32,4 +32,5 @@ urlpatterns = [
     # The same services as DRF viewsets, for projects built on DRF.
     path("api/v2/", include("django_ai_sdk.contrib.drf.urls")),
     path("api/integrations/", include("django_ai_sdk.integrations.mcp.urls")),
+    path("api/integrations/", include("django_ai_sdk.integrations.webhooks.urls")),
 ]
