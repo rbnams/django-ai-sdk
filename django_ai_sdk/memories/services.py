@@ -835,13 +835,21 @@ class MemoryService(PermissionsMixin):
 
     @classmethod
     async def upload_thread_file(
-        cls, thread_id: str, file: File, *, user: UserType
+        cls, thread_id: str, file: File, *, user: UserType, agent_id: str | None = None
     ) -> DocumentUploadResponse:
-        """Save file and enqueue pipeline processing. Returns immediately with doc_id."""
+        """Save file and enqueue pipeline processing. Returns immediately with doc_id.
+
+        `agent_id` is whichever agent the caller currently has selected for
+        this thread (mirroring how the chat endpoint already trusts a
+        per-message agent_id, not the thread's fixed creation-time one) --
+        falling back to the thread's stored agent for callers that don't
+        pass it, so an upload isn't gated on an agent the user switched away
+        from in the picker.
+        """
         thread = await _aget_or_not_found(
             Thread.objects.select_related("file_memory"), id=thread_id
         )
-        agent_id = thread.metadata.get("agent_id") or None
+        agent_id = agent_id or thread.metadata.get("agent_id") or None
         if agent_id is None:
             raise ValueError("Thread has no agent")
         agent = await AgentService.get(agent_id)
