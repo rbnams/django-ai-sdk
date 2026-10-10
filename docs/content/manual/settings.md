@@ -81,6 +81,15 @@ Settings are read via `getattr(settings, ...)` at call time (cached where noted)
 | `AI_SDK_WORKFLOW_STEPS` | `{}` | Step classes a JSON workflow may compose: `{"gather_thread": "apps.agents.steps.GatherStep"}`. Every type is the host's own — the package ships none. The registry is the gate: a type that is not listed cannot be named by an author. See [Workflows](/manual/workflows/). |
 | `AI_SDK_WORKFLOW_ACTIONS` | `{}` | Actions a definition may hang off the workflow or off one step: `{"console_log": "apps.agents.actions.ConsoleLogAction"}`. Every action is the host's own — the package ships none a definition can name. See [Workflows](/manual/workflows/). |
 
+## Webhooks
+
+For an integration a platform pushes events into. Per-platform keys (`AGENT`, `RUN_AS`, `ALLOW_FROM`, ...) live in `AI_SDK_INTEGRATIONS[<name>]`; see [Webhooks](/manual/webhooks/).
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `AI_SDK_WEBHOOK_TIMEOUT` | `120` | Seconds a webhook-triggered agent run may take before the channel gets a timeout reply instead. |
+| `AI_SDK_WEBHOOK_MAX_TEXT` | `4000` | Characters of the inbound question kept, so the prompt is bounded by the SDK rather than by whatever the platform accepts. |
+
 ## Streaming and Titles
 
 | Setting | Default | Purpose |

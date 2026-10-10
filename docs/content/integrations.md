@@ -40,6 +40,8 @@ get_integrations(["linear", "weather"])   ← integrations registry
 
 `weather` needs no setup at all and works out of the box. The MCP-backed ones connect to an MCP server you configure (see below).
 
+Integrations can also point the other way: `telegram`, `slack` and `github_webhook` receive events a platform pushes in, and an agent answers them in the same channel. See [Webhooks](/manual/webhooks/).
+
 {{< callout type="info" >}}
 `weather` requires no credentials: just add it to `INSTALLED_APPS` and an agent's `integrations` list and it works.
 {{< /callout >}}

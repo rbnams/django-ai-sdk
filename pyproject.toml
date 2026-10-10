@@ -28,6 +28,8 @@ dependencies = [
   "django>=5.2.6,<6.1",
   "haystack-ai>=3.0.0",
   "django-tasks>=0.12.0",
+  # Every outbound platform call in integrations/ goes through httpx.
+  "httpx>=0.28.0",
   "loguru>=0.7.3",
   "puremagic>=2.2.0",
   "pydantic>=2.13.4",
