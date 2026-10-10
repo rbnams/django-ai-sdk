@@ -91,6 +91,12 @@ For an integration a platform pushes events into. Per-platform keys (`AGENT`, `R
 | `AI_SDK_WEBHOOK_TIMEOUT` | `120` | Seconds a webhook-triggered agent run may take before the channel gets a timeout reply instead. |
 | `AI_SDK_WEBHOOK_MAX_TEXT` | `4000` | Characters of the inbound question kept, so the prompt is bounded by the SDK rather than by whatever the platform accepts. |
 
+## Automations
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `AI_SDK_AUTOMATIONS_ENABLED` | `True` | Global kill switch. `False` dispatches nothing, scheduled or by hand. See [Automations](/manual/automations/). |
+
 ## Streaming and Titles
 
 | Setting | Default | Purpose |

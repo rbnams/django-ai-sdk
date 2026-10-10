@@ -24,10 +24,14 @@ PIRATE = PirateBasicAgent().agent_id
 register(
     WorkflowDefinition(
         name="harbour-report",
+        # The turn the run starts from: `harbour-report` in automations.py writes it
+        # on a schedule, an API caller supplies it directly.
+        input_fields={"prompt": FieldDefinition(type="str", description="The turn to start from")},
         steps=[
             StepDefinition(
                 name="forecast",
                 agent_id=PIRATE,
+                history=["prompt"],
                 system_prompt_override=(
                     "Call the weather tool for Rotterdam and report the conditions as a "
                     "ship's log entry. Three sentences. Do not invent a forecast if the "

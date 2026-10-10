@@ -119,6 +119,7 @@ async def open_run(
     record: Any = None,
     status: str = WorkflowRun.Status.PENDING,
     started_at: Any = None,
+    automation: str = "",
 ) -> WorkflowRun:
     """The row one attempt at `workflow` records against."""
     return await WorkflowRun.objects.acreate(
@@ -128,6 +129,7 @@ async def open_run(
         inputs=serialize(inputs or {}),
         user_id=user_pk(user),
         started_at=started_at,
+        automation=automation,
     )
 
 

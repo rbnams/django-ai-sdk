@@ -94,6 +94,8 @@ class WorkflowRun(models.Model):
         on_delete=models.SET_NULL,
         related_name="workflow_runs",
     )
+    # The automation that dispatched this run, if one did. Empty for chat and API runs.
+    automation = models.CharField(max_length=255, blank=True, default="", db_index=True)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
