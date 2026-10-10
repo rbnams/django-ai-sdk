@@ -574,3 +574,22 @@ class TestRunState:
         outputs, _ = await executor.run(workflow, workflow_run=run)
 
         assert outputs == {"result": "already done"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+class TestOpenRun:
+    async def test_an_ordinary_run_carries_no_automation(self):
+        from django_ai_sdk.workflows.executor import open_run
+
+        run = await open_run(make_workflow())
+
+        assert run.automation == ""
+
+    async def test_an_automation_run_is_tagged_with_its_name(self):
+        from django_ai_sdk.workflows.executor import open_run
+
+        run = await open_run(make_workflow(), automation="digest")
+
+        await run.arefresh_from_db()
+        assert run.automation == "digest"

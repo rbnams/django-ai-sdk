@@ -9,6 +9,7 @@ from .agents.models import (
 
 # Conversation models from chats app
 from .artifacts.models import Artifact
+from .automations.models import AutomationState
 from .conversation.models import (
     Message,
     Thread,
@@ -43,6 +44,8 @@ __all__ = [
     "AgentGroup",
     "AgentSettings",
     "AgentUser",
+    # Automations
+    "AutomationState",
     # Workflows
     "WorkflowSettings",
 ]
