@@ -689,6 +689,32 @@ class TestUploadThreadFileRespectsAgentFileUpload:
                     str(thread.id), ContentFile(b"hello", name="a.txt"), user=user
                 )
 
+    async def test_the_selected_agent_decides_not_the_threads_first_one(self):
+        # The thread was started with an agent that refuses files; the person
+        # then picked one that accepts them, and uploads with that one selected.
+        from uuid import uuid4
+
+        from django.core.files.base import ContentFile
+        from django_ai_sdk.agents.models import AgentSettings, AgentUser
+        from django_ai_sdk.memories.services import MemoryService
+
+        thread, user = await self._thread_for(file_upload=False)
+        accepting = await AgentSettings.objects.acreate(
+            name="Accepting", slug=str(uuid4()), agent="test", file_upload=True
+        )
+        await AgentUser.objects.acreate(agent=accepting, user=user)
+
+        with patch.object(
+            MemoryService, "get_or_create_thread_file_memory", AsyncMock(side_effect=RuntimeError)
+        ):
+            with pytest.raises(RuntimeError):
+                await MemoryService.upload_thread_file(
+                    str(thread.id),
+                    ContentFile(b"hello", name="a.txt"),
+                    user=user,
+                    agent_id=str(accepting.id),
+                )
+
 
 
 @pytest.mark.django_db
