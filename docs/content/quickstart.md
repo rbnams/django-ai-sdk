@@ -49,7 +49,7 @@ SDK either.
 
 The `haystack` extra pulls in Haystack and the components agents run on. That's all you need to start.
 
-Want the full set of extras (MCP, vector stores, document parsing, providers)?
+Want the full set of extras (MCP, vector stores, document parsing, providers, TypeSafe)?
 
 ```bash
 pip install "django-ai-sdk[all]"
@@ -62,6 +62,16 @@ pip install "django-ai-sdk[ninja]"  # or: django-ai-sdk[drf]
 ```
 
 See [Views and Routing](/views-and-routing/#pick-a-starting-point).
+
+Optional extras you can install narrowly:
+
+| Extra | Adds |
+| --- | --- |
+| `typesafe` | TypeSafe / Jev client for turn screening and tool gating |
+| `rag` / `chroma` / `qdrant` | Vector stores |
+| `mcp` | MCP integrations |
+| `files` | Document parsers |
+| `automations` | Scheduled workflows |
 
 ## Configure Django
 

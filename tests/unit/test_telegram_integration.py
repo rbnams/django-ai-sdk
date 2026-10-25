@@ -142,6 +142,15 @@ class TestReply:
             "reply_parameters": {"message_id": 11},
         }
 
+    async def test_send_pushes_without_an_inbound_event(self, telegram):
+        post = AsyncMock(return_value=Mock(json=Mock(return_value={"ok": True})))
+        with patch("httpx.AsyncClient.post", post):
+            assert await telegram.send("848151", "reminder due") is True
+        assert post.await_args.kwargs["json"] == {
+            "chat_id": "848151",
+            "text": "reminder due",
+        }
+
     async def test_a_reference_telegram_did_not_issue_is_not_a_reply_target(self, telegram):
         event = self._event()
         event.thread_ref = ""

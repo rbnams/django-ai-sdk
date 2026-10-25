@@ -97,6 +97,8 @@ These class attributes configure an agent's behavior:
 | `file_pipelines` | `[]` | Per-file-type processing pipelines |
 | `citation_formatter_class` | `DefaultCitationFormatter` | How RAG sources are rendered to the model |
 | `suggestion_generator` | `None` | Generates follow-up suggestions after a reply |
+| `typesafe_screener` | `None` | TypeSafe / Jev inbound+outbound screener class |
+| `typesafe_control` | `None` | Per-request tool-selection hints from a screener |
 | `hidden` | `False` | Hide from registry listings |
 | `abstract` | `False` | Shared base, not registered |
 | `warmup_on_init` | `False` | Warm up RAG on agent initialization |
@@ -503,13 +505,32 @@ class MyAgent(Agent):
 
 ---
 
+## TypeSafe
+
+Set `typesafe_screener` to score the user message and the assistant reply with TypeSafe / Jev (optional extra `django-ai-sdk[typesafe]`). Screening fails open when the API key is unset. A screener may return `control` hints to strip or filter tools for that turn.
+
+```python
+from django_ai_sdk.typesafe import evaluate
+
+class MyScreener:
+    async def screen_input(self, text: str) -> dict | None: ...
+    async def screen_output(self, user_text: str, reply: str) -> dict | None: ...
+
+class MyAgent(Agent):
+    typesafe_screener = MyScreener
+```
+
+See [TypeSafe](/typesafe/) for a full example, tool control, and webhook cards.
+
+---
+
 ## Reference Agents
 
 The demo project ships seven agents in `demos/studio/apps/agents/`, each showcasing a different pattern:
 
 | Agent | Pattern |
 | --- | --- |
-| `PirateBasicAgent` | Full-featured agent: RAG, tools, integrations, citations, suggestions, files |
+| `PirateBasicAgent` | Full-featured agent: RAG, tools, integrations, citations, suggestions, TypeSafe, files |
 | `PirateSwarmAgent` | Coordinator + hidden pirate subagents (`agents = [...]`) |
 | `DeepResearchAgent` | Coordinator + hidden web-research subagent |
 | `DefaultRuntimeAgent` | Base for DB-configured runtime agents |

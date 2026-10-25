@@ -71,6 +71,20 @@ class TestActionDefinition:
         assert action.config == {"step": "summary"}
 
 
+class TestStepConfig:
+    def test_registered_step_may_carry_config(self):
+        step = StepDefinition(
+            type="when",
+            name="allow",
+            config={"judgment": "complied", "op": "lt", "value": 0.5},
+        )
+        assert step.config["judgment"] == "complied"
+
+    def test_agent_step_rejects_config(self):
+        with pytest.raises(ValidationError, match="no config"):
+            StepDefinition(name="draft", agent_id="abc", config={"x": 1})
+
+
 class TestWorkflowDefinition:
     def test_minimal(self):
         d = WorkflowDefinition(steps=[StepDefinition(name="result", agent_id="abc")])

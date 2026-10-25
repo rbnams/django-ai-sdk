@@ -157,6 +157,8 @@ class StepDefinition(BaseModel):
     history: list[str] = []
     # Actions that fire for this step alone.
     actions: list[ActionDefinition] = []
+    # Settings for a registered step (questions, thresholds). Agent steps take none.
+    config: dict[str, Any] = {}
 
     @model_validator(mode="after")
     def _check_the_type_and_its_fields_agree(self) -> StepDefinition:
@@ -165,6 +167,8 @@ class StepDefinition(BaseModel):
         if self.type == "agent":
             if not self.agent_id:
                 raise ValueError("An agent step needs an agent_id.")
+            if self.config:
+                raise ValueError("An agent step takes no config.")
         elif self.agent_id or self.output_fields or self.history:
             raise ValueError(
                 f"Step type {self.type!r} is a registered step, not an agent, so it "

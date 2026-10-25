@@ -45,6 +45,7 @@ stream = Stream(
     storage_adapter=storage,      # where to persist it
     citation_registry=registry,   # citation numbering (RAG)
     suggestion_generator=gen,     # follow-up questions
+    typesafe_screener=screener,   # optional TypeSafe / Jev cards
 )
 ```
 
@@ -71,14 +72,16 @@ Any Haystack pipeline works: the only requirement is that it accepts `messages` 
 `await stream.stream(messages)` is an async generator of `StreamEvent`s:
 
 1. **`MessageStartEvent`**: carries the `message_id`, generated **once** here as a UUID
-2. **`TextChunkEvent`**: one per chunk from the model
-3. **`ToolCallStartEvent`** / **`ToolInputCompleteEvent`** / **`ToolOutputEvent`**: tool calls as they happen
-4. **`SourceEvent`**: RAG sources, streamed with citation indices
-5. **`TextEndEvent`**: the answer's text is complete; citations are placed after it
-6. **`MessageEndEvent`**: after the message is finalized
-7. **`SuggestionEvent`**: optional follow-up suggestions
-8. **`StreamEndEvent`**: the run is done
-9. **`ErrorEvent`**: pipeline failures, instead of a hanging stream
+2. **`DataEvent` (`typesafe`)**: optional inbound TypeSafe card; may apply tool `control` before the LLM runs
+3. **`TextChunkEvent`**: one per chunk from the model
+4. **`ToolCallStartEvent`** / **`ToolInputCompleteEvent`** / **`ToolOutputEvent`**: tool calls as they happen
+5. **`SourceEvent`**: RAG sources, streamed with citation indices
+6. **`TextEndEvent`**: the answer's text is complete; citations are placed after it
+7. **`DataEvent` (`typesafe`)**: optional outbound TypeSafe card (before message end)
+8. **`MessageEndEvent`**: after the message is finalized
+9. **`SuggestionEvent`**: optional follow-up suggestions
+10. **`StreamEndEvent`**: the run is done
+11. **`ErrorEvent`**: pipeline failures, instead of a hanging stream
 
 Events carry structured data, so protocol handlers render them into their own format.
 

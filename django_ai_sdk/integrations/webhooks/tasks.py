@@ -77,6 +77,19 @@ async def run_inbound(payload: dict[str, Any]) -> None:
     user_message = ChatMessage(role="user", content=event.text)
     messages = [*history, user_message]
 
+    screener = agent.get_typesafe_screener()
+    # Await inbound before agent.run so control hints can filter get_tools().
+    inbound_payload: dict[str, Any] | None = None
+    if screener is not None:
+        inbound_payload = await _safe_screen_input(screener, event.text)
+        if inbound_payload:
+            from django_ai_sdk.typesafe.control import enrich_payload_acted
+
+            control = inbound_payload.get("control")
+            if isinstance(control, dict):
+                agent.typesafe_control = control
+                inbound_payload = enrich_payload_acted(inbound_payload)
+
     timeout = resolve_setting("AI_SDK_WEBHOOK_TIMEOUT", 120)
     token = current_event.set(event)
     try:
@@ -99,13 +112,48 @@ async def run_inbound(payload: dict[str, Any]) -> None:
         text = ERROR_MESSAGE
     finally:
         current_event.reset(token)
+        agent.typesafe_control = None
 
     reply_text = str(text) if text else ERROR_MESSAGE
-    # The fallbacks are persisted too: the channel shows them, so a thread that
-    # omitted them would disagree with what the person can scroll back to.
+    # Score cards are channel chrome only — never store them, or the next turn
+    # feeds Jev's numbers back into the model. When typesafe_publish is on,
+    # three posts: inbound card → answer → reply card. When it is off, the
+    # inbound screen still ran (for control hints) and only the answer is posted.
     if storage is not None:
         await _persist_turn(storage, user_message, reply_text)
-    await integration.reply(event, reply_text)
+
+    publish_scores = getattr(agent, "typesafe_publish", True)
+    if (
+        publish_scores
+        and screener is not None
+        and reply_text not in (TIMEOUT_MESSAGE, ERROR_MESSAGE)
+    ):
+        from django_ai_sdk.typesafe.format import format_typesafe_card
+
+        if inbound_payload:
+            await integration.reply(event, format_typesafe_card(inbound_payload))
+        await integration.reply(event, reply_text)
+        outbound_payload = await _safe_screen_output(screener, event.text, reply_text)
+        if outbound_payload:
+            await integration.reply(event, format_typesafe_card(outbound_payload))
+    else:
+        await integration.reply(event, reply_text)
+
+
+async def _safe_screen_input(screener: Any, text: str) -> dict[str, Any] | None:
+    try:
+        return await screener.screen_input(text)
+    except Exception:
+        logger.exception("TypeSafe inbound screen failed on webhook; continuing")
+        return None
+
+
+async def _safe_screen_output(screener: Any, user_text: str, reply: str) -> dict[str, Any] | None:
+    try:
+        return await screener.screen_output(user_text, reply)
+    except Exception:
+        logger.exception("TypeSafe outbound screen failed on webhook; continuing")
+        return None
 
 
 async def _load_conversation(

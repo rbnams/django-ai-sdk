@@ -90,6 +90,10 @@ AI_SDK_PERMISSIONS = {
 
 # A vision-capable model for VisionAgent
 AI_SDK_VISION_MODEL = env("AI_SDK_VISION_MODEL", default=None)
+
+# TypeSafe / Jev (optional; screening fails open when unset)
+TYPESAFE_API_KEY = env("TYPESAFE_API_KEY", default=None)
+TYPESAFE_MODEL = env("TYPESAFE_MODEL", default="jev-latest")
 AI_SDK_VISION_AGENT = "apps.agents.vision.VisionAgent" if AI_SDK_VISION_MODEL else None
 
 # The thread-file download view

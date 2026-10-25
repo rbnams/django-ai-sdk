@@ -16,6 +16,7 @@ All events live in `django_ai_sdk.events` and subclass `StreamEvent`.
 | `TextChunkEvent` | Text token | `content` |
 | `ReasoningChunkEvent` | Reasoning token | `content` |
 | `DataEvent` | Arbitrary structured data | `data_type`, `data` |
+| `DataEvent` (`typesafe`) | TypeSafe / Jev score card | `data_type="typesafe"`, `data` with `side`, `judgments`, optional `control` / `acted` |
 | `ToolCallStartEvent` | Tool call begins | `tool_call_id`, `tool_name` |
 | `ToolInputChunkEvent` | Incremental tool args | `tool_call_id`, `input_chunk` |
 | `ToolInputCompleteEvent` | Tool args ready | `tool_call_id`, `tool_name`, `tool_input` |

@@ -114,15 +114,22 @@ class TelegramIntegration(WebhookIntegration):
             return False
         return bool(message.get("text"))
 
-    async def reply(self, event: InboundEvent, text: str) -> None:
+    async def send(
+        self, chat_id: str, text: str, *, reply_to: str | None = None
+    ) -> bool:
+        """Push a message into a chat without an inbound webhook event.
+
+        Used by scheduled pings (wiki gardener) and by ``reply``. Returns whether
+        Telegram accepted the send; refusals are logged, not raised.
+        """
         payload: dict[str, Any] = {
-            "chat_id": event.conversation_id,
+            "chat_id": chat_id,
             "text": text[:MAX_MESSAGE_LENGTH],
         }
         # Telegram numbers its messages, so a reference it did not produce is not a
         # reply target; the answer lands in the chat instead of failing to send.
-        if event.thread_ref.isdigit():
-            payload["reply_parameters"] = {"message_id": int(event.thread_ref)}
+        if reply_to and str(reply_to).isdigit():
+            payload["reply_parameters"] = {"message_id": int(reply_to)}
 
         async with httpx.AsyncClient(timeout=SEND_TIMEOUT_SECONDS) as client:
             response = await client.post(
@@ -133,10 +140,15 @@ class TelegramIntegration(WebhookIntegration):
         body = _as_json(response)
         if not body.get("ok"):
             logger.error(
-                "Telegram refused a reply to %s: %s",
-                event.conversation_id,
+                "Telegram refused a send to %s: %s",
+                chat_id,
                 body.get("description", response.status_code),
             )
+            return False
+        return True
+
+    async def reply(self, event: InboundEvent, text: str) -> None:
+        await self.send(event.conversation_id, text, reply_to=event.thread_ref or None)
 
 
 def _as_json(response: httpx.Response) -> dict[str, Any]:

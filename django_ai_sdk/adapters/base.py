@@ -28,6 +28,7 @@ from django_ai_sdk.common import (
 )
 from django_ai_sdk.errors import ErrorInfo, describe_error
 from django_ai_sdk.events import (
+    DataEvent,
     ErrorEvent,
     MessageEndEvent,
     MessageStartEvent,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from django_ai_sdk.adapters.suggestions import SuggestionGenerator
     from django_ai_sdk.artifacts.tool_artifacts import ToolArtifact
     from django_ai_sdk.storage.base import BaseStorageAdapter
+    from django_ai_sdk.typesafe import TypeSafeScreener
 
 
 logger = get_logger(__name__)
@@ -293,6 +295,7 @@ class Stream:
     _grounder: Grounder | None = None
     # the citations tool call shown while the answer streams
     _citations_call_id: str | None = None
+    typesafe_screener: TypeSafeScreener | None = None
 
     # Message processing configuration
     merge_messages: bool = False
@@ -305,6 +308,7 @@ class Stream:
         storage_adapter: BaseStorageAdapter | None = None,
         citation_registry: SourceRegistry | None = None,
         suggestion_generator: SuggestionGenerator | None = None,
+        typesafe_screener: TypeSafeScreener | None = None,
     ) -> None:
         self.pipeline = pipeline
         if not isinstance(pipeline, Pipeline):
@@ -317,6 +321,7 @@ class Stream:
         self.storage_adapter = storage_adapter
         self.citation_registry = citation_registry
         self.suggestion_generator = suggestion_generator
+        self.typesafe_screener = typesafe_screener
         self._persisted_tool_ids: set[str] = set()
         self._persisted_tool_output_ids: set[str] = set()
         self.message_result: ChatMessage | None = None
@@ -803,6 +808,59 @@ class Stream:
             logger.opt(exception=e).error("Error generating suggestions: {}", e)
         return None
 
+    async def get_typesafe_input_screen(self, messages: list[ChatMessage]) -> DataEvent | None:
+        """Score the latest user message; fail-open when screening is unavailable.
+
+        When the payload includes ``control`` hints, apply them to this stream's
+        Haystack agent tools before generation starts.
+        """
+        if not self.typesafe_screener:
+            return None
+        text = ""
+        for message in reversed(messages):
+            if message.role == "user" and message.content:
+                text = message.content
+                break
+        if not text:
+            return None
+        try:
+            payload = await self.typesafe_screener.screen_input(text)
+        except Exception:
+            logger.exception("TypeSafe inbound screen failed; continuing without scores")
+            return None
+        if not payload:
+            return None
+        from django_ai_sdk.typesafe.control import (
+            apply_control_to_agent_component,
+            enrich_payload_acted,
+        )
+
+        control = payload.get("control") if isinstance(payload, dict) else None
+        if isinstance(control, dict):
+            apply_control_to_agent_component(self.agent_component, control)
+            payload = enrich_payload_acted(payload)
+        return DataEvent(data_type="typesafe", data=payload)
+
+    async def get_typesafe_output_screen(self, messages: list[ChatMessage]) -> DataEvent | None:
+        """Score the finished assistant reply; fail-open when screening is unavailable."""
+        if not self.typesafe_screener or not self.message_result or not self.message_result.content:
+            return None
+        user_text = ""
+        for message in reversed(messages):
+            if message.role == "user" and message.content:
+                user_text = message.content
+                break
+        try:
+            payload = await self.typesafe_screener.screen_output(
+                user_text, self.message_result.content
+            )
+        except Exception:
+            logger.exception("TypeSafe outbound screen failed; continuing without scores")
+            return None
+        if not payload:
+            return None
+        return DataEvent(data_type="typesafe", data=payload)
+
     async def stream(
         self,
         messages: list[ChatMessage],
@@ -840,6 +898,10 @@ class Stream:
 
         try:
             yield MessageStartEvent(message_id=message_id)
+
+            # Inbound TypeSafe card before the LLM starts; may apply control hints.
+            if screen := await self.get_typesafe_input_screen(messages):
+                yield screen
 
             # take snapshots of current contextvars
             # The task copies the context: tools register sources in this turn's registry.
@@ -890,6 +952,10 @@ class Stream:
                 yield event
             await self.get_final_message(stream_writer)
             _finalize_called = True
+
+            # Outbound TypeSafe card before message_end so it lands on this assistant turn.
+            if screen := await self.get_typesafe_output_screen(messages):
+                yield screen
 
             yield MessageEndEvent()
 

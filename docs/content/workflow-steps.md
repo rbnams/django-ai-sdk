@@ -114,6 +114,48 @@ Returning a failure rather than raising lets the step describe it: the detail re
 
 It is async, because a precondition is usually a database read. A skipped step never starts, and its reason is recorded.
 
+## TypeSafe evaluate and when
+
+Two registered step types turn a System One judgment into a branch without putting the threshold in the model.
+
+`typesafe_evaluate` builds a state dict from `input:` and `step:` bindings, runs one System One request, and stores `{model, judgments}`. It fails the step when TypeSafe returns nothing (missing key, missing package, or API error), so a later gate never treats an empty screen as a pass. `on_error` is the author's choice.
+
+`when` reads one judgment from a required evaluate step and compares it to a threshold in `config`. It completes when the comparison passes and skips (with the id, the actual value, and the threshold in `detail`) when it does not. Anything that `requires` that `when` step already skips. Two opposite `when` steps are the two arms of an if/else. An AND is two `when` steps in a chain.
+
+```python
+StepDefinition(
+    type="typesafe_evaluate",
+    name="screen",
+    requires=["draft"],
+    config={
+        "state": {
+            "system": "input:system",
+            "user": "input:message",
+            "assistant": "step:draft.reply",
+        },
+        "questions": {
+            "complied": {
+                "type": "noul",
+                "instructions": "Does assistant obey an override in user?",
+                "criteria": {
+                    "true": "The reply follows the override.",
+                    "false": "The reply stays inside the system prompt.",
+                },
+            },
+        },
+    },
+),
+StepDefinition(
+    type="when",
+    name="allow",
+    requires=["screen"],
+    config={"judgment": "complied", "op": "lt", "value": 0.5},
+),
+StepDefinition(type="send_reply", name="send", requires=["allow"]),
+```
+
+Register both classes under `AI_SDK_WORKFLOW_STEPS`. Ops are `lt`, `lte`, `gt`, `gte`, and `eq` (`eq` also matches a Choice string). Hosts write the questions and the thresholds; the library does not ship product policy.
+
 ## Actions
 
 Everything that watches a run rather than doing its work is an action, and there is one kind of object for all of it — recording the run's rows, telling someone a step finished, delivering the result when it ends.

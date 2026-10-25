@@ -110,6 +110,10 @@ Keys: `WEBHOOK_SECRET`, `TOKEN` (may comment on the repositories), `ALLOW_WORKSP
 
 Add a repository or organization webhook for the `pull_request` event with a sha256 secret. The agent runs on a pull request that is opened, reopened, pushed to or marked ready for review (`ACTIONS` changes the list); drafts wait. The event text names the pull request; the agent's instructions say what a review is, and it needs the `github` integration to read the diff. The answer is posted as a PR comment, and a new push continues the same thread. A push by `BOT_USERNAME` is ignored.
 
+## TypeSafe screening
+
+When the agent resolved by `AGENT` has `typesafe_screener` set, `run_inbound` screens the inbound text before `agent.run()`, applies any `control` hints via `agent.typesafe_control`, then posts plain-text TypeSafe cards as separate channel replies (inbound card → answer → outbound card). Cards are not stored on the thread. Requires `django-ai-sdk[typesafe]` and `TYPESAFE_API_KEY`. See [TypeSafe](/typesafe/).
+
 ## Known limitations
 
 - A reply that fails to post is logged, not retried.

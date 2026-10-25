@@ -151,7 +151,16 @@ def _compile_step(
     step.name = declared.name
     step.requires = tuple(declared.requires)
     step.on_error = OnError(declared.on_error)
+    step.config = dict(declared.config)
     step.actions = tuple(compile_actions(declared.actions, declared.name, action_registry))
+    validate = getattr(step, "validate_config", None)
+    if callable(validate):
+        try:
+            validate()
+        except ValueError as exc:
+            raise ImproperlyConfigured(
+                f"Workflow step {declared.name!r} config is invalid: {exc}"
+            ) from exc
     return step
 
 

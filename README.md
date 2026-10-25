@@ -118,6 +118,8 @@ async def chat(request, payload: ChatRequest):
   circuit breaking and OAuth built in.
 - **Tracing**: Opt-in Haystack tracing persisted to the ORM, with per-thread and
   per-message token accounting.
+- **TypeSafe**: Optional Jev judgments on chat turns — score cards, tool gating via
+  `control` hints, webhook channel footers. Install `django-ai-sdk[typesafe]`.
 - **Reindexing**: Hot-reload documents. Cached embeddings with simple refresh API.
 
 ## Documentation

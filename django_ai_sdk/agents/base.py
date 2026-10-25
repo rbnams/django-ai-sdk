@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from django_ai_sdk.files.pipeline import FilePipeline
     from django_ai_sdk.rags.schemas import RagDocument
     from django_ai_sdk.storage.base import BaseStorageAdapter
+    from django_ai_sdk.typesafe import TypeSafeScreener
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -248,6 +249,20 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
 
     # Suggestion generator class for follow-up questions.
     suggestion_generator: type[SuggestionGenerator] | None = None
+
+    # Opt-in TypeSafe screener (Jev judgments on inbound/outbound turns).
+    # Wired onto Stream and webhook run_inbound when set.
+    typesafe_screener: type[TypeSafeScreener] | None = None
+
+    # Webhook channels post inbound/outbound score cards when this is true.
+    # False still runs the inbound screen (control hints) and skips the cards
+    # and the outbound screen. Web chat does not read this flag.
+    typesafe_publish: bool = True
+
+    # Per-request tool-selection hints from a screener payload's ``control``
+    # dict (``strip_tools``, ``skip_rag``, ``remove_tool_names``). Set by
+    # webhook run_inbound or the host before ``get_tools()``; clear after.
+    typesafe_control: dict[str, Any] | None = None
 
     # Generator factory from django_ai_sdk.generators, e.g. `openai_responses_chat`.
     # Assign the factory itself, never call it: get_llm() builds it with this
@@ -495,6 +510,12 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         """
         return []
 
+    def get_typesafe_screener(self) -> TypeSafeScreener | None:
+        """Return an inbound TypeSafe screener, or None to skip."""
+        if not self.typesafe_screener:
+            return None
+        return self.typesafe_screener()
+
     async def get_tools(
         self,
         thread_id: str = "",
@@ -530,7 +551,10 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         # info about uploaded files
         result.extend(self.get_attachment_tools(thread_id))
 
-        return result
+        # Optional TypeSafe control hints (set by webhook / host before run).
+        from django_ai_sdk.typesafe.control import apply_tool_control
+
+        return apply_tool_control(result, self.typesafe_control)
 
     async def get_agent_tools(
         self,
@@ -1172,6 +1196,8 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
             suggestion_generator = self.get_suggestion_generator()
             if suggestion_generator:
                 adapter.suggestion_generator = suggestion_generator
+            if screener := self.get_typesafe_screener():
+                adapter.typesafe_screener = screener
             if required_tools := self.get_run_required_tools(messages):
                 adapter.hook_context = {"required_tools": required_tools}
             # Artifacts are stored on the thread: none without one.

@@ -89,6 +89,9 @@ class Step:
 
     actions: tuple[WorkflowAction, ...] = ()
 
+    # Settings from the StepDefinition. Agent steps leave this empty.
+    config: dict[str, Any] = {}
+
     async def skip_when(self, ctx: WorkflowContext) -> str:
         """A reason to skip, or "" to run.
 
