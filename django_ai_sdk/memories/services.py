@@ -16,7 +16,7 @@ from django.utils import timezone
 from django_ai_sdk.agents.services import AgentService
 from django_ai_sdk.conversation.models import Thread
 from django_ai_sdk.errors import ErrorCode, NotFound, UserError, get_error_spec
-from django_ai_sdk.files.common import compute_file_hash
+from django_ai_sdk.files.common import compute_file_hash, get_upload_settings
 from django_ai_sdk.logger import get_logger
 from django_ai_sdk.memories.models import (
     Entry,
@@ -35,7 +35,10 @@ from django_ai_sdk.memories.schemas import (
     MemoryUserOut,
     ThreadMemoryOut,
 )
-from django_ai_sdk.memories.tasks import PIPELINE_TIMEOUT_SECONDS, process_document_upload
+from django_ai_sdk.memories.tasks import (
+    PIPELINE_TIMEOUT_SECONDS,
+    process_document_upload,
+)
 from django_ai_sdk.permissions import (
     ConflictError,
     Operation,
@@ -98,6 +101,17 @@ async def _aget_or_not_found(qs: Any, **lookup: Any) -> Any:
         return await qs.aget(**lookup)
     except ObjectDoesNotExist:
         raise NotFound(f"{qs.model.__name__} not found") from None
+
+
+def _document_pdf(document: EntryDocument) -> bytes:
+    """A stored document as a PDF, converted when it is not one."""
+    from django_ai_sdk.files.previews import to_pdf
+
+    with document.file.open("rb") as file:
+        pdf = to_pdf(file.read(), document.file_extension)
+    if pdf is None:
+        raise NotFound("No preview for this document")
+    return pdf
 
 
 async def _fail_orphaned_processing_document(
@@ -163,6 +177,23 @@ def _document_status_out(
         processing_step=entry_doc.processing_step,
         task=task_status,
     )
+
+
+def _memory_user_out(share: MemoryUser) -> MemoryUserOut:
+    return MemoryUserOut(
+        user_id=str(share.user_id),
+        email=getattr(share.user, "email", "") or "",
+        first_name=getattr(share.user, "first_name", "") or "",
+        last_name=getattr(share.user, "last_name", "") or "",
+        can_manage=share.can_manage,
+        created_at=share.created_at.isoformat(),
+    )
+
+
+def _check_upload_size(file: File) -> None:
+    max_size = get_upload_settings().max_upload_size
+    if (file.size or 0) > max_size:
+        raise UserError(f"File too large. Maximum size is {max_size // (1024 * 1024)} MB.")
 
 
 class MemoryService(PermissionsMixin):
@@ -234,14 +265,7 @@ class MemoryService(PermissionsMixin):
         qs = memory.memory_users.all().select_related("user")[
             offset : offset + limit if limit is not None else None
         ]
-        return [
-            MemoryUserOut(
-                user_id=str(o.user_id),
-                can_manage=o.can_manage,
-                created_at=o.created_at.isoformat(),
-            )
-            async for o in qs
-        ]
+        return [_memory_user_out(o) async for o in qs]
 
     @classmethod
     async def add_memory_user(
@@ -262,11 +286,7 @@ class MemoryService(PermissionsMixin):
             user=target_user,
             defaults={"can_manage": can_manage},
         )
-        return MemoryUserOut(
-            user_id=str(ownership.user_id),
-            can_manage=ownership.can_manage,
-            created_at=ownership.created_at.isoformat(),
-        )
+        return _memory_user_out(ownership)
 
     @classmethod
     async def update_memory_user(
@@ -285,11 +305,7 @@ class MemoryService(PermissionsMixin):
         )
         ownership.can_manage = can_manage
         await ownership.asave(update_fields=["can_manage"])
-        return MemoryUserOut(
-            user_id=str(ownership.user_id),
-            can_manage=ownership.can_manage,
-            created_at=ownership.created_at.isoformat(),
-        )
+        return _memory_user_out(ownership)
 
     @classmethod
     async def remove_memory_user(cls, memory_id: str, user_id: str, *, user: UserType) -> None:
@@ -522,6 +538,7 @@ class MemoryService(PermissionsMixin):
         """Save file and enqueue pipeline processing. Returns immediately with doc_id."""
         memory = await _aget_or_not_found(Memory.objects, id=memory_id)
         await cls.has_perms(user, Operation.UPLOAD_DOCUMENT, memory)
+        _check_upload_size(file)
         return await cls._create_document(memory_id, file, user=user)
 
     @classmethod
@@ -863,6 +880,7 @@ class MemoryService(PermissionsMixin):
         )
         if not agent.file_upload:
             raise PermissionDenied("Not permitted to upload files")
+        _check_upload_size(file)
         memory = await cls.get_or_create_thread_file_memory(thread_id)
 
         file_name = file.name or ""
@@ -1237,6 +1255,88 @@ class MemoryService(PermissionsMixin):
         return entry.content
 
     @classmethod
+    async def _get_source(cls, *, user: UserType, **lookup: str) -> EntryDocument:
+        """A knowledge-base document with a preview"""
+        from django_ai_sdk.files.previews import IMAGE_EXTENSIONS, PREVIEW_EXTENSIONS
+
+        if not all(map(_is_uuid, lookup.values())):
+            raise NotFound("Document not found")
+
+        document = await _aget_or_not_found(
+            EntryDocument.objects.select_related("memory"), **lookup
+        )
+        await cls.has_perms(user, Operation.VIEW_DOCUMENT, document.memory)
+        shown = PREVIEW_EXTENSIONS | IMAGE_EXTENSIONS
+        if document.file_extension.lower() not in shown or not document.file:
+            raise NotFound("No preview for this document")
+        return document
+
+    @classmethod
+    async def get_source_document(
+        cls, entry_id: str, quotes: list[str], *, user: UserType
+    ) -> tuple[EntryDocument, int | None]:
+        """The original document behind a cited source (its ``documentId``), and the
+        page that holds the cited passages ``quotes`` (None when not found, and for
+        an image: it is shown as itself, see ``get_source_file``).
+
+        Raises:
+            NotFound: No document with a preview for this entry.
+            PermissionDenied: `user` may not view the entry's documents.
+        """
+        from django_ai_sdk.files.previews import IMAGE_EXTENSIONS, quote_page
+
+        document = await cls._get_source(entry_id=entry_id, user=user)
+        if not quotes or document.file_extension.lower() in IMAGE_EXTENSIONS:
+            return document, None
+
+        def find() -> int | None:
+            return quote_page(_document_pdf(document), quotes)
+
+        return document, await sync_to_async(find, thread_sensitive=False)()
+
+    @classmethod
+    async def get_source_file(cls, doc_id: str, *, user: UserType) -> EntryDocument:
+        """A cited knowledge-base document (one with a preview, or an image), for a
+        user who may view its memory's documents.
+
+        Raises:
+            NotFound: No such document, or none with a preview.
+            PermissionDenied: `user` may not view the memory's documents.
+        """
+        return await cls._get_source(id=doc_id, user=user)
+
+    @classmethod
+    async def get_source_pdf(cls, doc_id: str, *, user: UserType) -> tuple[EntryDocument, bytes]:
+        """A knowledge-base document as a PDF (converted when it is not one).
+
+        Raises:
+            NotFound: No such document, or none with a preview.
+            PermissionDenied: `user` may not view the memory's documents.
+        """
+        document = await cls._get_source(id=doc_id, user=user)
+        pdf = await sync_to_async(_document_pdf, thread_sensitive=False)(document)
+        return document, pdf
+
+    @classmethod
+    async def render_source_page(
+        cls, doc_id: str, page: int, quotes: list[str], *, user: UserType
+    ) -> tuple[bytes, str]:
+        """Page ``page`` of a knowledge-base document as a PNG with ``quotes``
+        marked, and where the marks are (see ``files.previews.render_page``).
+
+        Raises:
+            NotFound: No such document or page.
+            PermissionDenied: `user` may not view the memory's documents.
+        """
+        from django_ai_sdk.files.previews import render_page
+
+        _, pdf = await cls.get_source_pdf(doc_id, user=user)
+        rendered = await sync_to_async(render_page, thread_sensitive=False)(pdf, page, quotes)
+        if rendered is None:
+            raise NotFound(f"No page {page} in document {doc_id}")
+        return rendered
+
+    @classmethod
     async def resolve_attachments(
         cls,
         thread_id: str,
@@ -1377,3 +1477,7 @@ remove_memory_user = async_to_sync(MemoryService.remove_memory_user)
 add_memory_group = async_to_sync(MemoryService.add_memory_group)
 remove_memory_group = async_to_sync(MemoryService.remove_memory_group)
 list_memory_groups = async_to_sync(MemoryService.list_memory_groups)
+get_source_document = async_to_sync(MemoryService.get_source_document)
+get_source_file = async_to_sync(MemoryService.get_source_file)
+get_source_pdf = async_to_sync(MemoryService.get_source_pdf)
+render_source_page = async_to_sync(MemoryService.render_source_page)

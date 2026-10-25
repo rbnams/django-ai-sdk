@@ -6,8 +6,6 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from authlib.integrations.base_client.errors import OAuthError
-from authlib.integrations.httpx_client import AsyncOAuth2Client
 from pydantic import SecretStr, ValidationError
 
 from django_ai_sdk.integrations.base import (
@@ -24,6 +22,7 @@ from django_ai_sdk.integrations.mcp.schemas import (
 from django_ai_sdk.utils import resolve_setting
 
 if TYPE_CHECKING:
+    from authlib.integrations.httpx_client import AsyncOAuth2Client
     from django.contrib.auth.base_user import AbstractBaseUser
     from django.contrib.auth.models import AnonymousUser
     from django.http import HttpRequest
@@ -32,6 +31,15 @@ if TYPE_CHECKING:
     from django_ai_sdk.integrations.mcp.models import MCPOAuthToken
 
 logger = logging.getLogger(__name__)
+
+# Authlib's httpx client runs on httpx2 when it is installed and falls back to httpx
+# otherwise, so a failed token request can raise either library's error.
+try:
+    import httpx2
+
+    HTTP_ERRORS: tuple[type[Exception], ...] = (httpx.HTTPError, httpx2.HTTPError)
+except ImportError:
+    HTTP_ERRORS = (httpx.HTTPError,)
 
 #: How an MCP server authenticates. "static" is no auth at all, "token" is one shared
 #: deployment secret, "oauth" is a per-user OAuth 2.1 + PKCE connection.
@@ -99,13 +107,13 @@ class DynamicMCPIntegration(Integration):
         return self.config.type
 
     @property
-    def connect_kind(self) -> str | None:
+    def connect_kind(self) -> str | None:  # ty: ignore[invalid-property-type-override]
         if isinstance(self.config, OAuthMCPIntegrationConfig):
             return "oauth"
         return None
 
     @property
-    def detail(self) -> str | None:
+    def detail(self) -> str | None:  # ty: ignore[invalid-property-type-override]
         return self._needs_setup
 
     async def get_tool_names(
@@ -580,6 +588,8 @@ def build_oauth_client(client_id: str, client_secret: str, **kwargs: Any) -> Asy
     Confidential clients (a client_secret is configured) authenticate with HTTP
     Basic; public clients send client_id in the request body instead.
     """
+    from authlib.integrations.httpx_client import AsyncOAuth2Client
+
     return AsyncOAuth2Client(
         client_id=client_id,
         client_secret=client_secret or None,
@@ -601,6 +611,8 @@ async def refresh_oauth_token(
     if not refresh_token:
         logger.warning("No refresh token available for server %r", token_obj.server_name)
         return None
+
+    from authlib.integrations.base_client.errors import OAuthError
 
     from django_ai_sdk.integrations.mcp.discovery import discover
 
@@ -641,7 +653,7 @@ async def refresh_oauth_token(
     try:
         async with client:
             await client.refresh_token(discovery.token_endpoint, refresh_token=refresh_token)
-    except (httpx.HTTPError, OAuthError) as e:
+    except (*HTTP_ERRORS, OAuthError) as e:
         # Our own exchange may have failed *because* a concurrent refresh already
         # rotated this refresh_token (e.g. the IDP rejected our now-stale one with
         # invalid_grant). Check whether another writer already landed a good token

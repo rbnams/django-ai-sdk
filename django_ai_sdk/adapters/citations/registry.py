@@ -30,14 +30,19 @@ class SourceRegistry:
     """The sources an answer may cite"""
 
     def __init__(self) -> None:
-        self._by_key: dict[str, NumberedSource] = {}
-        self.seeded: set[str] = set()  # keys from earlier turns, not found again this turn
 
-    def add(self, sources: list[NumberedSource]) -> list[NumberedSource]:
-        """Register sources found this turn; returns them as registered"""
+        self._by_key: dict[str, NumberedSource] = {}
+        self.seeded: set[str] = set()  # keys from earlier turns
+        self.stored: set[str] = set()  # keys a text an earlier turn stored.
+        self.ranks: dict[str, int] = {}
+
+    def add(self, sources: list[NumberedSource], *, ranked: bool = True) -> list[NumberedSource]:
+        """Register sources found this turn, best first."""
         registered = []
-        for source in sources:
+        for rank, source in enumerate(sources, 1):
             key = source.key or source_key(source)
+            if ranked:
+                self.ranks[key] = min(rank, self.ranks.get(key, rank))
             known = self._by_key.get(key)
             if known is not None:
                 known.content = source.content or known.content  # the latest text wins
@@ -53,8 +58,9 @@ class SourceRegistry:
         """Add sources the answer may cite without finding them this turn"""
         for source in sources:
             key = source.key or source_key(source)
+            self.stored.add(key)
             if key not in self._by_key:
-                self.add([source.model_copy(update={"key": key})])
+                self.add([source.model_copy(update={"key": key})], ranked=False)
                 self.seeded.add(key)
 
     async def seed_from_thread(self, thread_id: str, limit: int = SEED_LIMIT) -> None:
@@ -72,9 +78,9 @@ class SourceRegistry:
             thread_id=thread_id, schema_name=CitationsArtifact.__name__
         ).order_by("-created_at")
         async for row in rows:
-            # only the sources
+            # only the sources with their text: an uncited one is stored without
             for s in map(CitedSource.model_validate, row.data.get("sources", [])):
-                if s.key not in found and len(found) < limit:
+                if s.content and s.key not in found and len(found) < limit:
                     found[s.key] = NumberedSource(
                         key=s.key,
                         title=s.title,

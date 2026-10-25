@@ -8,7 +8,7 @@ from pydantic import BaseModel
 class StreamEvent(BaseModel):
     """Base class for all normalized streaming events."""
 
-    event_type: str  # Subclasses override with specific Literal types
+    event_type: Any  # Subclasses override with specific Literal types
 
 
 class MessageStartEvent(StreamEvent):
@@ -83,6 +83,12 @@ class SuggestionEvent(StreamEvent):
 
     event_type: Literal["suggestion"] = "suggestion"
     suggestions: list[str]
+
+
+class TextEndEvent(StreamEvent):
+    """The answer's text is complete; the message may still get citations before it ends."""
+
+    event_type: Literal["text_end"] = "text_end"
 
 
 class MessageEndEvent(StreamEvent):

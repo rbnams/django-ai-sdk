@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 from django_ai_sdk.adapters.base import _CITED, _SENTINEL, Stream
@@ -233,6 +234,59 @@ class TestGround:
         assert [s.key for s in data.sources] == ["doc:d1:c1"]
 
 
+def filler(key: str) -> NumberedSource:
+    """A source that shares no words with ANSWER (no "0" in `key` either)."""
+    return NumberedSource(key=key, title=key, content=f"lorem ipsum {key.replace(':', ' ')}")
+
+
+class TestPick:
+    async def test_with_many_sources_a_block_reads_the_matching_ones_and_each_searchs_best(self):
+        registry = SourceRegistry()
+        for search in range(1, 5):  # four searches of ten hits, best first
+            registry.add([filler(f"doc:s{search}:{hit}") for hit in range(1, 11)])
+        registry.add([NumberedSource(key="doc:x", title="XAF", content=CHUNK.content)])
+        agent = CitationAgent(citations(("Postal Address element is optional", [(41, "0..*")])))
+
+        data = await ground(ANSWER, registry, agent)
+
+        sent = agent.calls[0]
+        assert len(re.findall(r"^\[\d+\] ", sent, re.MULTILINE)) <= grounding.MAX_SOURCES
+        assert "[41] XAF" in sent
+        # The best hit of every search, the rest left out.
+        for best in (1, 11, 21, 31):
+            assert f"[{best}] doc:s" in sent
+        assert "[2] doc:s" not in sent
+        (citation,) = data.citations
+        assert citation.evidence[0].key == "doc:x"
+
+    async def test_without_a_search_only_earlier_sources_sharing_words_are_read(self):
+        registry = SourceRegistry()
+        registry.seed([filler(f"doc:old:{n}") for n in range(1, 29)])
+        registry.seed(
+            [
+                NumberedSource(key="doc:a", title="Postal", content="POSTAL ADDRESS 0..*"),
+                NumberedSource(key="doc:b", title="Suppliers", content="customers or suppliers"),
+            ]
+        )
+        agent = CitationAgent(citations())
+
+        await ground(ANSWER, registry, agent)
+
+        assert "[29] Postal" in agent.calls[0]
+        assert "[30] Suppliers" in agent.calls[0]
+        assert "doc:old" not in agent.calls[0]
+
+    async def test_without_a_search_or_a_matching_source_the_agent_is_not_asked(self):
+        registry = SourceRegistry()
+        registry.seed([filler(f"doc:old:{n}") for n in range(1, 31)])
+        agent = CitationAgent(citations())
+
+        data = await ground(ANSWER, registry, agent)
+
+        assert agent.calls == []
+        assert data.citations == []
+
+
 class TestGrounder:
     @pytest.fixture(autouse=True)
     def small_blocks(self, monkeypatch):
@@ -432,6 +486,33 @@ class TestStream:
         await later.seed_from_thread(thread_id)
         assert [s.key for s in later.all] == ["doc:d1:c1"]
 
+    async def _turn(self, thread_id: str, reply: str) -> dict:
+        """A turn that finds CHUNK (again) and stores its citations; their payload."""
+        registry = SourceRegistry()
+        await registry.seed_from_thread(thread_id)
+        registry.add([from_document(CHUNK)])
+        stream = self._stream(registry, thread_id, reply)
+        writer = StreamWriter(message_id="m")
+        writer.add_chunk(stream.get_text_chunk(ANSWER))
+        return [e async for e in stream.get_citations_artifact(writer)][-1].tool_output
+
+    async def test_the_thread_stores_an_uncited_sources_text_once(self):
+        thread_id = await self._thread()
+        uncited = citations()
+
+        first = await self._turn(thread_id, uncited)
+        again = await self._turn(thread_id, uncited)
+        cited = await self._turn(thread_id, citations(("element is optional", [(1, "POSTAL")])))
+
+        assert first["sources"][0]["content"] == CHUNK.content
+        # Found again, not cited: the first turn's copy has its text.
+        assert again["sources"][0]["content"] == ""
+        # Cited: its answer shows the passage, so it keeps its text.
+        assert cited["sources"][0]["content"] == CHUNK.content
+        later = SourceRegistry()
+        await later.seed_from_thread(thread_id)
+        assert [(s.key, s.content) for s in later.all] == [("doc:d1:c1", CHUNK.content)]
+
 
 @pytest.mark.asyncio
 async def test_the_stream_no_longer_rewrites_the_answer_text():
@@ -481,6 +562,26 @@ def test_the_thread_lists_each_source_once(client, owner, stranger, url):
 
     client.force_login(stranger)
     assert client.get(url.format(t=thread.id)).status_code == 403
+
+
+@pytest.mark.django_db
+def test_the_thread_lists_a_source_with_the_text_an_earlier_turn_stored(owner):
+    from django_ai_sdk.artifacts.models import Artifact
+    from django_ai_sdk.conversation.models import Thread
+    from django_ai_sdk.storage.services import get_thread_sources
+
+    thread = Thread.objects.create(user=owner)
+    source = {"key": "doc:d1:c1", "title": "XAF", "cited": False}
+    for content in ("POSTAL ADDRESS 0..*, F", ""):  # the later copy is stored without
+        Artifact.objects.create(
+            thread=thread,
+            schema_name="CitationsArtifact",
+            artifact_type="citations",
+            data={"citations": [], "sources": [source | {"content": content}]},
+        )
+
+    (listed,) = get_thread_sources(str(thread.id), user=owner)
+    assert listed["content"] == "POSTAL ADDRESS 0..*, F"
 
 
 class TestCitationAgent:
