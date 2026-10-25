@@ -59,8 +59,18 @@ async def tick(*, now: datetime | None = None) -> list[Dispatched]:
     return results
 
 
+def is_enabled(automation: Automation, state: AutomationState | None) -> tuple[bool, str]:
+    """Whether the schedule fires it, and which layer decided: kill-switch, db or code."""
+    if not automations_enabled():
+        return False, "kill-switch"
+    if state is not None and state.enabled is not None:
+        return state.enabled, "db"
+    return automation.enabled, "code"
+
+
 async def _tick_one(automation: Automation, *, now: datetime) -> Dispatched:
-    if not automation.enabled:
+    existing = await AutomationState.objects.filter(name=automation.name).afirst()
+    if not is_enabled(automation, existing)[0]:
         return Dispatched(automation.name, None, "disabled")
 
     state, _ = await ensure_state(automation, now=now)
@@ -211,6 +221,7 @@ __all__ = [
     "claim",
     "dispatch",
     "ensure_state",
+    "is_enabled",
     "last_run_at",
     "run_now",
     "tick",

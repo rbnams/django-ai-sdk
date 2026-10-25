@@ -29,9 +29,11 @@ from .registry import (
     reset_registry,
 )
 from .schedule import Cron
+from .services import AutomationService
 
 __all__ = [
     "Automation",
+    "AutomationService",
     "AutomationState",
     "Cron",
     "get_automation",
