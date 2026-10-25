@@ -25,6 +25,9 @@ class AutomationState(models.Model):
 
     last_dispatched_at = models.DateTimeField(null=True, blank=True)
 
+    # An operator's on/off over the class's `enabled`; null leaves the class in charge.
+    enabled = models.BooleanField(null=True, blank=True, default=None)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
