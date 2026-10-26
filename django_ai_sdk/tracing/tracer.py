@@ -109,6 +109,12 @@ class TelemetrySpan(Span):
                 if isinstance(count := usage.get(alias), int):
                     setattr(self._trace, field, count)
                     break
+        from django_ai_sdk.pricing import cost_for
+
+        # Priced from AI_SDK_MODEL_PRICES; no price leaves it empty, never zero.
+        self._trace.cost = cost_for(
+            self._trace.model_name, self._trace.prompt_tokens, self._trace.completion_tokens
+        )
 
     def _end(self) -> None:
         self._trace.ended_at = timezone.now()

@@ -96,6 +96,34 @@ For an integration a platform pushes events into. Per-platform keys (`AGENT`, `R
 | --- | --- | --- |
 | `AI_SDK_AUTOMATIONS_ENABLED` | `True` | Global kill switch. `False` dispatches nothing, scheduled or by hand. See [Automations](/manual/automations/). |
 
+## Oversight
+
+One dict, `AI_SDK_OVERSIGHT`, every key optional. See [Oversight](/manual/oversight/).
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `ENABLED` | `True` | Kill switch: off leaves every agent unwatched. |
+| `DEFAULT_POLICY` | `""` | The policy of agents that name none. Empty: they are unwatched. |
+| `CAPTURE` | `"full"` | The most content the ledger keeps (`none`, `metadata`, `redacted`, `full`); a policy may keep less. |
+| `STREAM_MODE` | `"live"` | `hold` shows an answer only after review. |
+| `POLICIES` | `{}` | Per policy, the tuning the console allows, kept in settings. |
+| `ANSWERERS` | `{}` | Named answerers: `{"alias": {"class": ..., **kwargs}}` or another alias. |
+| `BUDGET_PER_DAY` / `CURRENCY` | `None` / `"EUR"` | Daily cap on model answerers' spend. |
+| `GATE_DEADLINE_MS` / `REVIEW_DEADLINE_MS` | `300` / `2000` | What the inline stages may add to a reply. |
+| `CLIENT_DETAIL` | `"actions"` | `full` also sends every stage's answers and rule matches in `data-oversight`, for a developer view in the chat. |
+| `WATCH_EVERY_CHARS` | `400` | Streamed characters between watch checks. |
+| `FAIL_MODE` | all `"open"` | Per inline stage: `closed` treats a failed lens as matching its rules. |
+| `RETENTION` | `{"security": 90, "quality": 30, "metadata": 730}` | Days content and metadata are kept. |
+| `PSEUDONYM_SECRET` | derived from `SECRET_KEY` | HMAC secret for actor pseudonyms. |
+| `MASTER_KEY` | `""` | base64 32 bytes; wraps per-thread content keys. Needs `[oversight]`. |
+| `SIGNING_KEY` / `SIGNING_NAME` / `LOG_ORIGIN` | `""` | Ed25519 key and names for signed checkpoints. |
+| `EXPORTERS` | `[]` | Where decisions and checkpoints are sent. |
+| `POLICY_CACHE_SECONDS` | `10` | How long a resolved policy (with its overlay) is reused. |
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `AI_SDK_MODEL_PRICES` | `{}` | Per-million-token prices by model or model prefix: `{"gpt-4.1-mini": {"input": 0.4, "output": 1.6}}`. Fills the cost of traces, turns and judges. |
+
 ## Streaming and Titles
 
 | Setting | Default | Purpose |

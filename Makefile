@@ -1,7 +1,7 @@
 PHONY: setup setup-all format test test-demos typecheck tag build publish release docs-graphs docs-build docs-serve
 
 DEMO_EXTRAS := --extra qdrant --extra mcp --extra files --extra automations --group studio
-TEST_EXTRAS := $(DEMO_EXTRAS) --extra chroma --extra providers --extra ninja --extra drf
+TEST_EXTRAS := $(DEMO_EXTRAS) --extra chroma --extra providers --extra ninja --extra drf --extra oversight
 # example: make test UV_RUN_ARGS='--with "django==5.2.*"'
 UV_RUN_ARGS ?=
 

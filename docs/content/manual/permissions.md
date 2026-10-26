@@ -24,6 +24,7 @@ PermissionDomain.MEMORY   # "memory"
 | `memory` | `MemoryDefaultPermission` |
 | `integrations` | `IntegrationDefaultPermission` |
 | `workflow` | `WorkflowDefaultPermission` |
+| `oversight` | `OversightDefaultPermission`: staff view, review and audit; superusers reveal who asked and manage policies. |
 
 Override a domain globally via `AI_SDK_PERMISSIONS`:
 
@@ -54,6 +55,8 @@ LIST_THREAD_MEMORIES, LINK_MEMORY, UNLINK_MEMORY
 USE_INTEGRATION, MANAGE_INTEGRATION
 # Workflows
 VIEW_WORKFLOW, RUN_WORKFLOW, MANAGE_WORKFLOW
+# Oversight (VIEW_OVERSIGHT is checked with purpose="security" | "quality" | "audit")
+VIEW_OVERSIGHT, REVIEW_OVERSIGHT, AUDIT_OVERSIGHT, REVEAL_ACTOR, MANAGE_OVERSIGHT
 # Misc
 CHAT, REINDEX
 ```

@@ -54,6 +54,8 @@ class Trace(models.Model):
     prompt_tokens = models.IntegerField(null=True, blank=True)
     completion_tokens = models.IntegerField(null=True, blank=True)
     total_tokens = models.IntegerField(null=True, blank=True)
+    # From AI_SDK_MODEL_PRICES at the time of the call, in the deployment's currency.
+    cost = models.FloatField(null=True, blank=True)
 
     # Typed as the queryset the manager proxies
     objects: ClassVar[TraceQuerySet] = TraceManager()  # ty: ignore[invalid-assignment]

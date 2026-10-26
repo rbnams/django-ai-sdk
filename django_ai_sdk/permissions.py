@@ -76,6 +76,16 @@ class Operation(StrEnum):
     VIEW_WORKFLOW = "view_workflow"
     RUN_WORKFLOW = "run_workflow"
     MANAGE_WORKFLOW = "manage_workflow"
+    # Read turns through a purpose's view (`purpose=` is passed to the check).
+    VIEW_OVERSIGHT = "view_oversight"
+    # Answer review queues: a human verdict on the ledger.
+    REVIEW_OVERSIGHT = "review_oversight"
+    # Decisions, checkpoints and the chain, never content.
+    AUDIT_OVERSIGHT = "audit_oversight"
+    # Learn who asked a turn. Always recorded with a reason.
+    REVEAL_ACTOR = "reveal_actor"
+    # Tune policies, shred scopes, export.
+    MANAGE_OVERSIGHT = "manage_oversight"
 
 
 class PermissionDomain(StrEnum):
@@ -85,6 +95,7 @@ class PermissionDomain(StrEnum):
     INTEGRATIONS = "integrations"
     AUTOMATIONS = "automations"
     WORKFLOW = "workflow"
+    OVERSIGHT = "oversight"
 
 
 class BasePermission(ABC):
@@ -533,6 +544,31 @@ def _owned_by(owner_id: Any, user: UserType) -> bool:
     return str(owner_id) == str(user.pk)
 
 
+class OversightDefaultPermission(BasePermission):
+    """Staff read, review and audit; only superusers reveal who asked or tune policy.
+
+    Reading the ledger is itself recorded, so this is who may look, not who may
+    look unseen. Split purposes between groups by overriding the `oversight`
+    domain, e.g. with IsInAllowedGroups per purpose.
+    """
+
+    STAFF: frozenset[Operation] = frozenset(
+        {Operation.VIEW_OVERSIGHT, Operation.REVIEW_OVERSIGHT, Operation.AUDIT_OVERSIGHT}
+    )
+    SUPERUSER: frozenset[Operation] = frozenset(
+        {Operation.REVEAL_ACTOR, Operation.MANAGE_OVERSIGHT}
+    )
+
+    async def has_permission(self, user: UserType, operation: Operation, **kwargs: Any) -> bool:
+        if user is None or not user.is_authenticated:
+            return False
+        if operation in self.SUPERUSER:
+            return bool(getattr(user, "is_superuser", False))
+        if operation in self.STAFF:
+            return bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
+        return False
+
+
 DOMAIN_PERMISSION_DEFAULTS: dict[PermissionDomain, list[str]] = {
     PermissionDomain.AGENT: ["django_ai_sdk.permissions.AgentDefaultPermission"],
     PermissionDomain.THREAD: ["django_ai_sdk.permissions.ThreadDefaultPermission"],
@@ -540,6 +576,7 @@ DOMAIN_PERMISSION_DEFAULTS: dict[PermissionDomain, list[str]] = {
     PermissionDomain.INTEGRATIONS: ["django_ai_sdk.permissions.IntegrationDefaultPermission"],
     PermissionDomain.AUTOMATIONS: ["django_ai_sdk.permissions.AutomationDefaultPermission"],
     PermissionDomain.WORKFLOW: ["django_ai_sdk.permissions.WorkflowDefaultPermission"],
+    PermissionDomain.OVERSIGHT: ["django_ai_sdk.permissions.OversightDefaultPermission"],
 }
 
 

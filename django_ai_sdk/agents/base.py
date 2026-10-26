@@ -264,6 +264,10 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
     # webhook run_inbound or the host before ``get_tools()``; clear after.
     typesafe_control: dict[str, Any] | None = None
 
+    # The oversight policy this agent's turns are judged by, by name. None takes
+    # AI_SDK_OVERSIGHT["DEFAULT_POLICY"]; False opts out even of that.
+    oversight: str | bool | None = None
+
     # Generator factory from django_ai_sdk.generators, e.g. `openai_responses_chat`.
     # Assign the factory itself, never call it: get_llm() builds it with this
     # agent's model.
@@ -510,6 +514,10 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         """
         return []
 
+    def get_oversight_policy(self) -> str | bool | None:
+        """The oversight policy name for this agent's turns; override to pick per instance."""
+        return self.oversight
+
     def get_typesafe_screener(self) -> TypeSafeScreener | None:
         """Return an inbound TypeSafe screener, or None to skip."""
         if not self.typesafe_screener:
@@ -554,7 +562,16 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         # Optional TypeSafe control hints (set by webhook / host before run).
         from django_ai_sdk.typesafe.control import apply_tool_control
 
-        return apply_tool_control(result, self.typesafe_control)
+        result = apply_tool_control(result, self.typesafe_control)
+
+        # Tools the turn's oversight gate took away; [] takes them all.
+        from django_ai_sdk.oversight.session import current_session
+
+        session = current_session()
+        if session is not None and session.restrict is not None:
+            taken = set(session.restrict)
+            result = [t for t in result if taken and getattr(t, "name", None) not in taken]
+        return result
 
     async def get_agent_tools(
         self,
@@ -852,6 +869,21 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         Returns:
             Response string, or parsed Pydantic model if response_format is set
         """
+        from django_ai_sdk.tracing import bind as bind_trace
+
+        # Headless runs trace to their thread too, not to nothing.
+        with bind_trace(thread_id=thread_id):
+            return await self._run(messages, system_prompt, response_format, thread_id, user, tools)
+
+    async def _run(
+        self,
+        messages: list[ChatMessage],
+        system_prompt: str | Prompt | None,
+        response_format: type[T] | None,
+        thread_id: str | None,
+        user: AbstractBaseUser | AnonymousUser | None,
+        tools: bool,
+    ) -> T | str | None:
         resolved = self.response_format if response_format is self._UNSET else response_format
         adapter = await self.get_run_adapter(thread_id=thread_id, user=user)
         rendered_prompt = system_prompt if system_prompt is not None else self.get_system_prompt()
@@ -1156,6 +1188,28 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 for message in messages:
                     message.attachments = []
 
+        # The oversight gate judges the question before the thread or the model sees it.
+        from django_ai_sdk.oversight.session import TurnSession
+
+        oversight = await TurnSession.start(
+            self, channel="chat", user=user, thread_id=thread_id, messages=messages
+        )
+        if oversight.active:
+            gate = await oversight.gate()
+            if gate.blocked:
+                from django_ai_sdk.oversight.stream import RefusalStream
+
+                await oversight.close()
+                return await stream_response(
+                    RefusalStream(gate.message, gate.notice), messages, self.protocol_handler
+                )
+            if gate.redacted:
+                question = next((m for m in reversed(messages) if m.role == "user"), None)
+                if question is not None:
+                    question.content = gate.input
+            if gate.notice:
+                oversight.notices.append(gate.notice)
+
         # Get storage adapter for thread
         storage_adapter = await self.get_storage_adapter(thread_id)
 
@@ -1176,6 +1230,7 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 # FIXME: we need a better way on how to create a id for the user messages
                 last_user_message.id = str(uuid.uuid4())
                 await storage_adapter.store_chat_message(last_user_message)
+                oversight.user_message_id = last_user_message.id
             else:
                 logger.debug("No user messages found to store")
 
@@ -1200,6 +1255,14 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 adapter.typesafe_screener = screener
             if required_tools := self.get_run_required_tools(messages):
                 adapter.hook_context = {"required_tools": required_tools}
+            if oversight.active:
+                from django_ai_sdk.adapters.base import Stream
+
+                if isinstance(adapter, Stream):
+                    adapter.oversight = oversight
+                else:
+                    # Only the SDK's Stream reports what happens next; record the gate.
+                    await oversight.close()
             # Artifacts are stored on the thread: none without one.
             if thread_id:
                 adapter.thread_id = thread_id

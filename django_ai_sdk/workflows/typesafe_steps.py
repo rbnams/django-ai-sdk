@@ -52,9 +52,7 @@ def resolve_binding(ctx: WorkflowContext, binding: str) -> Any:
         name, _, path = rest.partition(".")
         value = ctx.step(name)
         return _dig(value, path) if path else value
-    raise ValueError(
-        f"State binding {binding!r} must start with 'input:' or 'step:'."
-    )
+    raise ValueError(f"State binding {binding!r} must start with 'input:' or 'step:'.")
 
 
 def validate_questions(questions: Any) -> dict[str, Any]:
@@ -69,8 +67,7 @@ def validate_questions(questions: Any) -> dict[str, Any]:
         kind = spec.get("type")
         if kind not in _QUESTION_TYPES:
             raise ValueError(
-                f"Question {qid!r} type must be one of {sorted(_QUESTION_TYPES)}, "
-                f"not {kind!r}."
+                f"Question {qid!r} type must be one of {sorted(_QUESTION_TYPES)}, not {kind!r}."
             )
         if not str(spec.get("instructions") or "").strip():
             raise ValueError(f"Question {qid!r} needs instructions.")
@@ -92,8 +89,7 @@ def validate_state_bindings(state: Any) -> dict[str, str]:
         prefix = binding.split(":", 1)[0]
         if prefix not in {"input", "step"}:
             raise ValueError(
-                f"State key {key!r} binding {binding!r} must start with "
-                "'input:' or 'step:'."
+                f"State key {key!r} binding {binding!r} must start with 'input:' or 'step:'."
             )
         bindings[key] = binding.strip()
     return bindings
@@ -156,9 +152,7 @@ class WhenStep(Step):
             raise ValueError("WhenStep config.judgment must be a non-empty string.")
         op = self.config.get("op")
         if op not in _OPS:
-            raise ValueError(
-                f"WhenStep config.op must be one of {sorted(_OPS)}, not {op!r}."
-            )
+            raise ValueError(f"WhenStep config.op must be one of {sorted(_OPS)}, not {op!r}.")
         if "value" not in self.config:
             raise ValueError("WhenStep config.value is required.")
 

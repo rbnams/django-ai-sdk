@@ -188,12 +188,42 @@ class AgentStep(Step):
         # Omitted rather than passed as None: Agent.run reads an explicit None as
         # "no structured output", which would strip the agent's own.
         response_format = {"response_format": self.schema} if self.schema else {}
-        result = await agent.run(
-            await self.messages(ctx),
-            system_prompt=await self.system_prompt(ctx),
+        messages = await self.messages(ctx)
+
+        from django_ai_sdk.oversight.session import TurnSession
+        from django_ai_sdk.oversight.session import active as oversee
+
+        # A workflow step is a turn like any other, on its own channel.
+        oversight = await TurnSession.start(
+            agent,
+            channel=f"workflow:{ctx.workflow or 'adhoc'}:{self.name}",
             user=ctx.principal,
-            **response_format,
+            messages=messages,
         )
+        gate = await oversight.gate()
+        if gate.blocked:
+            await oversight.close()
+            return StepOutcome(status="failed", detail=f"refused by oversight: {gate.message}")
+        if gate.redacted and messages:
+            messages[-1].content = gate.input
+        with oversee(oversight):
+            result = await agent.run(
+                messages,
+                system_prompt=await self.system_prompt(ctx),
+                user=ctx.principal,
+                **response_format,
+            )
+        if isinstance(result, str):
+            reviewed = await oversight.review(result)
+            result = reviewed.output
+            if reviewed.blocked:
+                await oversight.close()
+                return StepOutcome(status="failed", detail=f"withheld by oversight: {result}")
+        elif result is not None:
+            await oversight.review(
+                result.model_dump_json() if isinstance(result, BaseModel) else str(result)
+            )
+        await oversight.close(error="" if result is not None else "no result")
         if result is None:
             return StepOutcome(status="failed", detail="the agent returned nothing")
         return self.outcome_for(result)

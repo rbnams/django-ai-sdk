@@ -11,12 +11,15 @@ Needs ``pip install django-ai-sdk[ninja]``. Mount what you need::
     api.add_router("/", ai_sdk_routers.get_workflows_router())
     api.add_router("/memories", ai_sdk_routers.get_memories_router())
     api.add_router("/integrations", ai_sdk_routers.get_integrations_router())
+    api.add_router("/", ai_sdk_routers.get_oversight_router(), auth=staff_auth)
 
 Each ``get_*_router()`` returns a new Router, so you can drop endpoints with
 ``exclude={"delete_all_threads"}`` and add your own on the result.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 try:
     import ninja  # noqa: F401
@@ -27,6 +30,9 @@ except ImportError as exc:  # pragma: no cover - exercised without the extra ins
         "django_ai_sdk.contrib.ninja needs django-ninja: pip install django-ai-sdk[ninja]"
     ) from exc
 
+if TYPE_CHECKING:
+    from ninja import Router
+
 from django_ai_sdk.contrib.ninja.agents import get_agents_router
 from django_ai_sdk.contrib.ninja.integrations import get_integrations_router
 from django_ai_sdk.contrib.ninja.memories import get_memories_router
@@ -34,10 +40,19 @@ from django_ai_sdk.contrib.ninja.routing import register_error_handlers
 from django_ai_sdk.contrib.ninja.threads import get_threads_router
 from django_ai_sdk.contrib.ninja.workflows import get_workflows_router
 
+
+def get_oversight_router(**kwargs: Any) -> Router:
+    """The oversight router; imported on demand, since it needs the oversight app."""
+    from django_ai_sdk.contrib.ninja.oversight import get_oversight_router as build
+
+    return build(**kwargs)
+
+
 __all__ = [
     "get_agents_router",
     "get_integrations_router",
     "get_memories_router",
+    "get_oversight_router",
     "get_threads_router",
     "get_workflows_router",
     "register_error_handlers",

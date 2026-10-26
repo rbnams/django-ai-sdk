@@ -192,6 +192,10 @@ class StreamWriter:
         """The answer text"""
         return "".join(self._content_chunks)
 
+    def replace_text(self, text: str) -> None:
+        """Store `text` instead of what streamed: a redacted or withheld answer."""
+        self._content_chunks = [text]
+
     async def finalize(self, finish_reason: str = "") -> ChatMessage:
         """Complete the message"""
         logger.debug(f"Finalizing message with reason: {finish_reason}")

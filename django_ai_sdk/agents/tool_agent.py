@@ -173,8 +173,11 @@ class RequireToolsHook:
 
 def default_hooks(agent: Any) -> dict[str, list[Any]]:
     """Standard hooks for a tool-capable agent."""
+    from django_ai_sdk.oversight.hooks import OversightToolHook
+
     hooks: dict[str, list[Any]] = {
-        "before_tool": [LogToolCallsHook()],
+        # First: a refused call is not counted against the budget, nor logged as run.
+        "before_tool": [OversightToolHook(), LogToolCallsHook()],
         "on_exit": [RequireToolsHook(getattr(agent, "required_tools", None))],
     }
     if agent.max_tool_calls is not None:
@@ -285,6 +288,11 @@ class ToolAgent:
 
     def _hooks(self) -> dict[str, list[Any]] | None:
         hooks = {point: list(items) for point, items in (self.config.hooks or {}).items()}
+        from django_ai_sdk.oversight.hooks import OversightToolHook
+
+        before = hooks.setdefault("before_tool", [])
+        if not any(isinstance(h, OversightToolHook) for h in before):
+            before.insert(0, OversightToolHook())
         if self.config.max_tool_calls is not None:
             hooks.setdefault("before_tool", []).append(
                 ToolCallBudgetHook(self.config.max_tool_calls)

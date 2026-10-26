@@ -48,7 +48,7 @@ Issues = "https://github.com/django-ai-sdk/django-ai-sdk/issues"
 Changelog = "https://github.com/django-ai-sdk/django-ai-sdk/releases"
 
 [project.optional-dependencies]
-all = ["django-ai-sdk[haystack,rag,mcp,files,providers,transformers,automations,typesafe]"]
+all = ["django-ai-sdk[haystack,rag,mcp,files,providers,transformers,automations,typesafe,oversight]"]
 # Automations only schedule by cron, so APScheduler's CronTrigger — used for parsing
 # and DST-correct next-occurrence math, not as a running scheduler — is only needed
 # once you declare one.
@@ -87,6 +87,11 @@ openrouter = ["openrouter-haystack>=2.0.0"]
 transformers = ["transformers-haystack>=2.0.0"]
 # TypeSafe System One (Jev): typed judgments, not a chat generator.
 typesafe = ["typesafe-sdk>=0.5.7"]
+# Oversight's encrypted evidence (crypto-shredding) and signed ledger checkpoints.
+# Without it the ledger still chains and verifies; content is stored in the clear.
+oversight = ["cryptography>=44"]
+# Presidio's analyzer as an oversight answerer; it also needs a spaCy model.
+presidio = ["presidio-analyzer>=2.2"]
 
 [dependency-groups]
 # Stack for the demo projects in demos/ (demos/base holds their shared settings).

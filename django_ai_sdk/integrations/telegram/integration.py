@@ -114,9 +114,7 @@ class TelegramIntegration(WebhookIntegration):
             return False
         return bool(message.get("text"))
 
-    async def send(
-        self, chat_id: str, text: str, *, reply_to: str | None = None
-    ) -> bool:
+    async def send(self, chat_id: str, text: str, *, reply_to: str | None = None) -> bool:
         """Push a message into a chat without an inbound webhook event.
 
         Used by scheduled pings (wiki gardener) and by ``reply``. Returns whether

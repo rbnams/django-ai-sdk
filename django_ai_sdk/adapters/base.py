@@ -44,6 +44,13 @@ from django_ai_sdk.events import (
 )
 from django_ai_sdk.generators import schema_kwargs
 from django_ai_sdk.logger import get_logger
+from django_ai_sdk.oversight.session import active as oversee
+from django_ai_sdk.oversight.stream import (
+    CONTENT_FILTER,
+    notice_event,
+    observe_event,
+    restrict_agent_tools,
+)
 from django_ai_sdk.tracing import bind as bind_trace
 from django_ai_sdk.utils import resolve_setting
 
@@ -56,6 +63,7 @@ if TYPE_CHECKING:
     from django_ai_sdk.adapters.interfaces import T
     from django_ai_sdk.adapters.suggestions import SuggestionGenerator
     from django_ai_sdk.artifacts.tool_artifacts import ToolArtifact
+    from django_ai_sdk.oversight.session import ReviewResult, TurnSession
     from django_ai_sdk.storage.base import BaseStorageAdapter
     from django_ai_sdk.typesafe import TypeSafeScreener
 
@@ -296,6 +304,8 @@ class Stream:
     # the citations tool call shown while the answer streams
     _citations_call_id: str | None = None
     typesafe_screener: TypeSafeScreener | None = None
+    # The turn's oversight session; set per run by Agent.as_view when a policy applies.
+    oversight: TurnSession | None = None
 
     # Message processing configuration
     merge_messages: bool = False
@@ -771,6 +781,28 @@ class Stream:
                             continue
                         stream_writer.add_chunk(chunk)
 
+    def get_pipeline_usage(
+        self, pipeline_task: asyncio.Task[Any]
+    ) -> tuple[str | None, int | None, int | None]:
+        """(model, prompt tokens, completion tokens) summed over the run's replies."""
+        from django_ai_sdk.pricing import usage_from_meta
+
+        if not pipeline_task.done() or pipeline_task.cancelled() or pipeline_task.exception():
+            return None, None, None
+        result = pipeline_task.result() or {}
+        if self.first_component and self.first_component in result:
+            result = result[self.first_component]
+        model, prompt, completion = None, None, None
+        for message in result.get("messages", []) if isinstance(result, dict) else []:
+            meta = getattr(message, "meta", None) or {}
+            p, c = usage_from_meta(meta)
+            if p is None and c is None:
+                continue
+            model = model or meta.get("model")
+            prompt = (prompt or 0) + (p or 0)
+            completion = (completion or 0) + (c or 0)
+        return model or self.model_name, prompt, completion
+
     async def get_final_message(
         self,
         stream_writer: StreamWriter | None,
@@ -896,8 +928,21 @@ class Stream:
 
         pipeline_task: asyncio.Task[Any] | None = None
 
+        session = self.oversight if self.oversight is not None and self.oversight.active else None
+        if session is not None:
+            session.message_id = message_id
+        stopped: ReviewResult | None = None
+
         try:
             yield MessageStartEvent(message_id=message_id)
+            # Every notice this turn sent, stored on the message so a reloaded
+            # thread shows them again.
+            sent: list[dict[str, Any]] = []
+            if session is not None:
+                for notice in session.notices:
+                    sent.append(notice)
+                    yield notice_event(notice)
+                session.notices.clear()
 
             # Inbound TypeSafe card before the LLM starts; may apply control hints.
             if screen := await self.get_typesafe_input_screen(messages):
@@ -907,10 +952,15 @@ class Stream:
             # The task copies the context: tools register sources in this turn's registry.
             registry_token = current_registry.set(self.citation_registry)
             try:
-                with bind_trace(
-                    thread_id=getattr(self.storage_adapter, "thread_id", None),
-                    message_id=message_id,
+                with (
+                    bind_trace(
+                        thread_id=getattr(self.storage_adapter, "thread_id", None),
+                        message_id=message_id,
+                    ),
+                    oversee(session),
                 ):
+                    if session is not None and session.restrict is not None:
+                        restrict_agent_tools(self.agent_component, session.restrict)
                     pipeline_task = self.get_task(haystack_messages, streaming_callback)
             finally:
                 current_registry.reset(registry_token)
@@ -924,8 +974,44 @@ class Stream:
                     on_block=lambda: queue.put_nowait(_CITED),
                 )
 
+            held: list[str] = []
+            hold = (
+                session is not None
+                and session.policy is not None
+                and (session.policy.stream_mode == "hold")
+            )
             async for event in self.get_events(queue, stream_writer):
+                if session is not None:
+                    if isinstance(event, TextChunkEvent):
+                        if session.note_text(event.content):
+                            watched = await session.watch()
+                            if watched.blocked:
+                                stopped = watched
+                                break
+                        if hold:
+                            held.append(event.content)
+                            continue
+                    else:
+                        observe_event(session, event)
                 yield event
+
+            if stopped is not None:
+                # The answer is withdrawn mid-stream: stop the model, store the message.
+                pipeline_task.cancel()
+                if stopped.notice:
+                    sent.append(stopped.notice)
+                    yield notice_event(stopped.notice)
+                if stream_writer:
+                    stream_writer.replace_text(stopped.output)
+                    stream_writer.message.metadata["oversight"] = sent
+                if hold or not session.view.output:
+                    yield TextChunkEvent(content=stopped.output)
+                yield TextEndEvent()
+                await self.get_final_message(stream_writer)
+                _finalize_called = True
+                yield MessageEndEvent(finish_reason=CONTENT_FILTER)
+                yield StreamEndEvent()
+                return
 
             try:
                 await self.get_pipeline_result(pipeline_task, stream_writer)
@@ -946,6 +1032,27 @@ class Stream:
                 yield StreamEndEvent()
                 return
 
+            finish_reason = None
+            if session is not None:
+                session.add_usage(*self.get_pipeline_usage(pipeline_task))
+                if self.citation_registry is not None:
+                    session.set_sources(
+                        self.citation_registry.all, seeded=self.citation_registry.seeded
+                    )
+                text = stream_writer.text if stream_writer else session.view.output
+                reviewed = await session.review(text)
+                if reviewed.replaced and stream_writer:
+                    stream_writer.replace_text(reviewed.output)
+                if reviewed.notice:
+                    sent.append(reviewed.notice)
+                    yield notice_event(reviewed.notice)
+                if sent and stream_writer:
+                    stream_writer.message.metadata["oversight"] = sent
+                if hold:
+                    yield TextChunkEvent(content=reviewed.output)
+                if reviewed.blocked:
+                    finish_reason = CONTENT_FILTER
+
             # the text is done
             yield TextEndEvent()
             async for event in self.get_citations_artifact(stream_writer):
@@ -957,7 +1064,7 @@ class Stream:
             if screen := await self.get_typesafe_output_screen(messages):
                 yield screen
 
-            yield MessageEndEvent()
+            yield MessageEndEvent(finish_reason=finish_reason)
 
             if suggestion := await self.get_suggestions(messages):
                 yield suggestion
@@ -993,5 +1100,7 @@ class Stream:
                     pass
             if stream_writer and not _finalize_called:
                 self.message_result = await stream_writer.finalize("cancelled")
+            if session is not None:
+                await session.close()
 
         yield StreamEndEvent()

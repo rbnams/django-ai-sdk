@@ -77,6 +77,26 @@ async def run_inbound(payload: dict[str, Any]) -> None:
     user_message = ChatMessage(role="user", content=event.text)
     messages = [*history, user_message]
 
+    from django_ai_sdk.oversight.session import TurnSession
+    from django_ai_sdk.oversight.session import active as oversee
+
+    # The same gate chat has: a refused question gets the policy's message and is
+    # never stored or sent to the model.
+    oversight = await TurnSession.start(
+        agent,
+        channel=f"webhook:{event.integration}",
+        user=principal,
+        thread_id=thread_id,
+        messages=messages,
+    )
+    gate = await oversight.gate()
+    if gate.blocked:
+        await oversight.close()
+        await integration.reply(event, gate.message)
+        return
+    if gate.redacted:
+        user_message.content = gate.input
+
     screener = agent.get_typesafe_screener()
     # Await inbound before agent.run so control hints can filter get_tools().
     inbound_payload: dict[str, Any] | None = None
@@ -93,10 +113,11 @@ async def run_inbound(payload: dict[str, Any]) -> None:
     timeout = resolve_setting("AI_SDK_WEBHOOK_TIMEOUT", 120)
     token = current_event.set(event)
     try:
-        text = await asyncio.wait_for(
-            agent.run(messages, tools=True, user=principal, thread_id=thread_id),
-            timeout=timeout,
-        )
+        with oversee(oversight):
+            text = await asyncio.wait_for(
+                agent.run(messages, tools=True, user=principal, thread_id=thread_id),
+                timeout=timeout,
+            )
     except TimeoutError:
         logger.warning(
             "Agent %r timed out after %s seconds on a %r event",
@@ -115,6 +136,9 @@ async def run_inbound(payload: dict[str, Any]) -> None:
         agent.typesafe_control = None
 
     reply_text = str(text) if text else ERROR_MESSAGE
+    if reply_text not in (TIMEOUT_MESSAGE, ERROR_MESSAGE):
+        reply_text = (await oversight.review(reply_text)).output
+    await oversight.close(error="" if text else "no reply")
     # Score cards are channel chrome only — never store them, or the next turn
     # feeds Jev's numbers back into the model. When typesafe_publish is on,
     # three posts: inbound card → answer → reply card. When it is off, the

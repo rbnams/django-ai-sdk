@@ -54,9 +54,7 @@ async def evaluate(
     try:
         from typesafe_sdk import AsyncTypeSafeClient
     except ImportError:
-        logger.warning(
-            "typesafe-sdk is not installed; install django-ai-sdk[typesafe] to screen"
-        )
+        logger.warning("typesafe-sdk is not installed; install django-ai-sdk[typesafe] to screen")
         return None
 
     try:

@@ -436,6 +436,10 @@ class VercelProtocolHandler(BaseProtocolHandler):
                         part["callProviderMetadata"] = who
                     parts.append(part)
 
+            # What oversight told the client while this answer streamed.
+            for notice in chat_message.metadata.get("oversight") or []:
+                parts.append({"type": "data-oversight", "data": notice})
+
             if chat_message.has_errors:
                 parts.append(
                     {
