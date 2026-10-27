@@ -12,14 +12,13 @@ class Command(BaseCommand):
 
     def handle(self, *args: Any, **options: Any) -> None:
         from django_ai_sdk.oversight import seal, vault
-        from django_ai_sdk.oversight.conf import log_origin, setting
+        from django_ai_sdk.oversight.conf import setting, signing_name
 
         configured = setting("SIGNING_KEY")
         if configured:
-            name = setting("SIGNING_NAME") or log_origin()
-            self.stdout.write(f"verifier key: {seal.verifier_key(name, configured)}")
+            self.stdout.write(f"verifier key: {seal.verifier_key(signing_name(), configured)}")
             return
         self.stdout.write(f"MASTER_KEY  = {vault.generate_master_key()!r}")
         key = seal.generate_signing_key()
         self.stdout.write(f"SIGNING_KEY = {key!r}")
-        self.stdout.write(f"verifier key: {seal.verifier_key(log_origin(), key)}")
+        self.stdout.write(f"verifier key: {seal.verifier_key(signing_name(), key)}")

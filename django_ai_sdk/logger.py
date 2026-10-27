@@ -13,13 +13,15 @@ if TYPE_CHECKING:
 logger.remove()
 
 
-if resolve_setting("AI_SDK_ENABLE_LOGS", False):
-    logger.add(
-        sys.stderr,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level="DEBUG",
-        colorize=True,
-    )
+# Warnings and errors always reach stderr, so a container's logs show them;
+# AI_SDK_ENABLE_LOGS adds everything down to DEBUG.
+logger.add(
+    sys.stderr,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="DEBUG" if resolve_setting("AI_SDK_ENABLE_LOGS", False) else "WARNING",
+    colorize=sys.stderr.isatty(),
+    diagnose=False,
+)
 
 logger.add(
     "logs/django_ai_sdk.log",
@@ -29,6 +31,8 @@ logger.add(
     retention="30 days",
     compression="zip",
     enqueue=True,
+    # diagnose would write local variables (turn text, tokens) into a 30-day file.
+    diagnose=False,
 )
 
 

@@ -6,6 +6,9 @@ about a state. This module never pretends otherwise.
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from django_ai_sdk.logger import get_logger
@@ -33,6 +36,64 @@ def typesafe_model() -> str:
     return "jev-latest"
 
 
+class TypeSafeUnavailable(RuntimeError):
+    """No API key, or typesafe-sdk is not installed: a configuration gap, not an outage."""
+
+
+def typesafe_missing() -> str:
+    """Why TypeSafe cannot be asked here, or "" when it can."""
+    if not typesafe_api_key():
+        return "TYPESAFE_API_KEY is not set"
+    if importlib.util.find_spec("typesafe_sdk") is None:
+        return "typesafe-sdk is not installed (pip install django-ai-sdk[typesafe])"
+    return ""
+
+
+# One client per event loop: its connection pool belongs to the loop that opened it,
+# and a background task under async_to_sync runs on a loop of its own.
+_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[str, Any]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _client(api_key: str) -> Any:
+    from typesafe_sdk import AsyncTypeSafeClient
+
+    loop = asyncio.get_running_loop()
+    cached = _clients.get(loop)
+    if cached is None or cached[0] != api_key:
+        cached = (api_key, AsyncTypeSafeClient(api_key=api_key, model=typesafe_model()))
+        _clients[loop] = cached
+    return cached[1]
+
+
+async def request(
+    state: Any,
+    questions: Mapping[str, Any],
+    *,
+    model: str | None = None,
+    timeout: float | None = None,
+    retry: Any = None,
+) -> dict[str, Any]:
+    """One System One request, as a JSON-safe summary.
+
+    Raises TypeSafeUnavailable without a key or the package; the SDK's own errors
+    pass through. `timeout` and `retry` (a RetryPolicy) override the client's.
+    """
+    missing = typesafe_missing()
+    if missing:
+        raise TypeSafeUnavailable(missing)
+    options: dict[str, Any] = {}
+    if timeout is not None:
+        options["timeout"] = timeout
+    if retry is not None:
+        options["retry"] = retry
+    response = await _client(typesafe_api_key() or "").system_one(
+        state=state, questions=questions, model=model or typesafe_model(), **options
+    )
+    return _summarize(response)
+
+
 async def evaluate(
     state: Any,
     questions: Mapping[str, Any],
@@ -44,31 +105,16 @@ async def evaluate(
     Fail-open: missing key, missing package, or API errors log and return None
     so a chat turn is never blocked by screening.
     """
-    api_key = typesafe_api_key()
-    if not api_key:
-        logger.warning("TYPESAFE_API_KEY unset; skipping TypeSafe evaluate")
-        return None
     if not questions:
         return None
-
     try:
-        from typesafe_sdk import AsyncTypeSafeClient
-    except ImportError:
-        logger.warning("typesafe-sdk is not installed; install django-ai-sdk[typesafe] to screen")
+        return await request(state, questions, model=model)
+    except TypeSafeUnavailable as exc:
+        logger.warning("{}; skipping TypeSafe evaluate", exc)
         return None
-
-    try:
-        async with AsyncTypeSafeClient(api_key=api_key, model=typesafe_model()) as client:
-            response = await client.system_one(
-                state=state,
-                questions=questions,
-                model=model or typesafe_model(),
-            )
     except Exception:
         logger.exception("TypeSafe system_one failed; skipping screen")
         return None
-
-    return _summarize(response)
 
 
 def _summarize(response: Any) -> dict[str, Any]:

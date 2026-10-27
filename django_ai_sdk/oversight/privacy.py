@@ -1,9 +1,9 @@
-"""Who may see what: pseudonyms, purposes, and the masks each purpose applies.
+"""Who may see what: pseudonyms, and the two views of a turn.
 
-A reviewer judging answer quality does not need to know who asked; a security
-reviewer needs the question but not the answer's sources; an auditor needs the
-decisions and the chain, and no content at all. Each purpose is a view, and a
-person shows up as a stable pseudonym until someone records why they must know.
+A reviewer reads the turn itself: the question, the answer, the sources it drew
+on (where an indirect injection hides) and every verdict with its reason. An
+auditor reads the decisions and the chain, and no content at all. A person shows
+up as a stable pseudonym until someone records why they must know.
 """
 
 from __future__ import annotations
@@ -51,21 +51,9 @@ def staff_label(user: AbstractBaseUser | AnonymousUser | None) -> str:
     return f"{username} ({user.pk})" if username else str(user.pk)
 
 
-# What each purpose sees of a turn. Anything not listed is withheld.
+# What each view shows of a turn. Anything not listed is withheld.
 VIEWS: dict[Purpose, frozenset[str]] = {
-    Purpose.SECURITY: frozenset(
-        {
-            "input",
-            "output",
-            "shown_input",
-            "shown_output",
-            "tool_calls",
-            "observations",
-            "decisions",
-            "history",
-        }
-    ),
-    Purpose.QUALITY: frozenset(
+    Purpose.REVIEW: frozenset(
         {
             "input",
             "output",
@@ -83,10 +71,6 @@ VIEWS: dict[Purpose, frozenset[str]] = {
 }
 
 
-# Purposes that see who asked as a pseudonym; the rest see no one at all.
-SEES_ACTOR = frozenset({Purpose.SECURITY, Purpose.AUDIT})
-
-
 def visible(purpose: Purpose, part: str) -> bool:
     return part in VIEWS.get(purpose, frozenset())
 
@@ -98,15 +82,8 @@ def mask_evidence(content: dict[str, Any] | None, purpose: Purpose) -> dict[str,
     return {key: value for key, value in content.items() if visible(purpose, key)}
 
 
-def lens_visible(lens_purposes: list[str] | tuple[str, ...], purpose: Purpose) -> bool:
-    """An observation is shown when its lens serves `purpose`; audit sees every verdict."""
-    return purpose is Purpose.AUDIT or str(purpose) in {str(p) for p in lens_purposes}
-
-
 __all__ = [
-    "SEES_ACTOR",
     "VIEWS",
-    "lens_visible",
     "mask_evidence",
     "pseudonym",
     "staff_label",

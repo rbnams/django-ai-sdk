@@ -123,6 +123,7 @@ class All(Condition):
 
 
 class AnyOf(Condition):
+    # Not `Any`, which would shadow typing.Any in this module.
     def __init__(self, items: list[Condition]) -> None:
         self.items = items
 

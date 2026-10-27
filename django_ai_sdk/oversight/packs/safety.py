@@ -1,35 +1,30 @@
 """The safety pack: harm in what is asked and what is said, and people at risk.
 
-Answered by a moderation model when the `moderation` alias is defined, and by
-patterns otherwise. A message suggesting someone is at risk is never blocked:
-it goes to a person, first in line.
+Jev answers all three lenses. Where it is unsure, OpenAI's moderation endpoint
+(the `moderation` alias) is asked about the question, and the `judge` model about
+the answer, which review has time for. A message suggesting someone is at risk is
+never blocked: it goes to a person, first in line.
 """
 
 from __future__ import annotations
 
-from django_ai_sdk.oversight.answerers import Patterns
 from django_ai_sdk.oversight.conditions import L
 from django_ai_sdk.oversight.lenses import Flag, Score
 from django_ai_sdk.oversight.policy import Policy
 from django_ai_sdk.oversight.registry import register
 from django_ai_sdk.oversight.rules import Alert, Notify, Queue, Rule
-from django_ai_sdk.oversight.types import Purpose, Stage, Subject
-
-SELF_HARM_PATTERNS = [
-    r"\b(kill|hurt|harm) myself\b",
-    r"\b(suicide|suicidal|end my life|want to die)\b",
-    r"\b(zelfmoord|mezelf (iets )?aandoen|dood willen|wil dood)\b",
-]
+from django_ai_sdk.oversight.types import Stage, Subject
 
 
 class SelfHarm(Flag):
     name = "self_harm"
     label = "Person at risk"
     question = "Does the message suggest the person may harm themselves?"
+    yes = "Expresses intent, plan or wish to harm or kill themselves, directly or indirectly."
+    no = "Mentions death or harm figuratively, about others, or as a topic."
     subject = Subject.INPUT
     stages = (Stage.GATE,)
-    answerers = [Patterns(SELF_HARM_PATTERNS, miss_confidence=0.7), "moderation?"]
-    purposes = (Purpose.SECURITY,)
+    answerers = ["jev?", "moderation?"]
 
 
 class HarmfulInput(Score):
@@ -39,8 +34,7 @@ class HarmfulInput(Score):
     low, high = "harmless", "clearly harmful"
     subject = Subject.INPUT
     stages = (Stage.GATE,)
-    answerers = ["moderation?", "guardian?"]
-    purposes = (Purpose.SECURITY,)
+    answerers = ["jev?", "moderation?"]
 
 
 class HarmfulOutput(Score):
@@ -50,8 +44,7 @@ class HarmfulOutput(Score):
     low, high = "harmless", "clearly harmful"
     subject = Subject.OUTPUT
     stages = (Stage.REVIEW,)
-    answerers = ["moderation?", "judge?"]
-    purposes = (Purpose.SECURITY, Purpose.QUALITY)
+    answerers = ["jev?", "judge?"]
 
 
 @register
@@ -81,4 +74,4 @@ class SafetyPack(Policy):
     ]
 
 
-__all__ = ["SELF_HARM_PATTERNS", "SafetyPack"]
+__all__ = ["HarmfulInput", "HarmfulOutput", "SafetyPack", "SelfHarm"]

@@ -14,13 +14,16 @@ from django_ai_sdk.oversight import (
     Keywords,
     L,
     Mode,
+    Notify,
     Policy,
     Redact,
     Rule,
+    pick,
     register,
 )
 from django_ai_sdk.oversight.conditions import from_dict, same_shape
 from django_ai_sdk.oversight.policy import apply_overlay, build, invalidate
+from django_ai_sdk.oversight.packs.security import SecurityPack
 from django_ai_sdk.oversight.registry import get_invalid_policies, validate
 from django_ai_sdk.oversight.stages import evaluate_rules
 from django_ai_sdk.oversight.types import Answer, Capture, Stage
@@ -83,6 +86,17 @@ class ChildPolicy(Policy):
     capture = Capture.REDACTED
     lenses = [Choice(name="topic", question="?", labels=["a", "b"], answerers=[Keywords({"a": ["a"]})])]
     rules = [Rule("note_b", when=L("topic") == "b", then=Alert(), mode=Mode.ENFORCE)]
+
+
+
+@register
+class PickedPolicy(Policy):
+    name = "test-picked"
+    lenses = pick(SecurityPack.lenses, "prompt_injection", "secrets_input")
+    rules = [
+        *pick(SecurityPack.rules, "block_injection"),
+        *pick(SecurityPack.rules, "redact_secrets_in_question", mode=Mode.ENFORCE),
+    ]
 
 
 class TestPolicies:
@@ -161,6 +175,27 @@ class TestPolicies:
 
         assert "test-bad" in get_invalid_policies()
 
+    def test_a_policy_picks_single_lenses_and_rules_from_a_pack(self):
+        resolved = build("test-picked")
+        assert list(resolved.lenses) == ["prompt_injection", "secrets_input"]
+        assert list(resolved.rules) == ["block_injection", "redact_secrets_in_question"]
+        assert resolved.sources["lens:prompt_injection.origin"] == "code"
+        assert resolved.rules["redact_secrets_in_question"].mode is Mode.ENFORCE
+        assert not get_invalid_policies().get("test-picked")
+
+    def test_picking_leaves_the_pack_alone(self):
+        pack = {rule.name: rule for rule in SecurityPack.rules}
+        assert pack["redact_secrets_in_question"].mode is Mode.SHADOW
+        assert pick(SecurityPack.rules, "block_injection")[0] is not pack["block_injection"]
+
+    def test_picking_an_unknown_name_says_what_there_is(self):
+        with pytest.raises(ImproperlyConfigured, match="prompt_injection"):
+            pick(SecurityPack.lenses, "prompt_injektion")
+
+    def test_mode_only_applies_to_rules(self):
+        with pytest.raises(TypeError):
+            pick(SecurityPack.lenses, "prompt_injection", mode=Mode.ENFORCE)
+
     def test_the_packs_are_registered_and_resolve(self):
         resolved = build("default")
         assert {"prompt_injection", "pii_input", "groundedness", "intent", "self_harm"} <= set(
@@ -197,8 +232,93 @@ class TestRuleEvaluation:
     def test_fail_closed_treats_an_error_as_a_match(self):
         resolved = build("test-parent")
         broken = {"mentions_x": ans(None, error="timeout")}
+
+        def closed():
+            return evaluate_rules(
+                resolved, broken, Stage.GATE, done=set(), errored={"mentions_x"}, fail_closed=True
+            )
+
+        # In shadow, a slow answerer would only fill the ledger with false matches.
+        assert not closed()
+        resolved.rules["block_x"].mode = Mode.ENFORCE
         assert not evaluate_rules(resolved, broken, Stage.GATE, done=set())
-        matched = evaluate_rules(
+        assert [m.rule.name for m in closed()] == ["block_x"]
+
+    def test_fail_closed_never_raises_an_alert(self):
+        resolved = build("test-parent")
+        resolved.rules["block_x"].mode = Mode.ENFORCE
+        resolved.rules["block_x"].then = [Alert("high")]
+        broken = {"mentions_x": ans(None, error="timeout")}
+        assert not evaluate_rules(
             resolved, broken, Stage.GATE, done=set(), errored={"mentions_x"}, fail_closed=True
         )
-        assert [m.rule.name for m in matched] == ["block_x"]
+
+    def test_retention_takes_content_and_metadata_only(self):
+        resolved = build("test-parent")
+        assert resolved.retention == {"content": 90, "metadata": 730}
+        apply_overlay(
+            resolved,
+            [
+                {"target_kind": "policy", "target": "", "field": "retention",
+                 "value": {"content": 30}},
+                {"target_kind": "policy", "target": "", "field": "retention",
+                 "value": {"security": 90}},
+            ],
+            source="db",
+        )
+        assert resolved.retention == {"content": 30, "metadata": 730}
+        assert "unknown retention" in resolved.rejected[0]["reason"]
+
+
+class TestSeverity:
+    def test_error_means_high_and_unknowns_are_refused(self):
+        assert Alert("error").severity == "high"
+        assert Notify(severity="critical").severity == "critical"
+        with pytest.raises(ValueError, match="Unknown severity"):
+            Alert("loud")
+
+    def test_the_most_severe_wins(self):
+        from django_ai_sdk.oversight.types import most_severe
+
+        assert most_severe("info", "high", "warning") == "high"
+        assert most_severe() == ""
+
+
+@pytest.mark.django_db(transaction=True)
+class TestInheritedTuning:
+    def setup_method(self):
+        invalidate()
+
+    async def _enforce_on_parent(self):
+        from django_ai_sdk.oversight.models import PolicyOverride
+
+        await PolicyOverride.objects.acreate(
+            policy="test-parent", target_kind="rule", target="block_x", field="mode",
+            value="enforce",
+        )
+
+    async def test_tuning_a_parent_reaches_its_children(self):
+        from django_ai_sdk.oversight.policy import aget_policy
+
+        await self._enforce_on_parent()
+        child = await aget_policy("test-child")
+        assert child.rules["block_x"].mode is Mode.ENFORCE
+        assert child.sources["rule:block_x.mode"] == "db:test-parent"
+        assert child.sources["rule:block_x.when"] == "pack:test-parent"
+
+    async def test_invalidating_a_parent_forgets_its_children(self):
+        from django_ai_sdk.oversight.policy import aget_policy
+
+        assert (await aget_policy("test-child")).rules["block_x"].mode is Mode.SHADOW
+        await self._enforce_on_parent()
+        invalidate("test-parent")
+        assert (await aget_policy("test-child")).rules["block_x"].mode is Mode.ENFORCE
+
+    async def test_an_uncached_read_leaves_the_cache_alone(self):
+        from django_ai_sdk.oversight import policy as policies
+
+        cached = await policies.aget_policy("test-child")
+        await self._enforce_on_parent()
+        fresh = await policies.aget_policy("test-child", uncached=True)
+        assert fresh.rules["block_x"].mode is Mode.ENFORCE
+        assert await policies.aget_policy("test-child") is cached

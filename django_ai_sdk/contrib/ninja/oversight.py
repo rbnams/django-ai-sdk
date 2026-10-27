@@ -13,7 +13,7 @@ from collections.abc import Collection
 from typing import Any
 
 from django.http import HttpRequest, StreamingHttpResponse
-from ninja import Router, Schema
+from ninja import Query, Router, Schema
 
 from django_ai_sdk.contrib.ninja.routing import ERRORS, ApiRouter, Limit, Offset
 from django_ai_sdk.errors import NotFound
@@ -35,6 +35,7 @@ from django_ai_sdk.oversight.schemas import (
     TryAnswererIn,
     TryLensIn,
     TurnDetail,
+    TurnFilter,
     TurnPage,
     VerdictIn,
     VerifyOut,
@@ -65,42 +66,18 @@ def _found(value: Any, what: str) -> Any:
 @routes.get("/oversight/turns/", response=TurnPage)
 async def list_oversight_turns(
     request: HttpRequest,
-    purpose: str = "security",
-    outcome: str = "",
-    shadow_outcome: str = "",
-    agent_id: str = "",
-    channel: str = "",
-    policy: str = "",
-    severity: str = "",
-    label: str = "",
-    value: str = "",
-    rule: str = "",
-    review: str = "",
-    thread_id: str = "",
+    filters: Query[TurnFilter],
+    purpose: str = "review",
     limit: Limit = 50,
     offset: Offset = 0,
 ) -> Any:
     return await OversightService.list_turns(
-        user=request.user,
-        purpose=purpose,
-        outcome=outcome,
-        shadow_outcome=shadow_outcome,
-        agent_id=agent_id,
-        channel=channel,
-        policy=policy,
-        severity=severity,
-        label=label,
-        value=value,
-        rule=rule,
-        review=review,
-        thread_id=thread_id,
-        limit=limit,
-        offset=offset,
+        filters, user=request.user, purpose=purpose, limit=limit, offset=offset
     )
 
 
 @routes.get("/oversight/turns/{turn_id}/", response=TurnDetail)
-async def get_oversight_turn(request: HttpRequest, turn_id: str, purpose: str = "security") -> Any:
+async def get_oversight_turn(request: HttpRequest, turn_id: str, purpose: str = "review") -> Any:
     turn = await OversightService.get_turn(turn_id, user=request.user, purpose=purpose)
     return _found(turn, "Turn")
 
@@ -122,7 +99,7 @@ async def list_oversight_reviews(
     request: HttpRequest,
     queue: str = "",
     status: str = "open",
-    purpose: str = "quality",
+    purpose: str = "review",
     limit: Limit = 50,
     offset: Offset = 0,
 ) -> Any:
@@ -153,11 +130,6 @@ async def list_oversight_policies(request: HttpRequest) -> Any:
 @routes.get("/oversight/policies/{name}/", response=dict[str, Any])
 async def get_oversight_policy(request: HttpRequest, name: str) -> Any:
     return _found(await OversightService.get_policy(name, user=request.user), "Policy")
-
-
-@routes.get("/oversight/policies/{name}/overrides/", response=list[OverrideOut])
-async def list_oversight_overrides(request: HttpRequest, name: str) -> Any:
-    return await OversightService.list_overrides(name, user=request.user)
 
 
 @routes.post("/oversight/policies/{name}/overrides/", response=dict[str, Any])

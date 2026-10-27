@@ -1,26 +1,23 @@
 """The quality pack: was the answer any good, and was retrieval?
 
-The RAG triad (context relevance, groundedness, answer relevance) runs in the
-background, so it costs the person nothing in latency. Lexical overlap answers
-each first; with a `judge` alias defined, a model is asked whenever overlap is
-unsure, which, by design, is most of the time.
+The RAG triad (context relevance, groundedness, answer relevance) and helpfulness
+run in the background, so they cost the person nothing in latency. Jev scores the
+triad against the turn's sources and tool results, in one call of about 200 ms;
+a turn with nothing to check against is not scored for grounding. Helpfulness,
+the broadest judgment, asks the `judge` model where Jev is unsure. Jev also answers
+refusals and a reply in the wrong language at review. Empty retrieval and failed
+tools are facts about the turn, so code answers them.
 """
 
 from __future__ import annotations
 
-from django_ai_sdk.oversight.answerers import (
-    EmptyRetrieval,
-    Language,
-    LexicalSupport,
-    Refusal,
-    ToolErrors,
-)
+from django_ai_sdk.oversight.answerers import EmptyRetrieval, ToolErrors
 from django_ai_sdk.oversight.conditions import L
 from django_ai_sdk.oversight.lenses import Flag, Score
 from django_ai_sdk.oversight.policy import Policy
 from django_ai_sdk.oversight.registry import register
 from django_ai_sdk.oversight.rules import Alert, Queue, Rule
-from django_ai_sdk.oversight.types import Purpose, Stage, Subject
+from django_ai_sdk.oversight.types import Stage, Subject
 
 
 class ContextRelevance(Score):
@@ -34,8 +31,7 @@ class ContextRelevance(Score):
     low, high = "unrelated", "exactly what is needed"
     subject = Subject.SOURCES
     stages = (Stage.REFLECT,)
-    answerers = [LexicalSupport(), "judge?"]
-    purposes = (Purpose.QUALITY,)
+    answerers = ["jev?"]
 
 
 class Groundedness(Score):
@@ -50,8 +46,8 @@ class Groundedness(Score):
     low, high = "unsupported", "fully supported"
     subject = Subject.OUTPUT
     stages = (Stage.REFLECT,)
-    answerers = [LexicalSupport(), "judge?"]
-    purposes = (Purpose.QUALITY,)
+    needs_evidence = True
+    answerers = ["jev?"]
 
 
 class AnswerRelevance(Score):
@@ -61,8 +57,7 @@ class AnswerRelevance(Score):
     low, high = "beside the point", "fully addresses it"
     subject = Subject.EXCHANGE
     stages = (Stage.REFLECT,)
-    answerers = ["judge?"]
-    purposes = (Purpose.QUALITY,)
+    answerers = ["jev?"]
 
 
 class Helpfulness(Score):
@@ -73,29 +68,30 @@ class Helpfulness(Score):
     low, high = "useless", "excellent"
     subject = Subject.EXCHANGE
     stages = (Stage.REFLECT,)
-    answerers = ["judge?"]
+    answerers = ["jev?", "judge?"]
     sample = 0.25
-    purposes = (Purpose.QUALITY,)
 
 
 class Refused(Flag):
     name = "refusal"
     label = "Refusal"
     question = "Does the assistant decline to answer?"
+    yes = "Declines, deflects or says it cannot help."
+    no = "Answers, even partly."
     subject = Subject.OUTPUT
     stages = (Stage.REVIEW,)
-    answerers = [Refusal()]
-    purposes = (Purpose.QUALITY,)
+    answerers = ["jev?"]
 
 
 class LanguageMismatch(Flag):
     name = "language_mismatch"
     label = "Language mismatch"
     question = "Is the answer in a different language than the question?"
+    yes = "Answers in a different language than the question."
+    no = "Same language."
     subject = Subject.EXCHANGE
     stages = (Stage.REVIEW,)
-    answerers = [Language()]
-    purposes = (Purpose.QUALITY,)
+    answerers = ["jev?"]
 
 
 class NothingFound(Flag):
@@ -105,7 +101,6 @@ class NothingFound(Flag):
     subject = Subject.SOURCES
     stages = (Stage.REVIEW,)
     answerers = [EmptyRetrieval()]
-    purposes = (Purpose.QUALITY,)
 
 
 class FailedTools(Score):
@@ -115,7 +110,6 @@ class FailedTools(Score):
     subject = Subject.EXCHANGE
     stages = (Stage.REVIEW,)
     answerers = [ToolErrors()]
-    purposes = (Purpose.QUALITY,)
 
 
 @register
@@ -160,4 +154,14 @@ class QualityPack(Policy):
     ]
 
 
-__all__ = ["QualityPack"]
+__all__ = [
+    "AnswerRelevance",
+    "ContextRelevance",
+    "FailedTools",
+    "Groundedness",
+    "Helpfulness",
+    "LanguageMismatch",
+    "NothingFound",
+    "QualityPack",
+    "Refused",
+]

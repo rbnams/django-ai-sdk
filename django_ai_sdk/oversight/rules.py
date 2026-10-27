@@ -18,7 +18,7 @@ from typing import Any, ClassVar
 from django.core.exceptions import ImproperlyConfigured
 
 from django_ai_sdk.oversight.conditions import Condition, from_dict
-from django_ai_sdk.oversight.types import Mode, Outcome, Stage
+from django_ai_sdk.oversight.types import Mode, Outcome, Severity, Stage
 
 
 class Action:
@@ -46,6 +46,17 @@ class Allow(Action):
     outcome = Outcome.ALLOWED
 
 
+def _severity(value: str) -> str:
+    # "error" was a severity once; "high" means the same.
+    value = "high" if value == "error" else value
+    try:
+        return str(Severity(value))
+    except ValueError:
+        raise ValueError(
+            f"Unknown severity {value!r}; one of {[str(s) for s in Severity]}"
+        ) from None
+
+
 class Alert(Action):
     """Mark the turn for attention at `severity`."""
 
@@ -53,7 +64,7 @@ class Alert(Action):
     outcome = Outcome.FLAGGED
 
     def __init__(self, severity: str = "warning") -> None:
-        self.severity = severity
+        self.severity = _severity(severity)
 
     def params(self) -> dict[str, Any]:
         return {"severity": self.severity}
@@ -63,15 +74,23 @@ class Redact(Action):
     """Mask what `lenses` (default: every lens the rule reads) pointed at.
 
     At the gate the question is masked before the model or the thread sees it; in
-    review the stored answer is masked, and the client told to replace its copy;
-    in reflect the stored message is masked after the fact.
+    review the stored answer is masked, and the client told to replace its copy
+    when the stream ends; in reflect the stored message is masked after the fact.
+    While the answer streams nothing is masked: a rule that holds there is judged
+    again in review, on the whole answer.
     """
 
     kind = "redact"
     outcome = Outcome.REDACTED
-    effective = (Stage.GATE, Stage.WATCH, Stage.REVIEW, Stage.REFLECT)
+    effective = (Stage.GATE, Stage.REVIEW, Stage.REFLECT)
 
     def __init__(self, lenses: list[str] | None = None, template: str = "[{label}]") -> None:
+        try:
+            template.format(label="X")
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                f"Redact template {template!r} must only use {{label}}: {exc}"
+            ) from exc
         self.lenses = list(lenses or [])
         self.template = template
 
@@ -124,7 +143,7 @@ class Queue(Action):
 
 
 class Escalate(Action):
-    """Ask a stronger answerer: re-judge `lens` with `answerer` in the background."""
+    """Re-judge `lens` with `answerer` in the background once this rule holds."""
 
     kind = "escalate"
     outcome = Outcome.FLAGGED
@@ -145,7 +164,7 @@ class Notify(Action):
 
     def __init__(self, exporters: list[str] | None = None, severity: str = "warning") -> None:
         self.exporters = list(exporters or [])
-        self.severity = severity
+        self.severity = _severity(severity)
 
     def params(self) -> dict[str, Any]:
         return {"exporters": self.exporters, "severity": self.severity}

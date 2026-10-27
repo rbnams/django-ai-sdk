@@ -23,7 +23,15 @@ if TYPE_CHECKING:
 
     from django.db import models
 
-    from django_ai_sdk.oversight.models import LedgerEntry
+    from django_ai_sdk.oversight.models import (
+        AccessRecord,
+        DataKey,
+        Decision,
+        LedgerEntry,
+        Observation,
+        PolicyOverride,
+        Turn,
+    )
 
 GENESIS = "0" * 64
 
@@ -53,7 +61,10 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def turn_payload(turn: Any) -> dict[str, Any]:
+# Hashed fields: never change them for an existing kind; add a new kind instead.
+# verify() recomputes every stored row's payload with these functions, so a renamed
+# or reformatted field breaks the chain for every row written before the change.
+def turn_payload(turn: Turn) -> dict[str, Any]:
     return {
         "id": str(turn.id),
         "created_at": _iso(turn.created_at),
@@ -70,7 +81,7 @@ def turn_payload(turn: Any) -> dict[str, Any]:
     }
 
 
-def observation_payload(obs: Any) -> dict[str, Any]:
+def observation_payload(obs: Observation) -> dict[str, Any]:
     return {
         "id": str(obs.id),
         "turn": str(obs.turn_id),
@@ -85,7 +96,7 @@ def observation_payload(obs: Any) -> dict[str, Any]:
     }
 
 
-def decision_payload(decision: Any) -> dict[str, Any]:
+def decision_payload(decision: Decision) -> dict[str, Any]:
     return {
         "id": str(decision.id),
         "turn": str(decision.turn_id),
@@ -98,7 +109,7 @@ def decision_payload(decision: Any) -> dict[str, Any]:
     }
 
 
-def access_payload(record: Any) -> dict[str, Any]:
+def access_payload(record: AccessRecord) -> dict[str, Any]:
     return {
         "id": str(record.id),
         "reader": record.reader_label,
@@ -110,7 +121,7 @@ def access_payload(record: Any) -> dict[str, Any]:
     }
 
 
-def override_payload(override: Any) -> dict[str, Any]:
+def override_payload(override: PolicyOverride) -> dict[str, Any]:
     # Not `active`: a later override withdraws this one, and is chained itself.
     return {
         "id": str(override.id),
@@ -124,7 +135,7 @@ def override_payload(override: Any) -> dict[str, Any]:
     }
 
 
-def shred_payload(key: Any) -> dict[str, Any]:
+def shred_payload(key: DataKey) -> dict[str, Any]:
     return {"id": str(key.id), "scope": key.scope, "at": _iso(key.shredded_at)}
 
 
@@ -132,49 +143,66 @@ def shred_payload(key: Any) -> dict[str, Any]:
 class Kind:
     model: str
     payload: Callable[[Any], dict[str, Any]]
-    # Domain rows carry their own entry_hash, so a reader can check one without the chain.
-    stamps: bool = True
+    # The row keeps its entry_hash: the feed shows a turn as chained without a join.
+    stamps: bool = False
 
 
 KINDS: dict[str, Kind] = {
-    "turn": Kind("Turn", turn_payload),
+    "turn": Kind("Turn", turn_payload, stamps=True),
     "observation": Kind("Observation", observation_payload),
     "decision": Kind("Decision", decision_payload),
     "access": Kind("AccessRecord", access_payload),
     "override": Kind("PolicyOverride", override_payload),
-    "shred": Kind("DataKey", shred_payload, stamps=False),
+    "shred": Kind("DataKey", shred_payload),
 }
 
 
 def append(kind: str, row: models.Model) -> LedgerEntry:
-    """Chain `row` onto the ledger. Call inside transaction.atomic(), synchronously.
+    """Chain `row` onto the ledger. Call inside transaction.atomic(), synchronously."""
+    return append_many([(kind, row)])[0]
 
-    The head row's lock serializes appenders: one gapless sequence, one tip.
+
+def append_many(items: list[tuple[str, models.Model]]) -> list[LedgerEntry]:
+    """Chain `items` onto the ledger in order. Call inside transaction.atomic(), synchronously.
+
+    The head row's lock serializes appenders: one gapless sequence, one tip. Take
+    it last in the transaction, so other turns wait for it as briefly as they can.
     """
     from django_ai_sdk.oversight.models import LedgerEntry, LedgerHead
 
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("ledger.append must run inside transaction.atomic()")
-    spec = KINDS[kind]
-    LedgerHead.objects.get_or_create(id=1)
-    head = LedgerHead.objects.select_for_update().get(id=1)
-    payload_hash = sha256(canonical(spec.payload(row)))
-    seq = head.seq + 1
-    digest = entry_digest(seq, kind, str(row.pk), payload_hash, head.entry_hash)
-    entry = LedgerEntry.objects.create(
-        seq=seq,
-        kind=kind,
-        ref=str(row.pk),
-        payload_hash=payload_hash,
-        prev_hash=head.entry_hash,
-        entry_hash=digest,
-    )
-    head.seq, head.entry_hash = seq, digest
+    if not items:
+        return []
+    head, _ = LedgerHead.objects.select_for_update().get_or_create(id=1)
+    seq, previous = head.seq, head.entry_hash
+    entries: list[LedgerEntry] = []
+    stamped: list[models.Model] = []
+    for kind, row in items:
+        spec = KINDS[kind]
+        seq += 1
+        payload_hash = sha256(canonical(spec.payload(row)))
+        digest = entry_digest(seq, kind, str(row.pk), payload_hash, previous)
+        entries.append(
+            LedgerEntry(
+                seq=seq,
+                kind=kind,
+                ref=str(row.pk),
+                payload_hash=payload_hash,
+                prev_hash=previous,
+                entry_hash=digest,
+            )
+        )
+        if spec.stamps:
+            row.entry_hash = digest  # type: ignore[attr-defined]
+            stamped.append(row)
+        previous = digest
+    LedgerEntry.objects.bulk_create(entries)
+    head.seq, head.entry_hash = seq, previous
     head.save(update_fields=["seq", "entry_hash"])
-    if spec.stamps:
-        type(row)._default_manager.filter(pk=row.pk).update(entry_hash=digest)
-        row.entry_hash = digest  # type: ignore[attr-defined]
-    return entry
+    for row in stamped:
+        type(row)._default_manager.filter(pk=row.pk).update(entry_hash=row.entry_hash)  # type: ignore[attr-defined]
+    return entries
 
 
 @dataclass
@@ -263,4 +291,13 @@ def verify(*, start: int = 1, stop: int | None = None, batch: int = 2_000) -> Ve
     return result
 
 
-__all__ = ["GENESIS", "KINDS", "Verification", "append", "canonical", "sha256", "verify"]
+__all__ = [
+    "GENESIS",
+    "KINDS",
+    "Verification",
+    "append",
+    "append_many",
+    "canonical",
+    "sha256",
+    "verify",
+]

@@ -342,6 +342,43 @@ async def cite(answer: str, registry: SourceRegistry, agent: Agent | Run) -> lis
     return citations
 
 
+def rebase(data: CitationsData, answer: str) -> CitationsData:
+    """`data` moved onto `answer`, the text as stored when review masked part of it.
+
+    A citation whose quote is still at its place stays; one whose quote moved is
+    found again; one whose quote is gone (it held a masked span) is dropped, and a
+    source only it cited is no longer marked cited. Fuzzy matches do not count: a
+    quote that only resembles the answer may be the part that was masked.
+    """
+    from django_ai_sdk.artifacts.schemas import CitationsData  # noqa: PLC0415
+
+    kept: list[Citation] = []
+    for citation in data.citations:
+        if answer[citation.start : citation.end] == citation.quote:
+            kept.append(citation)
+            continue
+        found = match(answer, citation.quote)
+        if found and found[2] != "fuzzy":
+            start, end, _ = found
+            kept.append(
+                citation.model_copy(update={"start": start, "end": end, "quote": answer[start:end]})
+            )
+    if len(kept) == len(data.citations) and all(
+        a is b for a, b in zip(kept, data.citations, strict=True)
+    ):
+        return data
+    kept.sort(key=lambda c: c.start)
+    numbers: dict[str, int] = {}
+    for citation in kept:
+        for evidence in citation.evidence:
+            numbers.setdefault(evidence.key, len(numbers) + 1)
+    sources = [
+        s.model_copy(update={"number": numbers.get(s.key, 0), "cited": s.key in numbers})
+        for s in data.sources
+    ]
+    return CitationsData(citations=kept, sources=sources)
+
+
 def uncited(registry: SourceRegistry) -> CitationsData:
     """The turn's own sources without citations"""
     from django_ai_sdk.artifacts.schemas import CitationsData  # noqa: PLC0415

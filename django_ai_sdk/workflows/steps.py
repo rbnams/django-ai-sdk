@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from django_ai_sdk.common import ChatMessage
 
@@ -220,9 +220,23 @@ class AgentStep(Step):
                 await oversight.close()
                 return StepOutcome(status="failed", detail=f"withheld by oversight: {result}")
         elif result is not None:
-            await oversight.review(
+            reviewed = await oversight.review(
                 result.model_dump_json() if isinstance(result, BaseModel) else str(result)
             )
+            if reviewed.blocked:
+                await oversight.close()
+                return StepOutcome(
+                    status="failed", detail=f"withheld by oversight: {reviewed.output}"
+                )
+            if reviewed.replaced:
+                result = _replaced(result, reviewed.output)
+                if result is None:
+                    # A masked copy that no longer fits the schema must not pass as the original.
+                    await oversight.close()
+                    return StepOutcome(
+                        status="failed",
+                        detail="withheld by oversight: the masked result is invalid",
+                    )
         await oversight.close(error="" if result is not None else "no result")
         if result is None:
             return StepOutcome(status="failed", detail="the agent returned nothing")
@@ -239,6 +253,16 @@ class AgentStep(Step):
         if self.schema is not None:
             return StepOutcome(status="failed", detail="the agent returned no structured output")
         return StepOutcome(output=result)
+
+
+def _replaced(result: Any, output: str) -> BaseModel | None:
+    """A structured result rebuilt from the text review masked; None when it cannot be."""
+    if not isinstance(result, BaseModel):
+        return None
+    try:
+        return type(result).model_validate_json(output)
+    except ValidationError:
+        return None
 
 
 def _as_message(item: Any) -> ChatMessage:

@@ -16,7 +16,7 @@ from haystack.dataclasses import (
     ToolCall,
 )
 
-from django_ai_sdk.adapters.citations.grounding import Grounder, uncited
+from django_ai_sdk.adapters.citations.grounding import Grounder, rebase, uncited
 from django_ai_sdk.adapters.citations.registry import current_registry
 from django_ai_sdk.adapters.utils import merge_messages
 from django_ai_sdk.agents.subagent import SUBAGENT_META_KEY, SubagentStreamFilter
@@ -50,6 +50,7 @@ from django_ai_sdk.oversight.stream import (
     notice_event,
     observe_event,
     restrict_agent_tools,
+    stored_notices,
 )
 from django_ai_sdk.tracing import bind as bind_trace
 from django_ai_sdk.utils import resolve_setting
@@ -540,7 +541,8 @@ class Stream:
                 async for _ in grounder.wait(answer, timeout):
                     for event in self._partial_citations(grounder):
                         yield event
-                data = grounder.citations()
+                # Review may have masked the answer: quotes must still be in it.
+                data = rebase(grounder.citations(), answer)
         except Exception:
             logger.exception("Placing citations failed; the answer has none")
             data = None
@@ -602,6 +604,17 @@ class Stream:
         output = data.model_dump(mode="json", by_alias=True)
         events.append(ToolOutputEvent(tool_call_id=self._citations_call_id, tool_output=output))
         return events
+
+    def _withdraw_citations(self) -> list[StreamEvent]:
+        """A withheld answer cites nothing: clear the citations shown while it streamed."""
+        from django_ai_sdk.artifacts.schemas import CitationsData  # noqa: PLC0415
+
+        if self._grounder:
+            self._grounder.cancel()
+        if not self._citations_call_id:
+            return []
+        empty = CitationsData().model_dump(mode="json", by_alias=True)
+        return [ToolOutputEvent(tool_call_id=self._citations_call_id, tool_output=empty)]
 
     def _tool_input(
         self,
@@ -806,12 +819,13 @@ class Stream:
     async def get_final_message(
         self,
         stream_writer: StreamWriter | None,
+        finish_reason: str = "stop",
     ) -> ChatMessage | None:
         """Finalize the stream writer: the message is stored."""
         if not stream_writer:
             return None
 
-        result = await stream_writer.finalize("stop")
+        result = await stream_writer.finalize(finish_reason)
         self.message_result = result
         return result
 
@@ -931,6 +945,15 @@ class Stream:
         session = self.oversight if self.oversight is not None and self.oversight.active else None
         if session is not None:
             session.message_id = message_id
+
+            async def refused_results(stubs: list[Any]) -> None:
+                # A refused call never reaches the ToolInvoker, so its stub is streamed here.
+                for index, stub in enumerate(stubs):
+                    await queue.put(
+                        StreamingChunk(content="", index=index, tool_call_result=stub.tool_call_result)
+                    )
+
+            session.on_tool_results = refused_results
         stopped: ReviewResult | None = None
 
         try:
@@ -966,20 +989,20 @@ class Stream:
                 current_registry.reset(registry_token)
             pipeline_task.add_done_callback(lambda _: queue.put_nowait(_SENTINEL))
 
-            registry = self.citation_registry
-            if registry is not None and self.thread_id and self.citation_agent and stream_writer:
-                self._grounder = Grounder(
-                    registry,
-                    self.citation_agent,
-                    on_block=lambda: queue.put_nowait(_CITED),
-                )
-
-            held: list[str] = []
             hold = (
                 session is not None
                 and session.policy is not None
                 and (session.policy.stream_mode == "hold")
             )
+            registry = self.citation_registry
+            if registry is not None and self.thread_id and self.citation_agent and stream_writer:
+                # Held answers show no citations as they stream: a block must hide them too.
+                self._grounder = Grounder(
+                    registry,
+                    self.citation_agent,
+                    on_block=None if hold else lambda: queue.put_nowait(_CITED),
+                )
+
             async for event in self.get_events(queue, stream_writer):
                 if session is not None:
                     if isinstance(event, TextChunkEvent):
@@ -989,7 +1012,10 @@ class Stream:
                                 stopped = watched
                                 break
                         if hold:
-                            held.append(event.content)
+                            continue
+                    elif isinstance(event, ReasoningChunkEvent):
+                        # Stored all the same; shown only with the answer it led to.
+                        if hold:
                             continue
                     else:
                         observe_event(session, event)
@@ -997,17 +1023,21 @@ class Stream:
 
             if stopped is not None:
                 # The answer is withdrawn mid-stream: stop the model, store the message.
+                session.add_usage(*self.get_pipeline_usage(pipeline_task))
                 pipeline_task.cancel()
+                for event in self._withdraw_citations():
+                    yield event
                 if stopped.notice:
                     sent.append(stopped.notice)
                     yield notice_event(stopped.notice)
                 if stream_writer:
                     stream_writer.replace_text(stopped.output)
-                    stream_writer.message.metadata["oversight"] = sent
-                if hold or not session.view.output:
+                    stream_writer.drop_reasoning()
+                    stream_writer.message.metadata["oversight"] = stored_notices(sent)
+                if hold:
                     yield TextChunkEvent(content=stopped.output)
                 yield TextEndEvent()
-                await self.get_final_message(stream_writer)
+                await self.get_final_message(stream_writer, CONTENT_FILTER)
                 _finalize_called = True
                 yield MessageEndEvent(finish_reason=CONTENT_FILTER)
                 yield StreamEndEvent()
@@ -1033,6 +1063,7 @@ class Stream:
                 return
 
             finish_reason = None
+            withheld = False
             if session is not None:
                 session.add_usage(*self.get_pipeline_usage(pipeline_task))
                 if self.citation_registry is not None:
@@ -1041,23 +1072,30 @@ class Stream:
                     )
                 text = stream_writer.text if stream_writer else session.view.output
                 reviewed = await session.review(text)
+                withheld = reviewed.blocked
                 if reviewed.replaced and stream_writer:
                     stream_writer.replace_text(reviewed.output)
+                if withheld and stream_writer:
+                    stream_writer.drop_reasoning()
                 if reviewed.notice:
                     sent.append(reviewed.notice)
                     yield notice_event(reviewed.notice)
                 if sent and stream_writer:
-                    stream_writer.message.metadata["oversight"] = sent
+                    stream_writer.message.metadata["oversight"] = stored_notices(sent)
                 if hold:
                     yield TextChunkEvent(content=reviewed.output)
-                if reviewed.blocked:
+                if withheld:
                     finish_reason = CONTENT_FILTER
 
             # the text is done
             yield TextEndEvent()
-            async for event in self.get_citations_artifact(stream_writer):
-                yield event
-            await self.get_final_message(stream_writer)
+            if withheld:
+                for event in self._withdraw_citations():
+                    yield event
+            else:
+                async for event in self.get_citations_artifact(stream_writer):
+                    yield event
+            await self.get_final_message(stream_writer, finish_reason or "stop")
             _finalize_called = True
 
             # Outbound TypeSafe card before message_end so it lands on this assistant turn.

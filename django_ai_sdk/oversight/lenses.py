@@ -1,8 +1,9 @@
 """Lenses: one typed question about a turn, answerable by anything.
 
-A lens fixes the question and the shape of its answer, never who answers it. The
-same `PromptInjection` can be answered by a regex today, a local classifier next
-month and a human on Friday, and its history stays one comparable series.
+A lens fixes the question and the shape of its answer, never who answers it. Pick
+the answerer per lens: Jev for most yes/no, label and score lenses, code for exact
+spans such as personal data and secrets, a model judge for written text or where
+Jev is unsure. Change it later and the lens's history stays one comparable series.
 
 Declare a lens as a subclass, or inline with keyword arguments::
 
@@ -10,7 +11,7 @@ Declare a lens as a subclass, or inline with keyword arguments::
         name = "topic"
         question = "What is this message about?"
         labels = ["billing", "hr", "other"]
-        answerers = [Keywords({"billing": ["invoice"], "hr": ["leave"]}), "fast"]
+        answerers = ["jev?", "judge?"]
 
     Flag(name="mentions_competitor", question="Does it name a competitor?")
 """
@@ -22,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from django.core.exceptions import ImproperlyConfigured
 from pydantic import BaseModel, Field, create_model
 
-from django_ai_sdk.oversight.types import Purpose, Stage, Subject
+from django_ai_sdk.oversight.types import Stage, Subject, TurnView
 
 if TYPE_CHECKING:
     from typing import Literal  # noqa: F401
@@ -52,9 +53,10 @@ class Lens:
 
     # Share of turns the reflect stage judges, 0..1. Inline stages always run.
     sample: float = 1.0
-    # Who reads this lens's answers; the purpose views filter on it.
-    purposes: tuple[Purpose, ...] = (Purpose.SECURITY, Purpose.QUALITY)
     enabled: bool = True
+    # Only asked when the turn has sources or tool results to judge against
+    # (always so for subject SOURCES): groundedness means nothing without them.
+    needs_evidence: bool = False
 
     def __init__(self, **overrides: Any) -> None:
         for key, value in overrides.items():
@@ -63,8 +65,13 @@ class Lens:
             setattr(self, key, value)
         self.stages = tuple(Stage(s) for s in self.stages)
         self.subject = Subject(self.subject)
-        self.purposes = tuple(Purpose(p) for p in self.purposes)
         self.answerers = list(self.answerers)
+
+    def applies(self, view: TurnView) -> bool:
+        """Whether this turn has what the lens judges."""
+        if self.needs_evidence or self.subject is Subject.SOURCES:
+            return bool(view.evidence())
+        return True
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r}>"
@@ -99,6 +106,9 @@ class Lens:
         """This lens as a TypeSafe question, or None when TypeSafe has no such type."""
         return None
 
+    def typesafe_instructions(self) -> str:
+        return f"{self.question}\n{self.guidance}" if self.guidance else self.question
+
     def describe(self) -> dict[str, Any]:
         """JSON-safe summary for the policy screen and the ledger's config events."""
         return {
@@ -110,7 +120,6 @@ class Lens:
             "stages": [str(s) for s in self.stages],
             "confident": self.confident,
             "sample": self.sample,
-            "purposes": [str(p) for p in self.purposes],
             "enabled": self.enabled,
             **self.extra_description(),
         }
@@ -148,7 +157,7 @@ class Flag(Lens):
     def typesafe_question(self) -> dict[str, Any]:
         return {
             "type": "noul",
-            "instructions": self.question,
+            "instructions": self.typesafe_instructions(),
             "criteria": {"true": self.yes, "false": self.no},
         }
 
@@ -184,7 +193,7 @@ class Choice(Lens):
     def typesafe_question(self) -> dict[str, Any]:
         return {
             "type": "choice",
-            "instructions": self.question,
+            "instructions": self.typesafe_instructions(),
             "criteria": {label: self.criteria.get(label, label) for label in self.labels},
         }
 
@@ -196,8 +205,9 @@ class Score(Lens):
     """A number from 0 to 1, where 1 is the most of what the question asks about."""
 
     kind = "score"
-    # What 0 and 1 mean, for a model judge and for the screen.
+    # What 0 and 1 mean, for a model judge and for the screen; `middle` is Jev's middle level.
     low: str = "not at all"
+    middle: str = "partly"
     high: str = "completely"
 
     def parse(self, value: Any) -> float:
@@ -219,8 +229,8 @@ class Score(Lens):
     def typesafe_question(self) -> dict[str, Any]:
         return {
             "type": "score",
-            "instructions": self.question,
-            "criteria": [self.low, "partly", self.high],
+            "instructions": self.typesafe_instructions(),
+            "criteria": [self.low, self.middle, self.high],
         }
 
     def extra_description(self) -> dict[str, Any]:

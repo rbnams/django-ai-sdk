@@ -1,8 +1,10 @@
-"""System-one answerers: deterministic, local, free, fast enough for the gate.
+"""Local answerers: deterministic, free, fast enough for the gate.
 
-They never call a model, so a policy built only from these adds no cost and no
-data processor. A hit answers with confidence 1; nothing found answers with the
-answerer's `miss_confidence`, so a Cascade can still escalate a quiet "no".
+They never call a model, so they add no cost and no data processor. Use them for
+structural facts (lengths, tool failures, empty retrieval) and exact spans; a
+judgment call is Jev's. A hit answers with confidence 1; nothing found answers
+with the answerer's `miss_confidence`, so a later answerer can still overrule a
+quiet "no".
 """
 
 from __future__ import annotations
@@ -19,30 +21,47 @@ if TYPE_CHECKING:
     from django_ai_sdk.oversight.lenses import Lens
     from django_ai_sdk.oversight.types import TurnView
 
+# Detectors read at most this much of a subject: it bounds every pattern's cost,
+# and the spans still index the text, since they fall in its prefix.
+MAX_SCAN_CHARS = 50_000
+
 
 class Detector(Answerer):
     """Base for answerers that find labelled spans in the subject's text."""
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
     timeout = 2.0
-    # How sure "found nothing" is. Below the lens's `confident`, a Cascade asks on.
+    # How sure "found nothing" is. Below the lens's `confident`, the next answerer is asked.
     miss_confidence: float = 0.9
 
     def detect(self, text: str, view: TurnView, lens: Lens) -> list[TextSpan]:
         raise NotImplementedError
 
+    def looks_for(self) -> list[str]:
+        """The kinds this detector knows, so a miss can say what it looked for."""
+        return []
+
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
         text = view.text(lens.subject)
         if not text:
             return None
-        spans = self.detect(text, view, lens)
+        spans = self.detect(text[:MAX_SCAN_CHARS], view, lens)
         labels = list(dict.fromkeys(span.label for span in spans))
+        notes = [f"found {_listed(labels)}"] if labels else []
+        if not labels and (kinds := self.looks_for()):
+            notes.append(f"found none of: {_listed(kinds)}")
+        if len(text) > MAX_SCAN_CHARS:
+            notes.append(f"scanned the first {MAX_SCAN_CHARS:,} characters")
         return Answer(
             value=lens.from_detections(labels),
             confidence=1.0 if spans else self.miss_confidence,
             spans=spans,
-            rationale=f"found {', '.join(labels)}" if labels else "",
+            rationale="; ".join(notes),
         )
+
+
+def _listed(kinds: list[str]) -> str:
+    return ", ".join(kind.replace("_", " ") for kind in kinds)
 
 
 class Patterns(Detector):
@@ -78,8 +97,8 @@ class Patterns(Detector):
 class Keywords(Detector):
     """Whole-word keywords by label; the label with the most hits comes first.
 
-    The system-one way to classify every message: `Keywords({"billing": ["invoice",
-    "refund"], "hr": ["leave", "salary"]})` answers a Choice lens.
+    For fixed vocabularies such as product or competitor names: `Keywords({"acme":
+    ["acme"], "globex": ["globex"]})` answers an Entities or Choice lens.
     """
 
     def __init__(
@@ -108,7 +127,7 @@ class Keywords(Detector):
 class Length(Answerer):
     """The subject's length against `max_chars`: a Flag when over, a Score of how far."""
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
 
     def __init__(self, max_chars: int, name: str = "") -> None:
         self.max_chars = max_chars
@@ -148,7 +167,7 @@ def guess_language(text: str) -> tuple[str, float]:
 class Language(Answerer):
     """The subject's language (a Choice), or whether output matches input's (a Flag)."""
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
 
     def __init__(self, name: str = "") -> None:
         self.name = name or "language"
@@ -195,7 +214,7 @@ class Refusal(Detector):
 class EmptyRetrieval(Answerer):
     """Whether the turn found no sources while it did call a tool to look."""
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
 
     def __init__(self, name: str = "") -> None:
         self.name = name or "empty_retrieval"
@@ -209,7 +228,7 @@ class EmptyRetrieval(Answerer):
 class ToolErrors(Answerer):
     """The share of the turn's tool calls that failed: a Score, or a Flag for any."""
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
 
     def __init__(self, name: str = "") -> None:
         self.name = name or "tool_errors"
@@ -238,7 +257,7 @@ def _terms(text: str) -> set[str]:
 
 
 class LexicalSupport(Answerer):
-    """System-one RAG checks by word overlap. A floor under the model judges, not a peer.
+    """Local RAG checks by word overlap. A floor under the model judges, not a peer.
 
     By the lens's subject:
       OUTPUT/EXCHANGE: groundedness, the share of answer sentences most of whose
@@ -248,7 +267,7 @@ class LexicalSupport(Answerer):
     A Score gets the share; a Flag means "below `threshold`".
     """
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
 
     def __init__(
         self,

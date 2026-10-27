@@ -34,7 +34,7 @@ from django_ai_sdk.oversight.rules import Rule, action_from_dict
 from django_ai_sdk.oversight.types import Capture, Mode, Stage, Subject
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
 logger = get_logger(__name__)
 
@@ -44,6 +44,7 @@ CAPTURE_ORDER = [Capture.NONE, Capture.METADATA, Capture.REDACTED, Capture.FULL]
 LENS_FIELDS = {"enabled", "sample", "answerers", "confident", "stages"}
 RULE_FIELDS = {"mode", "when", "then", "message", "stages"}
 POLICY_FIELDS = {"capture", "stream_mode", "retention"}
+RETENTION_KEYS = ("content", "metadata")
 
 # The overlay scope for what is not one policy's: answerer aliases, agent choices.
 GLOBAL = "*"
@@ -63,7 +64,8 @@ class Policy:
     # None inherits; the deployment's CAPTURE is a ceiling either way.
     capture: Capture | None = None
     stream_mode: str | None = None
-    # Days per kind of content: "security", "quality", "metadata".
+    # Days to keep this policy's turns: {"content": 90, "metadata": 730}, either
+    # key alone. Unset keys come from AI_SDK_OVERSIGHT["RETENTION"].
     retention: dict[str, int] = {}  # noqa: RUF012
     # Where this policy's values say they come from on the policy screen.
     origin: str = "code"
@@ -74,6 +76,31 @@ class Policy:
 
     def get_rules(self) -> list[Rule]:
         return list(self.rules)
+
+
+def pick[T: (Lens | type[Lens], Rule)](
+    items: Iterable[T], *names: str, mode: Mode | str | None = None
+) -> list[T]:
+    """The lenses or rules called `names`, in that order, out of a pack's `lenses` or `rules`.
+
+    Start small: take what you need from the packs instead of extending them whole::
+
+        lenses = pick(SecurityPack.lenses, "prompt_injection", "pii_input")
+        rules = pick(SecurityPack.rules, "block_injection", "redact_pii_in_question")
+
+    Rules come back as copies, so `mode` changes the copy and the pack keeps its own.
+    """
+    by_name = {item.name: item for item in items}
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        raise ImproperlyConfigured(f"Cannot pick {missing}: the choices are {sorted(by_name)}")
+    picked = [copy.copy(by_name[name]) for name in names]
+    if mode is not None:
+        for item in picked:
+            if not isinstance(item, Rule):
+                raise TypeError("pick(mode=...) applies to rules only")
+            item.mode = Mode(mode)
+    return picked
 
 
 @dataclass
@@ -121,7 +148,7 @@ class ResolvedPolicy:
                 return {"name": spec[:-1], "optional": True, "configured": False}
             try:
                 return {**resolve(spec).describe(), "optional": optional, "configured": True}
-            except ImproperlyConfigured as exc:
+            except (ImproperlyConfigured, ImportError) as exc:
                 return {"name": str(spec), "error": str(exc), "configured": False}
 
         return {
@@ -162,29 +189,44 @@ class ResolvedPolicy:
         }
 
 
-def build(name: str, *, overlay: Iterable[dict[str, Any]] = ()) -> ResolvedPolicy:
+def build(
+    name: str,
+    *,
+    overlay: Iterable[dict[str, Any]] = (),
+    ancestors: Mapping[str, Iterable[dict[str, Any]]] | None = None,
+) -> ResolvedPolicy:
     """Resolve `name` from code and settings, then apply `overlay` entries from the database.
 
+    `ancestors` holds the overlay entries of the policies `name` extends, by name:
+    tuning a parent in the console reaches every policy built on it.
     Raises LookupError for an unknown policy, ImproperlyConfigured for a cycle.
     """
     from django_ai_sdk.oversight.conf import setting
     from django_ai_sdk.oversight.registry import get_policy_class
 
     overlay = list(overlay)
+    ancestors = ancestors or {}
     definition = _definition(overlay)
     if get_policy_class(name) is None and definition is not None:
-        resolved = _from_definition(name, definition)
+        resolved = _from_definition(name, definition, ancestors)
     else:
-        resolved = _from_code(name, ())
-    configured = setting("POLICIES") or {}
-    if name in configured:
-        apply_overlay(resolved, _entries_from_settings(configured[name]), source="settings")
-    apply_overlay(resolved, overlay, source="db")
+        resolved = _from_code(name, (), ancestors)
+    _tune(resolved, name, overlay)
     ceiling = Capture(setting("CAPTURE"))
     if CAPTURE_ORDER.index(resolved.capture) > CAPTURE_ORDER.index(ceiling):
         resolved.capture = ceiling
         resolved.sources["policy.capture"] = "settings"
     return resolved
+
+
+def _tune(resolved: ResolvedPolicy, name: str, overlay: Iterable[dict[str, Any]]) -> None:
+    """Apply what settings and then the database say about policy `name`."""
+    from django_ai_sdk.oversight.conf import setting
+
+    configured = setting("POLICIES") or {}
+    if name in configured:
+        apply_overlay(resolved, _entries_from_settings(configured[name]), source="settings")
+    apply_overlay(resolved, overlay, source="db")
 
 
 def _definition(overlay: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -196,7 +238,9 @@ def _definition(overlay: list[dict[str, Any]]) -> dict[str, Any] | None:
     return found if isinstance(found, dict) else None
 
 
-def _from_definition(name: str, definition: dict[str, Any]) -> ResolvedPolicy:
+def _from_definition(
+    name: str, definition: dict[str, Any], ancestors: Mapping[str, Iterable[dict[str, Any]]]
+) -> ResolvedPolicy:
     """A policy the console defined: its parents from code, then its own overlay."""
     from django_ai_sdk.oversight.conf import setting
 
@@ -206,27 +250,41 @@ def _from_definition(name: str, definition: dict[str, Any]) -> ResolvedPolicy:
         description=str(definition.get("description") or ""),
         capture=Capture(setting("CAPTURE")),
         stream_mode=str(setting("STREAM_MODE")),
-        retention=dict(setting("RETENTION")),
+        retention=_retention(setting("RETENTION")),
         origin="db",
         extends=[str(p) for p in definition.get("extends") or []],
     )
     for parent_name in resolved.extends:
-        parent = _from_code(parent_name, (name,))
-        _inherit(resolved, parent, parent_name)
+        _inherit(resolved, _parent(parent_name, (name,), ancestors), parent_name)
     resolved.sources["policy.definition"] = "db"
     return resolved
+
+
+def _parent(
+    name: str, chain: tuple[str, ...], ancestors: Mapping[str, Iterable[dict[str, Any]]]
+) -> ResolvedPolicy:
+    """Parent `name` as its children inherit it: with its settings and console tuning."""
+    parent = _from_code(name, chain, ancestors)
+    _tune(parent, name, ancestors.get(name, ()))
+    return parent
 
 
 def _inherit(resolved: ResolvedPolicy, parent: ResolvedPolicy, parent_name: str) -> None:
     resolved.lenses.update(parent.lenses)
     resolved.rules.update(parent.rules)
     for key, value in parent.sources.items():
-        resolved.sources[key] = value if value.startswith("pack:") else f"pack:{parent_name}"
+        if value == "db":
+            value = f"db:{parent_name}"
+        elif not value.startswith(("pack:", "db:")) and value != "settings":
+            value = f"pack:{parent_name}"
+        resolved.sources[key] = value
     if parent.capture is not None and parent.sources.get("policy.capture"):
         resolved.capture = parent.capture
 
 
-def _from_code(name: str, chain: tuple[str, ...]) -> ResolvedPolicy:
+def _from_code(
+    name: str, chain: tuple[str, ...], ancestors: Mapping[str, Iterable[dict[str, Any]]]
+) -> ResolvedPolicy:
     from django_ai_sdk.oversight.conf import setting
     from django_ai_sdk.oversight.registry import get_policy_class
 
@@ -242,13 +300,12 @@ def _from_code(name: str, chain: tuple[str, ...]) -> ResolvedPolicy:
         description=policy.description,
         capture=Capture(setting("CAPTURE")),
         stream_mode=str(setting("STREAM_MODE")),
-        retention=dict(setting("RETENTION")),
+        retention=_retention(setting("RETENTION")),
         origin=cls.origin,
         extends=list(policy.extends),
     )
     for parent_name in policy.extends:
-        parent = _from_code(parent_name, (*chain, name))
-        _inherit(resolved, parent, parent_name)
+        _inherit(resolved, _parent(parent_name, (*chain, name), ancestors), parent_name)
     origin = cls.origin
     for lens in policy.get_lenses():
         lens = copy.copy(lens)
@@ -256,12 +313,10 @@ def _from_code(name: str, chain: tuple[str, ...]) -> ResolvedPolicy:
         # names them "code:<index>" instead, so a chain can keep them when reordered.
         lens._code_answerers = list(lens.answerers)
         resolved.lenses[lens.name] = lens
-        for key in (*LENS_FIELDS, "origin"):
-            resolved.sources[f"lens:{lens.name}.{key}"] = origin
+        _mark_definition(resolved, "lens", lens.name, origin)
     for rule in policy.get_rules():
         resolved.rules[rule.name] = copy.copy(rule)
-        for key in (*RULE_FIELDS, "origin"):
-            resolved.sources[f"rule:{rule.name}.{key}"] = origin
+        _mark_definition(resolved, "rule", rule.name, origin)
     if policy.capture is not None:
         resolved.capture = Capture(policy.capture)
         resolved.sources["policy.capture"] = origin
@@ -269,9 +324,29 @@ def _from_code(name: str, chain: tuple[str, ...]) -> ResolvedPolicy:
         resolved.stream_mode = policy.stream_mode
         resolved.sources["policy.stream_mode"] = origin
     if policy.retention:
-        resolved.retention = {**resolved.retention, **policy.retention}
+        resolved.retention = {**resolved.retention, **_retention(policy.retention)}
         resolved.sources["policy.retention"] = origin
     return resolved
+
+
+def _mark_definition(resolved: ResolvedPolicy, kind: str, target: str, source: str) -> None:
+    """Every field of a lens or rule comes from where it was defined, until tuned."""
+    fields = LENS_FIELDS if kind == "lens" else RULE_FIELDS
+    for name in (*fields, "origin"):
+        resolved.sources[f"{kind}:{target}.{name}"] = source
+
+
+def _retention(value: Any) -> dict[str, int]:
+    """Days per kind of data, checked: only "content" and "metadata", at least a day each."""
+    if not isinstance(value, dict):
+        raise ValueError('retention is {"content": days, "metadata": days}')
+    unknown = sorted(set(value) - set(RETENTION_KEYS))
+    if unknown:
+        raise ValueError(f"unknown retention {unknown}; one of {list(RETENTION_KEYS)}")
+    days = {key: int(v) for key, v in value.items()}
+    if any(d < 1 for d in days.values()):
+        raise ValueError("retention keeps data for at least a day")
+    return days
 
 
 def _entries_from_settings(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -294,15 +369,46 @@ def _entries_from_settings(config: dict[str, Any]) -> list[dict[str, Any]]:
 def apply_overlay(
     resolved: ResolvedPolicy, entries: Iterable[dict[str, Any]], *, source: str
 ) -> None:
-    """Apply overlay entries in order. One that cannot apply is recorded, never raised."""
+    """Apply overlay entries in order. One that cannot apply is recorded, never raised.
+
+    Entries from the database pass `console_entry` first: a row written before a
+    kind left the catalog, or by hand, never imports what the console may not.
+    """
     for entry in entries:
         try:
-            _apply_one(resolved, entry, source)
-        except (ImproperlyConfigured, ValueError, KeyError, TypeError) as exc:
+            _apply_one(resolved, console_entry(entry) if source == "db" else entry, source)
+        except (ImproperlyConfigured, ImportError, ValueError, KeyError, TypeError) as exc:
             resolved.rejected.append({**_jsonable(entry), "source": source, "reason": str(exc)})
 
 
-def _code_answerer(lens: Lens, spec: Any) -> Any:
+def console_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """`entry` with every answerer in it as the console may write it; ValueError otherwise."""
+    from django_ai_sdk.oversight.answerers.base import console_config
+    from django_ai_sdk.oversight.catalog import ALIAS_KINDS, INLINE_KINDS
+
+    kind, key, value = entry["target_kind"], entry["field"], entry.get("value")
+    if value is None:
+        return entry
+    if kind == "answerer":
+        value = console_config(value, kinds=ALIAS_KINDS)
+    elif kind == "lens" and key == "answerers":
+        value = [console_config(spec, kinds=INLINE_KINDS) for spec in value]
+    elif kind == "lens" and key == "definition":
+        if not isinstance(value, dict):
+            raise ValueError("a lens definition is an object")
+        if "answerers" in value:
+            specs = value["answerers"] or []
+            value = {**value, "answerers": [console_config(a, kinds=INLINE_KINDS) for a in specs]}
+    elif kind == "rule" and key in {"definition", "then"}:
+        actions = (value.get("then") if isinstance(value, dict) else value) or []
+        for action in actions:
+            if isinstance(action, dict) and "answerer" in action:
+                # An escalation names an alias, never a configuration.
+                console_config(action["answerer"], kinds=[])
+    return {**entry, "value": value}
+
+
+def code_answerer(lens: Lens, spec: Any) -> Any:
     """`spec`, or the code-built answerer a "code:<index>" reference names."""
     if isinstance(spec, str) and spec.startswith("code:"):
         built = getattr(lens, "_code_answerers", [])
@@ -328,132 +434,139 @@ def _jsonable(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _apply_one(resolved: ResolvedPolicy, entry: dict[str, Any], source: str) -> None:
-    kind, target, key, value = (
-        entry["target_kind"],
-        entry.get("target", ""),
-        entry["field"],
-        entry.get("value"),
-    )
-    if kind == "policy":
-        if key == "definition":
-            if resolved.origin != "db":
-                raise ValueError("a policy declared in code cannot be redefined in the console")
-            # Applied before the rest of the overlay, by build().
-            return
-        if key not in POLICY_FIELDS:
-            raise ValueError(f"{key!r} is not a policy setting the overlay may change")
-        if key == "capture":
-            value = Capture(value)
-        setattr(resolved, key, value)
-        resolved.sources[f"policy.{key}"] = source
+    kind = entry["target_kind"]
+    apply = {"policy": _apply_policy, "lens": _apply_lens, "rule": _apply_rule}.get(kind)
+    if apply is None:
+        raise ValueError(f"unknown overlay target {kind!r}")
+    apply(resolved, entry.get("target", ""), entry["field"], entry.get("value"), source)
+
+
+def _apply_policy(resolved: ResolvedPolicy, target: str, key: str, value: Any, source: str) -> None:
+    if key == "definition":
+        if resolved.origin != "db":
+            raise ValueError("a policy declared in code cannot be redefined in the console")
+        # Applied before the rest of the overlay, by build().
         return
+    if key == "capture":
+        resolved.capture = Capture(value)
+    elif key == "stream_mode":
+        resolved.stream_mode = value
+    elif key == "retention":
+        resolved.retention = {**resolved.retention, **_retention(value)}
+    else:
+        raise ValueError(f"{key!r} is not a policy setting the overlay may change")
+    resolved.sources[f"policy.{key}"] = source
 
-    if kind == "lens":
-        if key == "definition":
-            # A lens declared outside code: settings or the console.
-            lens = lens_from_config({**value, "name": target})
-            resolved.lenses[target] = lens
-            for name in (*LENS_FIELDS, "origin"):
-                resolved.sources[f"lens:{target}.{name}"] = source
-            return
-        lens = resolved.lenses.get(target)
-        if lens is None:
-            raise KeyError(f"no lens {target!r}")
-        if key not in LENS_FIELDS:
-            raise ValueError(f"{key!r} is not a lens setting the overlay may change")
-        lens = copy.copy(lens)
-        if key == "stages":
-            value = tuple(Stage(s) for s in value)
-        elif key == "sample" or key == "confident":
-            value = float(value)
-            if not 0 <= value <= 1:
-                raise ValueError(f"{key} must be between 0 and 1")
-        elif key == "answerers":
-            from django_ai_sdk.oversight.answerers.base import alias_defined, resolve
 
-            value = [_code_answerer(lens, spec) for spec in value]
-            for spec in value:
-                # "guard?" is fine where no guard is set up: the lens skips it.
-                if isinstance(spec, str) and spec.endswith("?") and not alias_defined(spec[:-1]):
-                    continue
-                resolve(spec)
-        elif key == "enabled":
-            value = bool(value)
-        setattr(lens, key, value)
-        resolved.lenses[target] = lens
-        resolved.sources[f"lens:{target}.{key}"] = source
+def _apply_lens(resolved: ResolvedPolicy, target: str, key: str, value: Any, source: str) -> None:
+    if key == "definition":
+        # A lens declared outside code: settings or the console.
+        resolved.lenses[target] = lens_from_config({**value, "name": target})
+        _mark_definition(resolved, "lens", target, source)
         return
+    lens = resolved.lenses.get(target)
+    if lens is None:
+        raise KeyError(f"no lens {target!r}")
+    if key not in LENS_FIELDS:
+        raise ValueError(f"{key!r} is not a lens setting the overlay may change")
+    lens = copy.copy(lens)
+    if key == "stages":
+        value = tuple(Stage(s) for s in value)
+    elif key in {"sample", "confident"}:
+        value = float(value)
+        if not 0 <= value <= 1:
+            raise ValueError(f"{key} must be between 0 and 1")
+    elif key == "answerers":
+        from django_ai_sdk.oversight.answerers.base import alias_defined, resolve
 
-    if kind == "rule":
-        if key == "definition":
-            rule = Rule.from_dict({**value, "name": target})
-            unknown = rule.lenses() - set(resolved.lenses)
-            if unknown:
-                raise ValueError(f"rule reads unknown lenses {sorted(unknown)}")
-            resolved.rules[target] = rule
-            for name in (*RULE_FIELDS, "origin"):
-                resolved.sources[f"rule:{target}.{name}"] = source
-            return
-        rule = resolved.rules.get(target)
-        if rule is None:
-            raise KeyError(f"no rule {target!r}")
-        if key not in RULE_FIELDS:
-            raise ValueError(f"{key!r} is not a rule setting the overlay may change")
-        rule = copy.copy(rule)
-        if key == "mode":
-            rule.mode = Mode(value)
-        elif key == "when":
-            code_defined = resolved.sources.get(f"rule:{target}.origin", "code") != "db"
-            if code_defined and not same_shape(rule.when.to_dict(), value):
-                raise ValueError("the overlay may change a code rule's thresholds, not its test")
-            rule.when = from_dict(value)
-        elif key == "then":
-            rule.then = [action_from_dict(a) for a in value]
-        elif key == "stages":
-            rule.stages = tuple(Stage(s) for s in value)
-        else:
-            rule.message = str(value)
+        value = [code_answerer(lens, spec) for spec in value]
+        for spec in value:
+            # "strong?" is fine where no strong model is set up: the lens skips it.
+            if isinstance(spec, str) and spec.endswith("?") and not alias_defined(spec[:-1]):
+                continue
+            resolve(spec)
+    elif key == "enabled":
+        value = bool(value)
+    setattr(lens, key, value)
+    resolved.lenses[target] = lens
+    resolved.sources[f"lens:{target}.{key}"] = source
+
+
+def _apply_rule(resolved: ResolvedPolicy, target: str, key: str, value: Any, source: str) -> None:
+    if key == "definition":
+        rule = Rule.from_dict({**value, "name": target})
+        unknown = rule.lenses() - set(resolved.lenses)
+        if unknown:
+            raise ValueError(f"rule reads unknown lenses {sorted(unknown)}")
         resolved.rules[target] = rule
-        resolved.sources[f"rule:{target}.{key}"] = source
+        _mark_definition(resolved, "rule", target, source)
         return
+    rule = resolved.rules.get(target)
+    if rule is None:
+        raise KeyError(f"no rule {target!r}")
+    rule = copy.copy(rule)
+    if key == "mode":
+        rule.mode = Mode(value)
+    elif key == "when":
+        code_defined = resolved.sources.get(f"rule:{target}.origin", "code") != "db"
+        if code_defined and not same_shape(rule.when.to_dict(), value):
+            raise ValueError("the overlay may change a code rule's thresholds, not its test")
+        rule.when = from_dict(value)
+    elif key == "then":
+        rule.then = [action_from_dict(a) for a in value]
+    elif key == "stages":
+        rule.stages = tuple(Stage(s) for s in value)
+    elif key == "message":
+        rule.message = str(value)
+    else:
+        raise ValueError(f"{key!r} is not a rule setting the overlay may change")
+    resolved.rules[target] = rule
+    resolved.sources[f"rule:{target}.{key}"] = source
 
-    raise ValueError(f"unknown overlay target {kind!r}")
 
-
-# name -> (resolved at, ResolvedPolicy)
-_cache: dict[str, tuple[float, ResolvedPolicy]] = {}
+# name -> (resolved at, ResolvedPolicy or None when it did not load, its ancestors)
+_cache: dict[str, tuple[float, ResolvedPolicy | None, frozenset[str]]] = {}
+# name -> why it did not load
+_broken: dict[str, str] = {}
 
 # (loaded at, {"answerers": {alias: config}, "agents": {agent id: policy or ""}})
 _console: tuple[float, dict[str, dict[str, Any]]] | None = None
 
 
-async def aconsole() -> dict[str, dict[str, Any]]:
+async def aconsole(*, uncached: bool = False) -> dict[str, dict[str, Any]]:
     """The deployment-wide console entries, cached like policies.
 
     Loading them also hands the aliases to answerer resolution, so a lens that
-    names a console alias resolves in sync code too.
+    names a console alias resolves in sync code too. `uncached` reads them fresh
+    and leaves the cache to the turns.
     """
     from django_ai_sdk.oversight.answerers.base import set_console_aliases
     from django_ai_sdk.oversight.conf import setting
 
     global _console
     ttl = float(setting("POLICY_CACHE_SECONDS"))
-    if _console and time.monotonic() - _console[0] < ttl:
+    if not uncached and _console and time.monotonic() - _console[0] < ttl:
         return _console[1]
     loaded: dict[str, dict[str, Any]] = {"answerers": {}, "agents": {}}
     try:
-        entries = await _aload_overlay(GLOBAL)
+        entries = (await _aload_rows([GLOBAL]))[GLOBAL]
     except Exception:
         # Like a broken policy, an unreadable console must never take chat down.
         logger.opt(exception=True).warning("Oversight console entries could not be loaded")
         return loaded
     for entry in entries:
         if entry["target_kind"] == "answerer" and entry["field"] == "definition":
+            try:
+                entry = console_entry(entry)
+            except ValueError as exc:
+                logger.warning("Console answerer {!r} is not used: {}", entry["target"], exc)
+                continue
             loaded["answerers"][entry["target"]] = entry["value"]
         elif entry["target_kind"] == "agent" and entry["field"] == "policy":
             loaded["agents"][entry["target"]] = str(entry["value"] or "")
     set_console_aliases(loaded["answerers"])
-    _console = (time.monotonic(), loaded)
+    if not uncached:
+        _console = (time.monotonic(), loaded)
     return loaded
 
 
@@ -464,50 +577,106 @@ async def aassigned_policy(agent_id: str) -> str | None:
     return (await aconsole())["agents"].get(agent_id)
 
 
-async def aget_policy(name: str) -> ResolvedPolicy | None:
+async def aget_policy(name: str, *, uncached: bool = False) -> ResolvedPolicy | None:
     """The effective policy, overlay included, cached for POLICY_CACHE_SECONDS.
 
-    None for an unknown or broken policy: a typo must never take chat down.
+    None for an unknown or broken policy: a typo must never take chat down. Why it
+    broke is logged once per cache period and kept for the console (`broken`).
+    `uncached` builds it from the database without reading or filling the cache,
+    for console pages, so looking at a policy never flushes what turns use.
     """
     from django_ai_sdk.oversight.conf import setting
 
     ttl = float(setting("POLICY_CACHE_SECONDS"))
-    await aconsole()
-    cached = _cache.get(name)
+    await aconsole(uncached=uncached)
+    cached = None if uncached else _cache.get(name)
     if cached and time.monotonic() - cached[0] < ttl:
         return cached[1]
+    resolved: ResolvedPolicy | None
+    lineage: frozenset[str] = frozenset()
     try:
-        overlay = await _aload_overlay(name)
-        resolved = build(name, overlay=overlay)
-    except LookupError:
-        logger.warning("Agent names oversight policy {!r}, which is not registered", name)
-        return None
-    except ImproperlyConfigured:
-        logger.exception("Oversight policy {!r} cannot be resolved", name)
-        return None
-    _cache[name] = (time.monotonic(), resolved)
+        own, ancestors = await load_overlay(name)
+        lineage = frozenset(ancestors)
+        resolved = build(name, overlay=own, ancestors=ancestors)
+    except Exception as exc:
+        logger.exception("Oversight policy {!r} cannot be loaded: {}", name, exc)
+        _broken[name] = str(exc) or type(exc).__name__
+        resolved = None
+    else:
+        _broken.pop(name, None)
+    if not uncached:
+        _cache[name] = (time.monotonic(), resolved, lineage)
     return resolved
 
 
-async def _aload_overlay(name: str) -> list[dict[str, Any]]:
+def broken(name: str) -> str:
+    """Why `name` did not load the last time it was asked for, or ""."""
+    return _broken.get(name, "")
+
+
+async def load_overlay(name: str) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """`name`'s active overlay entries, and those of every policy it extends, by name.
+
+    One query for a policy in code. A console policy's parents are in its own
+    definition, so they take a second.
+    """
+    from django_ai_sdk.oversight.registry import get_policy_class
+
+    if get_policy_class(name) is not None:
+        rows = await _aload_rows([name, *code_ancestors(name)])
+        return rows.pop(name), rows
+    own = (await _aload_rows([name]))[name]
+    definition = _definition(own) or {}
+    return own, await load_ancestors([str(p) for p in definition.get("extends") or []])
+
+
+async def load_ancestors(parents: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+    """The overlay entries of `parents` and every policy they extend, by name."""
+    names = {a for parent in parents for a in (parent, *code_ancestors(parent))}
+    return await _aload_rows(names) if names else {}
+
+
+def code_ancestors(name: str) -> list[str]:
+    """Every policy `name` extends in code, nearest first; a cycle is build()'s to report."""
+    from django_ai_sdk.oversight.registry import get_policy_class
+
+    found: list[str] = []
+    todo = list(getattr(get_policy_class(name), "extends", []) or [])
+    while todo:
+        parent = todo.pop(0)
+        if parent in found or parent == name:
+            continue
+        found.append(parent)
+        todo.extend(getattr(get_policy_class(parent), "extends", []) or [])
+    return found
+
+
+async def _aload_rows(names: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
     from django_ai_sdk.oversight.models import PolicyOverride
 
-    return [
-        {"target_kind": o.target_kind, "target": o.target, "field": o.field, "value": o.value}
-        async for o in PolicyOverride.objects.filter(policy=name, active=True).order_by(
-            "changed_at"
+    rows: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
+    async for o in PolicyOverride.objects.filter(policy__in=list(rows), active=True).order_by(
+        "changed_at"
+    ):
+        rows[o.policy].append(
+            {"target_kind": o.target_kind, "target": o.target, "field": o.field, "value": o.value}
         )
-    ]
+    return rows
 
 
 def invalidate(name: str | None = None) -> None:
-    """Forget cached resolutions, so the next turn reads the overlay again."""
+    """Forget cached resolutions, so the next turn reads the overlay again.
+
+    Forgetting a policy also forgets every policy that extends it.
+    """
     global _console
     if name is None or name == GLOBAL:
         _cache.clear()
         _console = None
-    else:
-        _cache.pop(name, None)
+        return
+    for cached, (_, _, lineage) in list(_cache.items()):
+        if cached == name or name in lineage:
+            _cache.pop(cached, None)
 
 
 __all__ = [
@@ -520,6 +689,13 @@ __all__ = [
     "aconsole",
     "aget_policy",
     "apply_overlay",
+    "broken",
     "build",
+    "code_ancestors",
+    "code_answerer",
+    "console_entry",
     "invalidate",
+    "load_ancestors",
+    "load_overlay",
+    "pick",
 ]

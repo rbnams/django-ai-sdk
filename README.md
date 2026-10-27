@@ -120,6 +120,9 @@ async def chat(request, payload: ChatRequest):
   per-message token accounting.
 - **TypeSafe**: Optional Jev judgments on chat turns — score cards, tool gating via
   `control` hints, webhook channel footers. Install `django-ai-sdk[typesafe]`.
+- **Oversight**: Lenses ask one typed question about every turn, answered by Jev, code or a
+  model judge as you pick per lens; rules block, redact or queue for a person, starting in
+  test mode; a hash-chained audit ledger with a console API. Install `django-ai-sdk[oversight]`.
 - **Reindexing**: Hot-reload documents. Cached embeddings with simple refresh API.
 
 ## Documentation

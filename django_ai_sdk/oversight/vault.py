@@ -50,11 +50,13 @@ def _aead(key: bytes) -> Any:
 
 
 def seal_bytes(key: bytes, data: bytes, aad: bytes) -> bytes:
+    """`data` encrypted under `key`, a fresh nonce in front; `aad` must match on open."""
     nonce = os.urandom(NONCE)
     return nonce + _aead(key).encrypt(nonce, data, aad)
 
 
 def open_bytes(key: bytes, blob: bytes, aad: bytes) -> bytes:
+    """The plaintext of a `seal_bytes` blob. Raises if the key, blob or `aad` differ."""
     return _aead(key).decrypt(blob[:NONCE], blob[NONCE:], aad)
 
 
@@ -81,6 +83,10 @@ def data_key_for(scope: str) -> tuple[DataKey, bytes] | None:
 
 
 def unwrap(row: DataKey) -> bytes | None:
+    """The scope's plaintext data key, opened with the master key.
+
+    None when encryption is off or the scope was shredded.
+    """
     master = master_key()
     if master is None or not row.wrapped or row.shredded_at is not None:
         return None
@@ -96,6 +102,10 @@ def encrypt_json(scope: str, value: Any) -> tuple[DataKey, bytes] | None:
 
 
 def decrypt_json(row: DataKey | None, blob: bytes | None, scope: str) -> Any:
+    """The value `encrypt_json` sealed under the scope's data key.
+
+    None when there is nothing to open, encryption is off or the scope was shredded.
+    """
     import json
 
     if row is None or blob is None:

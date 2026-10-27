@@ -1,13 +1,15 @@
 """AI_SDK_OVERSIGHT, resolved. One dict, read here only, every key defaulted.
 
 AI_SDK_OVERSIGHT = {
-    "ENABLED": True,
     "DEFAULT_POLICY": "default",
     "ANSWERERS": {
-        "fast": {"class": "django_ai_sdk.oversight.answerers.LLMJudge",
-                 "model": "gpt-4.1-mini"},
-        "local": {"class": "django_ai_sdk.oversight.answerers.LLMJudge",
-                  "llm": "django_ai_sdk.generators.ollama_chat", "model": "llama3.2"},
+        # Yes/no, label and score lenses.
+        "jev": {"class": "django_ai_sdk.oversight.answerers.TypeSafe"},
+        # A chat model for text lenses and second opinions, and one for escalations.
+        "judge": {"class": "django_ai_sdk.oversight.answerers.LLMJudge",
+                  "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"},
+        "strong": {"class": "django_ai_sdk.oversight.answerers.LLMJudge",
+                   "model": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"},
     },
     "BUDGET_PER_DAY": 5.0,
 }
@@ -37,30 +39,39 @@ DEFAULTS: dict[str, Any] = {
     # Per policy, the same tuning the console's overlay allows, kept in settings:
     # {"support": {"rules": {"block_injection": {"mode": "enforce"}}, "capture": "redacted"}}
     "POLICIES": {},
-    # Named answerers, so a lens says "fast" and settings say which model that is.
+    # Named answerers, so a lens says "judge" and settings say which model that is.
     "ANSWERERS": {},
     # Spend cap for model answerers across the deployment, per UTC day. None: no cap.
     "BUDGET_PER_DAY": None,
     "CURRENCY": "EUR",
     # Milliseconds the gate may add to a reply. Answerers still running are abandoned.
-    "GATE_DEADLINE_MS": 300,
+    # Room for Jev (~0.3 s plus network) and code, not for a model judge.
+    "GATE_DEADLINE_MS": 1000,
     "REVIEW_DEADLINE_MS": 2_000,
     # What the chat client is told: "actions" only when a rule changed the turn;
-    # "full" every stage's answers and matches too, for a developer view.
+    # "full" every stage's answers and matches too, for a developer view; "staff"
+    # that view only for users who may read oversight (it shows what a rule tests).
     "CLIENT_DETAIL": "actions",
     # Characters between watch checks while an answer streams.
     "WATCH_EVERY_CHARS": 400,
+    # Milliseconds a watch check may pause the stream. Lenses still running answer
+    # "deadline" and are asked again in reflect.
+    "WATCH_DEADLINE_MS": 300,
     # What an answerer that fails or times out means at each stage. "open" lets the
-    # turn through; "closed" treats every rule depending on it as matched.
+    # turn through; "closed" treats an enforced rule that blocks, redacts or takes
+    # tools away as matched when a lens it reads failed. Rules that only alert,
+    # queue or notify never fire on a failure, nor do shadow rules.
     "FAIL_MODE": {"gate": "open", "watch": "open", "review": "open"},
-    # Days each kind of content is kept. Metadata outlives content.
-    "RETENTION": {"security": 90, "quality": 30, "metadata": 730},
+    # Days a turn's content (evidence) and its metadata (the turn row, its answers
+    # and decisions) are kept. A policy may set either for its own turns.
+    "RETENTION": {"content": 90, "metadata": 730},
     # HMAC secret for actor pseudonyms. Defaults to one derived from SECRET_KEY.
     "PSEUDONYM_SECRET": "",
     # base64 32-byte key that wraps per-thread content keys. Empty stores content
     # in the clear (the oversight.W004 check says so).
     "MASTER_KEY": "",
-    # base64 Ed25519 private key (32 bytes) and a name for signed checkpoints.
+    # base64 Ed25519 private key (32 bytes) for signed checkpoints, and the key's
+    # name in the signature. Usually left unset: the name is then the log origin.
     "SIGNING_KEY": "",
     "SIGNING_NAME": "",
     # The checkpoint's origin line; defaults to the first ALLOWED_HOSTS entry.
@@ -108,6 +119,11 @@ def log_origin() -> str:
     return f"{hosts[0] if hosts else 'localhost'}/oversight"
 
 
+def signing_name() -> str:
+    """The name checkpoints are signed under, which a verifier key must carry too."""
+    return setting("SIGNING_NAME") or log_origin()
+
+
 __all__ = [
     "APP_LABEL",
     "DEFAULTS",
@@ -116,4 +132,5 @@ __all__ = [
     "log_origin",
     "oversight_settings",
     "setting",
+    "signing_name",
 ]

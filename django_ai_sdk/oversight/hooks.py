@@ -68,6 +68,8 @@ class OversightToolHook:
             for index, call in enumerate(calls)
         ]
         state.set("messages", [*messages, *stubs], handler_override=replace_values)
+        if session.on_tool_results is not None:
+            await session.on_tool_results(stubs)
 
 
 __all__ = ["REFUSED_META_KEY", "OversightToolHook"]

@@ -1,17 +1,16 @@
 """The classify pack: label every message, so the ledger can be sliced by what people ask.
 
-The generic intent labels are a starting point: declare a Choice lens named
-`intent` in your own policy, with your own labels and keywords, and it replaces
-this one. With a `fast` alias, a model labels what keywords cannot.
+Jev labels both at the gate. The generic intent labels are a starting point:
+declare a Choice lens named `intent` in your own policy, with your own labels and
+criteria, and it replaces this one.
 """
 
 from __future__ import annotations
 
-from django_ai_sdk.oversight.answerers import Keywords, Language
 from django_ai_sdk.oversight.lenses import Choice
 from django_ai_sdk.oversight.policy import Policy
 from django_ai_sdk.oversight.registry import register
-from django_ai_sdk.oversight.types import Purpose, Stage, Subject
+from django_ai_sdk.oversight.types import Stage, Subject
 
 
 class Intent(Choice):
@@ -28,32 +27,7 @@ class Intent(Choice):
     }
     subject = Subject.INPUT
     stages = (Stage.GATE,)
-    answerers = [
-        Keywords(
-            {
-                "smalltalk": ["hi", "hello", "hey", "thanks", "thank you", "hoi", "hallo", "dank"],
-                "complaint": ["not working", "broken", "terrible", "werkt niet", "klacht"],
-                "feedback": ["wrong answer", "that's wrong", "klopt niet", "good answer"],
-                "task": ["write", "create", "make", "draft", "schrijf", "maak"],
-                "question": [
-                    "what",
-                    "how",
-                    "why",
-                    "when",
-                    "where",
-                    "who",
-                    "wat",
-                    "hoe",
-                    "waarom",
-                    "wanneer",
-                    "waar",
-                    "wie",
-                ],
-            }
-        ),
-        "fast?",
-    ]
-    purposes = (Purpose.QUALITY,)
+    answerers = ["jev?"]
 
 
 class InputLanguage(Choice):
@@ -61,10 +35,17 @@ class InputLanguage(Choice):
     label = "Language"
     question = "Which language is the message written in?"
     labels = ["en", "nl", "de", "fr", "es", "other"]
+    criteria = {  # noqa: RUF012
+        "en": "English",
+        "nl": "Dutch",
+        "de": "German",
+        "fr": "French",
+        "es": "Spanish",
+        "other": "Another language, or too little text to tell",
+    }
     subject = Subject.INPUT
     stages = (Stage.GATE,)
-    answerers = [Language()]
-    purposes = (Purpose.QUALITY,)
+    answerers = ["jev?"]
 
 
 @register
@@ -76,4 +57,4 @@ class ClassifyPack(Policy):
     lenses = [Intent, InputLanguage]
 
 
-__all__ = ["ClassifyPack"]
+__all__ = ["ClassifyPack", "InputLanguage", "Intent"]

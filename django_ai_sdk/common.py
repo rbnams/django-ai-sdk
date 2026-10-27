@@ -196,6 +196,10 @@ class StreamWriter:
         """Store `text` instead of what streamed: a redacted or withheld answer."""
         self._content_chunks = [text]
 
+    def drop_reasoning(self) -> None:
+        """Store no reasoning: a withheld answer's would give it away."""
+        self._reasoning_chunks = []
+
     async def finalize(self, finish_reason: str = "") -> ChatMessage:
         """Complete the message"""
         logger.debug(f"Finalizing message with reason: {finish_reason}")

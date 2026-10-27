@@ -57,7 +57,8 @@ def bsn_ok(value: str) -> bool:
 
 # label -> (pattern, validator). Checksummed kinds first: an overlap goes to the first.
 KINDS: dict[str, tuple[str, Callable[[str], bool] | None]] = {
-    "email": (r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b", None),
+    # Bounded, so a long run of "a." cannot backtrack for seconds.
+    "email": (r"\b[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}\b", None),
     "iban": (r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){2,7}(?:\s?[A-Z0-9]{1,4})?\b", iban_ok),
     "credit_card": (r"\b(?:\d[ -]?){12,18}\d\b", luhn_ok),
     "bsn": (r"\b\d{9}\b|\b\d{4}\.\d{2}\.\d{3}\b", bsn_ok),
@@ -87,7 +88,7 @@ class PII(Detector):
     `extra` adds patterns of your own, label -> regex, without a checksum.
     """
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
     miss_confidence = 0.85
 
     def __init__(
@@ -105,6 +106,9 @@ class PII(Detector):
             (label, re.compile(pattern), None) for label, pattern in (extra or {}).items()
         ]
         self.name = name or "pii"
+
+    def looks_for(self) -> list[str]:
+        return [label for label, _, _ in self.patterns]
 
     def detect(self, text: str, view: TurnView, lens: Lens) -> list[TextSpan]:
         spans: list[TextSpan] = []
@@ -124,7 +128,7 @@ class PII(Detector):
 class Secrets(Detector):
     """API keys, tokens and private keys pasted into a message or a tool argument."""
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
     miss_confidence = 0.9
 
     def __init__(self, *, extra: dict[str, str] | None = None, name: str = "") -> None:
@@ -132,6 +136,9 @@ class Secrets(Detector):
             (label, re.compile(pattern)) for label, pattern in {**SECRETS, **(extra or {})}.items()
         ]
         self.name = name or "secrets"
+
+    def looks_for(self) -> list[str]:
+        return [label for label, _ in self.patterns]
 
     def detect(self, text: str, view: TurnView, lens: Lens) -> list[TextSpan]:
         return [
@@ -141,20 +148,62 @@ class Secrets(Detector):
         ]
 
 
+_SECRET_PATTERNS = [(label, re.compile(pattern)) for label, pattern in SECRETS.items()]
+
+
+def mask_secrets(text: str) -> str:
+    """`text` with every built-in secret pattern masked, before it leaves for a processor."""
+    if not text:
+        return text
+    spans = [
+        TextSpan(start=m.start(), end=m.end(), label=label)
+        for label, pattern in _SECRET_PATTERNS
+        for m in pattern.finditer(text)
+    ]
+    return redact(text, spans) if spans else text
+
+
 def redact(text: str, spans: Iterable[TextSpan], template: str = "[{label}]") -> str:
     """`text` with every span replaced by its label; overlapping spans merge."""
-    ordered = sorted(spans, key=lambda s: (s.start, -s.end))
+    return redact_all(text, [(spans, template)])
+
+
+def redact_all(text: str, groups: Iterable[tuple[Iterable[TextSpan], str]]) -> str:
+    """`text` with the spans of every (spans, template) group masked, in one pass.
+
+    Masking group after group would shift the offsets of the next; here all spans
+    index the original text. Overlapping spans merge into the first one's label.
+    """
+    ordered = sorted(
+        ((span, template) for spans, template in groups for span in spans),
+        key=lambda item: (item[0].start, -item[0].end),
+    )
     out: list[str] = []
     cursor = 0
-    for span in ordered:
-        if span.end <= cursor:
+    for span, template in ordered:
+        start, end = max(span.start, 0), min(span.end, len(text))
+        if end <= cursor or start >= end:
             continue
-        start = max(span.start, cursor)
+        if start < cursor:
+            # Overlaps the span just masked: that label covers this one too.
+            cursor = end
+            continue
         out.append(text[cursor:start])
         out.append(template.format(label=(span.label or "redacted").upper()))
-        cursor = span.end
+        cursor = end
     out.append(text[cursor:])
     return "".join(out)
 
 
-__all__ = ["KINDS", "PII", "SECRETS", "Secrets", "bsn_ok", "iban_ok", "luhn_ok", "redact"]
+__all__ = [
+    "KINDS",
+    "PII",
+    "SECRETS",
+    "Secrets",
+    "bsn_ok",
+    "iban_ok",
+    "luhn_ok",
+    "mask_secrets",
+    "redact",
+    "redact_all",
+]

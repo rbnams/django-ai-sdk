@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from django.core.exceptions import ImproperlyConfigured
 
 from django_ai_sdk.oversight.answerers.base import Answerer
+from django_ai_sdk.oversight.answerers.pii import mask_secrets
 from django_ai_sdk.oversight.types import Answer, TextSpan
 from django_ai_sdk.utils import resolve_setting
 
@@ -29,7 +30,7 @@ class Presidio(Answerer):
     labels come back lower-cased, so an Entities lens can list "person".
     """
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
     timeout = 5.0
     _engine: ClassVar[Any] = None
 
@@ -114,9 +115,13 @@ class HFClassifier(Answerer):
         self.name = name or f"hf:{model.rsplit('/', 1)[-1]}"
 
     @property
-    def system_one(self) -> bool:  # ty: ignore[invalid-method-override]
+    def metered(self) -> bool:  # ty: ignore[invalid-method-override]
         # Local inference costs nothing per call; an endpoint is billed.
-        return self.endpoint is None
+        return self.endpoint is not None
+
+    @property
+    def external(self) -> str:  # ty: ignore[invalid-method-override]
+        return "Hugging Face" if self.endpoint else ""
 
     def describe(self) -> dict[str, Any]:
         return {**super().describe(), "model": self.model}
@@ -154,7 +159,7 @@ class HFClassifier(Answerer):
         return result[0] if result and isinstance(result[0], list) else result
 
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
-        text = view.text(lens.subject)[: self.max_chars]
+        text = mask_secrets(view.text(lens.subject)[: self.max_chars])
         if not text:
             return None
         scores = {str(item["label"]): float(item["score"]) for item in await self.classify(text)}
@@ -180,6 +185,7 @@ class Moderation(Answerer):
     the flagged categories.
     """
 
+    external: ClassVar[str] = "OpenAI"
     timeout = 10.0
 
     def __init__(self, model: str = "omni-moderation-latest", *, name: str = "") -> None:
@@ -189,10 +195,10 @@ class Moderation(Answerer):
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
         from openai import AsyncOpenAI
 
-        text = view.text(lens.subject)
+        text = mask_secrets(view.text(lens.subject)[:20_000])
         if not text:
             return None
-        response = await AsyncOpenAI().moderations.create(model=self.model, input=text[:20_000])
+        response = await AsyncOpenAI().moderations.create(model=self.model, input=text)
         result = response.results[0]
         categories = {k: bool(v) for k, v in result.categories.model_dump().items()}
         scores = {k: float(v or 0) for k, v in result.category_scores.model_dump().items()}

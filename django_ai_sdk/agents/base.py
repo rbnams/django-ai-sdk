@@ -930,6 +930,15 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         haystack_messages = adapter.get_messages(messages)
         result = await haystack_agent.run_async(messages=haystack_messages)
         replies = result.get("messages", [])
+        from django_ai_sdk.oversight.session import current_session
+        from django_ai_sdk.oversight.stream import observe_replies
+
+        # Review judges what the loop did, not an empty exchange. The result starts
+        # with the system prompt and the messages it was given: only the rest is new.
+        if (session := current_session()) is not None:
+            given = sum(1 for m in haystack_messages if not m.is_from("system"))
+            head = next((i for i, m in enumerate(replies) if not m.is_from("system")), 0)
+            observe_replies(session, replies[head + given :])
         return replies[-1].text if replies else None
 
     async def get_run_adapter(

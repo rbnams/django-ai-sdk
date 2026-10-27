@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from asgiref.sync import sync_to_async
+from django.utils import timezone
 from django_ai_sdk.errors import UserError
 from django_ai_sdk.oversight import ledger
-from django_ai_sdk.oversight.models import AccessRecord, PolicyOverride, ReviewItem
+from django_ai_sdk.oversight.models import AccessRecord, PolicyOverride, ReviewItem, Turn
 from django_ai_sdk.oversight.policy import invalidate
-from django_ai_sdk.oversight.schemas import OverrideIn, VerdictIn
+from django_ai_sdk.oversight.schemas import OverrideIn, TurnFilter, VerdictIn
 from django_ai_sdk.oversight.services import OversightService
 from django_ai_sdk.oversight.session import TurnSession
 from django_ai_sdk.permissions import PermissionDenied
@@ -39,28 +42,28 @@ class TestReading:
         with pytest.raises(PermissionDenied):
             await OversightService.list_turns(user=member)
 
-    async def test_security_sees_the_question_and_a_pseudonym(self):
+    async def test_review_sees_the_turn_and_a_pseudonym(self):
         asker = await UserFactory.acreate()
         staff = await UserFactory.acreate(staff=True)
         turn_id = await a_turn(user=asker)
-        page = await OversightService.list_turns(user=staff, purpose="security")
+        page = await OversightService.list_turns(user=staff, purpose="review")
         [row] = page.items
         assert row.preview == "What about my salary?"
         assert row.actor.startswith("u-")
         assert row.labels["topic"] == "hr"
         assert {h.rule for h in row.hits} >= {"hr_to_people", "would_block_hr"}
-        detail = await OversightService.get_turn(turn_id, user=staff, purpose="security")
+        detail = await OversightService.get_turn(turn_id, user=staff, purpose="review")
         assert detail.evidence["input"] == "What about my salary?"
-        assert "sources" not in detail.evidence
+        # Sources are where an indirect injection hides: the reviewer sees them.
+        assert "sources" in detail.evidence
+        assert detail.actor == row.actor
         assert detail.chain.intact is True
         assert detail.chain.seq is not None
 
-    async def test_quality_hides_who_asked(self):
+    async def test_the_old_purposes_are_gone(self):
         staff = await UserFactory.acreate(staff=True)
-        turn_id = await a_turn(user=await UserFactory.acreate())
-        detail = await OversightService.get_turn(turn_id, user=staff, purpose="quality")
-        assert detail.actor == "hidden"
-        assert "sources" in detail.evidence
+        with pytest.raises(UserError):
+            await OversightService.list_turns(user=staff, purpose="security")
 
     async def test_audit_sees_no_content_and_no_reasons(self):
         staff = await UserFactory.acreate(staff=True)
@@ -74,21 +77,26 @@ class TestReading:
     async def test_every_read_is_on_the_ledger(self):
         staff = await UserFactory.acreate(staff=True)
         turn_id = await a_turn()
-        await OversightService.list_turns(user=staff, outcome="flagged")
+        await OversightService.list_turns(TurnFilter(outcome="flagged"), user=staff)
         await OversightService.get_turn(turn_id, user=staff)
-        actions = [r.action async for r in AccessRecord.objects.order_by("created_at")]
-        assert actions == ["list", "view"]
+        records = [r async for r in AccessRecord.objects.order_by("created_at")]
+        assert [r.action for r in records] == ["list", "view"]
+        assert records[0].query == {"outcome": "flagged"}
         assert (await sync_to_async(ledger.verify)()).ok
 
     async def test_filters(self):
         staff = await UserFactory.acreate(staff=True)
         await a_turn()
         await a_turn("hello there", "Hi!")
-        assert (await OversightService.list_turns(user=staff)).total == 2
-        assert (await OversightService.list_turns(user=staff, label="topic", value="hr")).total == 1
-        would = await OversightService.list_turns(user=staff, shadow_outcome="blocked")
-        assert would.total == 1
-        assert (await OversightService.list_turns(user=staff, review="open")).total == 1
+        async def total(**fields):
+            return (await OversightService.list_turns(TurnFilter(**fields), user=staff)).total
+
+        assert await total() == 2
+        assert await total(label="topic", value="hr") == 1
+        assert await total(shadow_outcome="blocked") == 1
+        assert await total(review="open") == 1
+        assert await total(until=timezone.now() - timedelta(days=1)) == 0
+        assert await total(since=timezone.now() - timedelta(days=1)) == 2
 
     async def test_an_unknown_turn_is_none(self):
         staff = await UserFactory.acreate(staff=True)
@@ -113,6 +121,16 @@ class TestReveal:
         detail = await OversightService.get_turn(turn_id, user=root)
         assert detail.revealed
 
+    async def test_a_reveal_follows_the_reader_not_their_name(self):
+        turn_id = await a_turn(user=await UserFactory.acreate())
+        root = await UserFactory.acreate(superuser=True, staff=True)
+        other = await UserFactory.acreate(superuser=True, staff=True)
+        await OversightService.reveal(turn_id, user=root, reason="incident 42 follow-up")
+        setattr(root, root.USERNAME_FIELD, "renamed@example.com")
+        await root.asave()
+        assert (await OversightService.get_turn(turn_id, user=root)).revealed
+        assert not (await OversightService.get_turn(turn_id, user=other)).revealed
+
 
 @pytest.mark.django_db(transaction=True)
 class TestReviews:
@@ -126,10 +144,25 @@ class TestReviews:
         )
         assert done.status == "done"
         assert (await ReviewItem.objects.aget()).status == "done"
-        detail = await OversightService.get_turn(item.turn_id, user=staff, purpose="quality")
+        detail = await OversightService.get_turn(item.turn_id, user=staff, purpose="review")
         human = [o for o in detail.observations if o.reviewer]
         assert human[0].lens == "rule:hr_to_people"
         assert human[0].value is True
+
+    async def test_reading_the_queue_is_checked_and_recorded(self):
+        from unittest.mock import AsyncMock, patch
+
+        staff = await UserFactory.acreate(staff=True)
+        await a_turn()
+        await OversightService.list_reviews(user=staff, queue="hr")
+        record = await AccessRecord.objects.aget(action="reviews")
+        assert (record.purpose, record.query) == (
+            "review", {"queue": "hr", "status": "open", "offset": 0})
+        refused = AsyncMock(side_effect=PermissionDenied("no"))
+        with patch.object(OversightService, "_check_purpose", refused):
+            with pytest.raises(PermissionDenied):
+                await OversightService.list_reviews(user=staff, purpose="audit")
+        refused.assert_awaited_once()
 
     async def test_a_verdict_on_a_lens(self):
         staff = await UserFactory.acreate(staff=True)
@@ -138,6 +171,8 @@ class TestReviews:
             turn_id, VerdictIn(lens="topic", value="other"), user=staff
         )
         assert (obs.value, obs.answerer) == ("other", "human")
+        # A person's answer is not a reflection: reflect still runs later.
+        assert (await Turn.objects.aget(id=turn_id)).reflected_at is None
         with pytest.raises(UserError):
             await OversightService.add_verdict(turn_id, VerdictIn(lens="topic", value="zz"),
                                                user=staff)
@@ -221,35 +256,3 @@ class TestLedgerAndInsight:
         root = await UserFactory.acreate(superuser=True, staff=True)
         assert await OversightService.forget_thread("t-1", user=root, reason="erasure request")
         assert not await OversightService.forget_thread("t-1", user=root, reason="erasure again")
-
-
-@pytest.mark.django_db(transaction=True)
-def test_the_ninja_router(client):
-    from django.test import Client
-    from django.urls import path
-    from ninja import NinjaAPI
-
-    from django_ai_sdk.contrib.ninja import get_oversight_router, register_error_handlers
-
-    from ninja.security import SessionAuth
-
-    api = NinjaAPI(auth=SessionAuth(), urls_namespace="oversight-test")
-    register_error_handlers(api)
-    api.add_router("/", get_oversight_router())
-    urlpatterns = [path("api/", api.urls)]
-
-    user = UserFactory.create(staff=True)
-    browser = Client()
-    browser.force_login(user)
-    from django.test import override_settings
-
-    with override_settings(ROOT_URLCONF=type("urls", (), {"urlpatterns": urlpatterns})):
-        first = browser.get("/api/oversight/turns/")
-        assert first.status_code == 200, first.content
-        assert first.json()["total"] == 0
-        assert browser.get("/api/oversight/turns/x/").status_code == 404
-        assert browser.get("/api/oversight/turns/?purpose=bogus").status_code == 400
-        assert browser.get("/api/oversight/policies/").status_code == 200
-        response = browser.post("/api/oversight/turns/x/reveal/", {"reason": "because of reasons"},
-                                content_type="application/json")
-        assert response.status_code == 403

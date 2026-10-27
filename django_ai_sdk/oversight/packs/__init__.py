@@ -1,5 +1,6 @@
-"""Built-in policies to extend: security, quality, safety, classify, and all of them as default.
+"""Built-in policies: security, quality, safety, classify, and all of them as default.
 
+Extend a pack whole, or take single lenses and rules from it with `policy.pick`.
 Importing this module registers them; OversightConfig.ready() does that.
 """
 

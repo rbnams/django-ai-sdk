@@ -1,19 +1,24 @@
 """A daily spend cap for model answerers, so oversight can never outspend the product.
 
-System-one answerers are free and never counted. When the cap is reached, model
-answerers abstain with error "budget" and a Cascade falls back to what it has.
+Unmetered answerers (local detectors, Jev, people) are never counted. When the cap
+is reached, metered answerers abstain with error "budget" and the lens keeps the
+answers it has.
 """
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 from collections import defaultdict
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from django.db.models import F, Sum
 
 from django_ai_sdk.logger import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 logger = get_logger(__name__)
 
@@ -36,14 +41,23 @@ class Budget:
         self.pending[answerer].append(float(cost or 0))
 
     async def flush(self) -> None:
-        """Add this turn's spend to the day's rows; one upsert per answerer."""
+        """Add this turn's spend to the day's rows: one update per answerer, a row if new."""
+        from django.db import IntegrityError
+
         from django_ai_sdk.oversight.models import DailySpend
 
         for answerer, costs in self.pending.items():
-            row, _ = await DailySpend.objects.aget_or_create(date=self.day, answerer=answerer[:200])
-            await DailySpend.objects.filter(pk=row.pk).aupdate(
-                cost=F("cost") + sum(costs), calls=F("calls") + len(costs)
-            )
+            rows = DailySpend.objects.filter(date=self.day, answerer=answerer[:200])
+            added = {"cost": F("cost") + sum(costs), "calls": F("calls") + len(costs)}
+            if await rows.aupdate(**added):
+                continue
+            try:
+                await DailySpend.objects.acreate(
+                    date=self.day, answerer=answerer[:200], cost=sum(costs), calls=len(costs)
+                )
+            except IntegrityError:
+                # Another turn created the row first; add to it instead.
+                await rows.aupdate(**added)
         self.pending.clear()
 
 
@@ -75,6 +89,18 @@ async def aload(cap: float | None = None) -> Budget:
     return Budget(float(cap), float(total["s"] or 0))
 
 
+@contextlib.asynccontextmanager
+async def charged() -> AsyncIterator[Budget]:
+    """Today's budget, active for the block and recorded after: for console dry runs."""
+    budget = await aload()
+    token = activate(budget)
+    try:
+        yield budget
+    finally:
+        deactivate(token)
+        await budget.flush()
+
+
 async def spend_by_day(since: date) -> list[dict[str, Any]]:
     from django_ai_sdk.oversight.models import DailySpend
 
@@ -90,4 +116,12 @@ async def spend_by_day(since: date) -> list[dict[str, Any]]:
     ]
 
 
-__all__ = ["Budget", "activate", "aload", "current", "deactivate", "spend_by_day"]
+__all__ = [
+    "Budget",
+    "activate",
+    "aload",
+    "charged",
+    "current",
+    "deactivate",
+    "spend_by_day",
+]

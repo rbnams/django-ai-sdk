@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.utils.module_loading import import_string
 
 from django_ai_sdk.oversight.answerers.base import Answerer
+from django_ai_sdk.oversight.answerers.pii import mask_secrets
 from django_ai_sdk.oversight.types import Answer, Subject
 from django_ai_sdk.pricing import cost_for, usage_from_meta
 
@@ -37,24 +38,28 @@ answer, say so in the rationale and give a low confidence."""
 
 # Per field, the most characters a judge is shown: long turns are cut, not dropped.
 DEFAULT_LIMITS = {"input": 6_000, "output": 8_000, "source": 1_500, "sources": 8, "history": 6}
+# Characters of each earlier message shown; Jev's state uses the same.
+HISTORY_ITEM_CHARS = 500
 
 
 def render_turn(lens: Lens, view: TurnView, limits: dict[str, int] | None = None) -> str:
-    """The evidence a judge reads for `lens`, fenced and trimmed."""
+    """The evidence a judge reads for `lens`, fenced, trimmed and with secrets masked."""
     limits = {**DEFAULT_LIMITS, **(limits or {})}
     parts: list[str] = []
     subject = lens.subject
     if view.history and subject in {Subject.INPUT, Subject.EXCHANGE}:
         recent = view.history[-limits["history"] :]
-        lines = "\n".join(f"{h.role}: {_cut(h.content, 500)}" for h in recent)
+        lines = "\n".join(f"{h.role}: {_cut(h.content, HISTORY_ITEM_CHARS)}" for h in recent)
         parts.append(f"<history>\n{_fence(lines)}\n</history>")
     if subject in {Subject.INPUT, Subject.EXCHANGE, Subject.SOURCES, Subject.OUTPUT}:
         parts.append(f"<question>\n{_fence(_cut(view.input, limits['input']))}\n</question>")
-    if subject in {Subject.SOURCES, Subject.OUTPUT, Subject.EXCHANGE} and view.fresh_sources():
+    if subject in {Subject.SOURCES, Subject.OUTPUT, Subject.EXCHANGE} and (
+        evidence := view.evidence()
+    ):
         rendered = "\n".join(
             f'<source n="{n}" title="{_attr(s.title)}">\n{_fence(_cut(s.content, limits["source"]))}'
             "\n</source>"
-            for n, s in enumerate(view.fresh_sources()[: limits["sources"]], start=1)
+            for n, s in enumerate(evidence[: limits["sources"]], start=1)
         )
         parts.append(f"<sources>\n{rendered}\n</sources>")
     if subject in {Subject.OUTPUT, Subject.EXCHANGE}:
@@ -66,7 +71,7 @@ def render_turn(lens: Lens, view: TurnView, limits: dict[str, int] | None = None
             f"<question>\n{_fence(_cut(view.input, limits['input']))}\n</question>\n"
             f'<tool_call name="{_attr(call.name)}">\n{_fence(arguments)}\n</tool_call>'
         )
-    return "<turn>\n" + "\n".join(parts) + "\n</turn>"
+    return "<turn>\n" + mask_secrets("\n".join(parts)) + "\n</turn>"
 
 
 def _cut(text: str, limit: int) -> str:
@@ -116,6 +121,7 @@ class LLMJudge(Answerer):
     asked for JSON and parsed.
     """
 
+    external: ClassVar[str] = "model gateway"
     timeout = 45.0
 
     def __init__(
@@ -205,18 +211,18 @@ def _unit(value: Any, default: float) -> float:
 
 
 class AgentJudge(Answerer):
-    """A registered SDK agent as an answerer: its model, instructions and tools.
+    """A registered SDK agent as an answerer: its model and instructions; its tools are not run.
 
     For judges that need a knowledge base of their own (a policy handbook, a style
     guide) or a model only an agent class knows how to build. Oversight is off
     inside the judge's run, so judging never produces turns to judge.
     """
 
+    external: ClassVar[str] = "model gateway"
     timeout = 90.0
 
-    def __init__(self, agent: str, *, tools: bool = False, name: str = "") -> None:
+    def __init__(self, agent: str, *, name: str = "") -> None:
         self.agent = agent
-        self.tools = tools
         self.name = name or f"agent:{agent}"
 
     def resolve_agent(self) -> Any:

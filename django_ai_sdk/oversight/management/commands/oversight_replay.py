@@ -37,7 +37,12 @@ class Command(BaseCommand):
         cases = self._cases(options)
         if not cases:
             raise CommandError("Nothing to replay: give --file or --reviewed N.")
-        report = async_to_sync(replay)(options["agent"], cases, policy=options["policy"])
+        from django_ai_sdk.oversight.simulate import replay
+
+        try:
+            report = async_to_sync(replay)(options["agent"], cases, policy=options["policy"])
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
         if options["json"]:
             self.stdout.write(json.dumps(report, default=str))
             return
@@ -72,49 +77,3 @@ class Command(BaseCommand):
                     break
             return list(cases.values())
         return []
-
-
-async def replay(
-    agent_ref: str, cases: list[dict[str, Any]], *, policy: str = ""
-) -> dict[str, Any]:
-    from django_ai_sdk.common import ChatMessage
-    from django_ai_sdk.oversight.answerers.llm import AgentJudge
-    from django_ai_sdk.oversight.metrics import _band
-    from django_ai_sdk.oversight.policy import aget_policy
-    from django_ai_sdk.oversight.session import _policy_name, unobserved
-    from django_ai_sdk.oversight.stages import run_lenses
-    from django_ai_sdk.oversight.types import Stage, TurnView
-
-    agent = AgentJudge(agent_ref).resolve_agent()
-    resolved = await aget_policy(policy or _policy_name(agent))
-    if resolved is None:
-        raise CommandError("The agent has no oversight policy; pass --policy.")
-    lenses: dict[str, Any] = {}
-    failed = 0
-    for case in cases:
-        try:
-            with unobserved():
-                output = await agent.run(
-                    [ChatMessage(role="user", content=case["input"])], tools=True
-                )
-        except Exception:
-            failed += 1
-            continue
-        view = TurnView(
-            turn_id=f"replay:{hash(case['input'])}", input=case["input"], output=str(output or "")
-        )
-        expected = case.get("expected") or {}
-        judged = [
-            lens
-            for name, lens in resolved.lenses.items()
-            if name in expected and (Stage.REVIEW in lens.stages or Stage.REFLECT in lens.stages)
-        ]
-        with unobserved():
-            observed = await run_lenses(judged, view, Stage.RETRO)
-        for o in observed:
-            stats = lenses.setdefault(o.lens.name, {"expected": 0, "kept": 0, "answers": []})
-            stats["expected"] += 1
-            if o.answer.ok and _band(o.answer.value) == _band(expected[o.lens.name]):
-                stats["kept"] += 1
-            stats["answers"].append(o.answer.value)
-    return {"cases": len(cases), "failed": failed, "lenses": lenses}

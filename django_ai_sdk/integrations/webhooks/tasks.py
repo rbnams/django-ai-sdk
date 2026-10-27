@@ -101,7 +101,8 @@ async def run_inbound(payload: dict[str, Any]) -> None:
     # Await inbound before agent.run so control hints can filter get_tools().
     inbound_payload: dict[str, Any] | None = None
     if screener is not None:
-        inbound_payload = await _safe_screen_input(screener, event.text)
+        # The question as the gate left it: a pasted secret never reaches the screener.
+        inbound_payload = await _safe_screen_input(screener, user_message.content)
         if inbound_payload:
             from django_ai_sdk.typesafe.control import enrich_payload_acted
 
@@ -157,7 +158,7 @@ async def run_inbound(payload: dict[str, Any]) -> None:
         if inbound_payload:
             await integration.reply(event, format_typesafe_card(inbound_payload))
         await integration.reply(event, reply_text)
-        outbound_payload = await _safe_screen_output(screener, event.text, reply_text)
+        outbound_payload = await _safe_screen_output(screener, user_message.content, reply_text)
         if outbound_payload:
             await integration.reply(event, format_typesafe_card(outbound_payload))
     else:

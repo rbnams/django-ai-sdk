@@ -48,6 +48,7 @@ Issues = "https://github.com/django-ai-sdk/django-ai-sdk/issues"
 Changelog = "https://github.com/django-ai-sdk/django-ai-sdk/releases"
 
 [project.optional-dependencies]
+# Leaves out presidio on purpose: it also needs a spaCy model, downloaded separately.
 all = ["django-ai-sdk[haystack,rag,mcp,files,providers,transformers,automations,typesafe,oversight]"]
 # Automations only schedule by cron, so APScheduler's CronTrigger — used for parsing
 # and DST-correct next-occurrence math, not as a running scheduler — is only needed

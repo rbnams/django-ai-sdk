@@ -1,6 +1,6 @@
 """A person as an answerer: the lens goes to a review queue and is answered later.
 
-Last in a Cascade it means "when the machines are unsure, ask someone". The
+Last in a lens's answerers it means "when the machines are unsure, ask someone". The
 verdict lands as an Observation like any other, which is what lets the ledger
 measure how often each model agrees with people.
 """
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 class Human(Answerer):
     """Queue the lens for a person. `priority`: higher is sooner."""
 
-    system_one: ClassVar[bool] = True
+    metered: ClassVar[bool] = False
 
     def __init__(self, queue: str = "default", *, priority: int = 0, name: str = "") -> None:
         self.queue = queue

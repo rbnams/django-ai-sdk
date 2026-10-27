@@ -26,6 +26,8 @@ PermissionDomain.MEMORY   # "memory"
 | `workflow` | `WorkflowDefaultPermission` |
 | `oversight` | `OversightDefaultPermission`: staff view, review and audit; superusers reveal who asked and manage policies. |
 
+Managing oversight includes configuring answerers: a host that grants `MANAGE_OVERSIGHT` more widely also lets those users choose which model or service judges turns, within the catalog's kinds and parameters.
+
 Override a domain globally via `AI_SDK_PERMISSIONS`:
 
 ```python
@@ -55,7 +57,7 @@ LIST_THREAD_MEMORIES, LINK_MEMORY, UNLINK_MEMORY
 USE_INTEGRATION, MANAGE_INTEGRATION
 # Workflows
 VIEW_WORKFLOW, RUN_WORKFLOW, MANAGE_WORKFLOW
-# Oversight (VIEW_OVERSIGHT is checked with purpose="security" | "quality" | "audit")
+# Oversight (VIEW_OVERSIGHT is checked with purpose="review", AUDIT_OVERSIGHT with "audit")
 VIEW_OVERSIGHT, REVIEW_OVERSIGHT, AUDIT_OVERSIGHT, REVEAL_ACTOR, MANAGE_OVERSIGHT
 # Misc
 CHAT, REINDEX

@@ -64,9 +64,29 @@ class Capture(StrEnum):
 class Purpose(StrEnum):
     """Why someone reads the ledger; it decides what they are shown."""
 
-    SECURITY = "security"
-    QUALITY = "quality"
+    # The turn itself: question, answer, sources, tool calls, verdicts and reasons.
+    REVIEW = "review"
+    # Decisions, bare verdicts and the chain; no content.
     AUDIT = "audit"
+
+
+class Severity(StrEnum):
+    """How urgent an alert or a notification is, least first."""
+
+    INFO = "info"
+    WARNING = "warning"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+SEVERITY_ORDER = ["", *Severity]
+
+
+def most_severe(*levels: str) -> str:
+    """The most urgent of `levels`; "" when there are none."""
+    return max(
+        levels, key=lambda s: SEVERITY_ORDER.index(s) if s in SEVERITY_ORDER else 0, default=""
+    )
 
 
 class Outcome(StrEnum):
@@ -104,7 +124,7 @@ class Answer(BaseModel):
     """
 
     value: Any = None
-    # How sure the answerer is, 0..1. System-one answerers are sure or abstain.
+    # How sure the answerer is, 0..1. A detector's hit is 1; its miss, its miss_confidence.
     confidence: float = 1.0
     rationale: str = ""
     spans: list[TextSpan] = Field(default_factory=list)
@@ -114,7 +134,7 @@ class Answer(BaseModel):
     latency_ms: float | None = None
     tokens: int | None = None
     cost: float | None = None
-    # Answers given on the way to this one, by a Cascade or a Vote.
+    # Answers given on the way to this one, by earlier answerers in the lens's list.
     trail: list[Answer] = Field(default_factory=list)
     # Why there is no value: the answerer failed, timed out or ran out of budget.
     error: str = ""
@@ -191,6 +211,19 @@ class TurnView(BaseModel):
         """Sources found for this turn, not those carried over from earlier ones."""
         return [s for s in self.sources if not s.seeded]
 
+    def evidence(self) -> list[Source]:
+        """What the answer could rest on: this turn's sources, then each tool's result.
+
+        A weather tool's reply grounds "12°C and rain" the way a retrieved chunk does,
+        so judges of groundedness read both.
+        """
+        results = [
+            Source(title=f"{call.name} result", content=_compact(call.result), kind="tool")
+            for call in self.tool_calls
+            if not call.error and call.result not in (None, "", [], {})
+        ]
+        return [*self.fresh_sources(), *results]
+
 
 def _compact(value: Any) -> str:
     import json
@@ -211,11 +244,14 @@ __all__ = [
     "Mode",
     "Outcome",
     "Purpose",
+    "SEVERITY_ORDER",
+    "Severity",
     "Source",
     "Stage",
     "Subject",
     "TextSpan",
     "ToolCall",
     "TurnView",
+    "most_severe",
     "worst",
 ]

@@ -13,6 +13,8 @@ import uuid
 from django.conf import settings
 from django.db import models
 
+from .types import Purpose
+
 APP_LABEL = "django_ai_sdk_oversight"
 
 
@@ -136,6 +138,8 @@ class Turn(models.Model):
     evidence = models.ForeignKey(Evidence, null=True, blank=True, on_delete=models.SET_NULL)
     evidence_hash = models.CharField(max_length=64, blank=True)
     entry_hash = models.CharField(max_length=64, blank=True)
+    # When prune drops the turn: its policy's metadata retention after created_at.
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     # Denormalized, updated as later stages answer; not on the ledger.
     labels = models.JSONField(default=dict, blank=True)
@@ -168,7 +172,7 @@ class Observation(models.Model):
     confidence = models.FloatField(null=True, blank=True)
     rationale = models.TextField(blank=True)
     spans = models.JSONField(default=list, blank=True)
-    # The answers a Cascade or Vote passed through on the way to this one.
+    # The answers of earlier answerers in the lens's list, on the way to this one.
     trail = models.JSONField(default=list, blank=True)
     error = models.CharField(max_length=200, blank=True)
     queued = models.CharField(max_length=100, blank=True)
@@ -178,13 +182,12 @@ class Observation(models.Model):
     # The person behind a human answer, as a pseudonym.
     reviewer = models.CharField(max_length=32, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    entry_hash = models.CharField(max_length=64, blank=True)
 
     class Meta:
         app_label = APP_LABEL
         db_table = "django_ai_sdk_oversight_observations"
         ordering = ["created_at"]
-        indexes = [models.Index(fields=["lens", "created_at"])]
+        indexes = [models.Index(fields=["turn", "lens"])]
 
 
 class Decision(models.Model):
@@ -200,7 +203,6 @@ class Decision(models.Model):
     acted = models.BooleanField(default=False)
     condition = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
-    entry_hash = models.CharField(max_length=64, blank=True)
 
     class Meta:
         app_label = APP_LABEL
@@ -240,6 +242,7 @@ class ReviewItem(models.Model):
         app_label = APP_LABEL
         db_table = "django_ai_sdk_oversight_reviews"
         ordering = ["-priority", "created_at"]
+        indexes = [models.Index(fields=["status", "queue", "-priority", "created_at"])]
         constraints = [
             models.UniqueConstraint(
                 fields=["turn", "queue", "lens", "rule"],
@@ -260,19 +263,19 @@ class AccessRecord(models.Model):
         related_name="+",
     )
     reader_label = models.CharField(max_length=255, blank=True)
-    purpose = models.CharField(max_length=16)
+    purpose = models.CharField(max_length=16, choices=[(p.value, p.name.title()) for p in Purpose])
     # list, view, reveal, export, verify, review, override
     action = models.CharField(max_length=16, db_index=True)
     turn_ref = models.CharField(max_length=64, blank=True, db_index=True)
     query = models.JSONField(default=dict, blank=True)
     reason = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    entry_hash = models.CharField(max_length=64, blank=True)
 
     class Meta:
         app_label = APP_LABEL
         db_table = "django_ai_sdk_oversight_access"
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["-created_at"])]
 
 
 class Checkpoint(models.Model):
@@ -299,12 +302,14 @@ class PolicyOverride(models.Model):
 
     id = models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True)
     policy = models.CharField(max_length=100, db_index=True)
-    # lens | rule | policy
+    # lens | rule | policy | agent | answerer
     target_kind = models.CharField(max_length=16)
     target = models.CharField(max_length=100, blank=True)
     field = models.CharField(max_length=32)
     value = models.JSONField(null=True)
-    # An override is withdrawn by a new row, so the history stays on the ledger.
+    # Whether this is the latest row for its field: a later row (or a reset) clears
+    # it, so the history stays on the ledger. Materialized for the overlay's query,
+    # left out of override_payload, and the one field updated after insert.
     active = models.BooleanField(default=True, db_index=True)
     changed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -316,7 +321,6 @@ class PolicyOverride(models.Model):
     changed_by_label = models.CharField(max_length=255, blank=True)
     note = models.TextField(blank=True)
     changed_at = models.DateTimeField(auto_now_add=True)
-    entry_hash = models.CharField(max_length=64, blank=True)
 
     class Meta:
         app_label = APP_LABEL
