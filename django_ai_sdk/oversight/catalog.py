@@ -309,8 +309,8 @@ ACTION_KINDS = [
     },
     {
         "kind": "notify",
-        "label": "Notify",
-        "summary": "Send to exporters: Slack, webhook, SIEM.",
+        "label": "Send an alert",
+        "summary": "Message someone outside the console: Telegram, Slack, a webhook.",
         "params": [
             _param(
                 "severity",
@@ -323,8 +323,8 @@ ACTION_KINDS = [
     },
     {
         "kind": "alert",
-        "label": "Alert",
-        "summary": "Mark the turn in the console.",
+        "label": "Flag it",
+        "summary": "Mark the turn in the console, at a severity.",
         "params": [
             _param(
                 "severity",

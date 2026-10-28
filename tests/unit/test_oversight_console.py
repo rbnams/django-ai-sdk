@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from asgiref.sync import sync_to_async
+from django_ai_sdk.agents.runtime import RuntimeAgent
 from django_ai_sdk.errors import UserError
 from django_ai_sdk.oversight.answerers.base import alias_defined, resolve
 from django_ai_sdk.oversight.models import PolicyOverride, Turn
@@ -234,8 +235,33 @@ class TestPolicies:
         assert {c.note for c in trail} == {"For the shop"}
 
 
+class PerRowAgent(RuntimeAgent):
+    """A runtime base that picks its policy from its row, as a host may."""
+
+    def get_oversight_policy(self) -> str:
+        return f"for-{self._config.slug}"
+
+
 @pytest.mark.django_db(transaction=True)
 class TestAgents:
+    async def test_a_runtime_agent_is_asked_for_its_policy(self, settings):  # noqa: ANN001
+        from django_ai_sdk.agents.config import get_runtime_agent_bases
+        from django_ai_sdk.agents.models import AgentSettings
+        from django_ai_sdk.oversight.console import _agents
+
+        settings.AI_SDK_RUNTIME_AGENT_BASES = ["tests.unit.test_oversight_console.PerRowAgent"]
+        get_runtime_agent_bases.cache_clear()
+        try:
+            await AgentSettings.objects.acreate(
+                name="Coach", slug="coach", model="gpt-4o-mini",
+                agent="tests.unit.test_oversight_console.PerRowAgent",
+            )
+            rows = await sync_to_async(_agents)()
+        finally:
+            get_runtime_agent_bases.cache_clear()
+        row = next(r for r in rows if r["name"] == "Coach")
+        assert (row["code_policy"], row["code_reason"]) == ("for-coach", "agent")
+
     async def test_the_console_choice_wins_over_code(self):
         user = await root()
         agent = make_agent([], None)

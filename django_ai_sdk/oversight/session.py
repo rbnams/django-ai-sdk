@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import hashlib
+import re
 import secrets
 import time
 import uuid
@@ -38,6 +39,7 @@ from django_ai_sdk.oversight.answerers.pii import redact_all
 from django_ai_sdk.oversight.conf import is_enabled, setting
 from django_ai_sdk.oversight.rules import Block, Redact
 from django_ai_sdk.oversight.stages import (
+    STAGE_ORDER,
     Matched,
     Observed,
     asks_again,
@@ -510,9 +512,10 @@ class TurnSession:
         from django_ai_sdk.utils import serialize
 
         assert self.policy is not None
+        matches = [*matched, *self._tool_matches(stage, matched)]
         return {
             "policy": self.policy.name,
-            "shadow_outcome": str(worst(*(m.outcome(shadow=True) for m in matched))),
+            "shadow_outcome": str(worst(*(m.outcome(shadow=True) for m in matches))),
             "pending": sorted(lens.name for lens in self.policy.active_lenses(Stage.REFLECT))
             if stage is Stage.REVIEW
             else [],
@@ -538,9 +541,15 @@ class TurnSession:
                     "acted": [a.kind for a in m.acted],
                     "would": [a.kind for a in m.rule.then],
                 }
-                for m in matched
+                for m in matches
             ],
         }
+
+    def _tool_matches(self, stage: Stage, matched: list[Matched]) -> list[Matched]:
+        """The answer's notice also carries what tool calls matched: no notice of their own says so."""
+        if stage is not Stage.REVIEW:
+            return []
+        return [m for m in self.matched if m.stage is Stage.WATCH and m not in matched]
 
     # Closing.
 
@@ -724,11 +733,12 @@ def evidence_content(session: TurnSession, capture: Capture) -> dict[str, Any] |
             "tool_calls": [{"name": c.name, "error": c.error} for c in view.tool_calls],
         }
     full = capture is Capture.FULL
-    input_text = session.original_input if full else view.input
-    output_text = session.original_output if full and session.original_output else view.output
-    if not full:
-        input_text = _redact_subject(session, input_text, Subject.INPUT)
-        output_text = _redact_subject(session, output_text, Subject.OUTPUT)
+    if full:
+        input_text = session.original_input
+        output_text = session.original_output or view.output
+    else:
+        input_text = _redact_subject(session, Subject.INPUT)
+        output_text = _redact_subject(session, Subject.OUTPUT)
     return {
         **base,
         "input": input_text,
@@ -744,15 +754,33 @@ def evidence_content(session: TurnSession, capture: Capture) -> dict[str, Any] |
     }
 
 
-def _redact_subject(session: TurnSession, text: str, subject: Subject) -> str:
-    """Mask what any Entities lens found in `subject`, for REDACTED capture."""
-    spans = [
-        span
-        for o in session.observed
-        if o.lens.kind == "entities" and o.lens.subject is subject
-        for span in o.answer.spans
-    ]
-    return redact_all(text, [(spans, "[{label}]")]) if spans else text
+def _redact_subject(session: TurnSession, subject: Subject) -> str:
+    """`subject` as passed on, with what any Entities lens found there masked.
+
+    For REDACTED capture. A lens that ran before a rule masked or replaced the text
+    read it as said, so its offsets don't fit what was passed on: what it found is
+    masked wherever it still shows there.
+    """
+    view = session.view
+    if subject is Subject.INPUT:
+        said, shown, masked_at = session.original_input or view.input, view.input, Stage.GATE
+    else:
+        said, shown, masked_at = session.original_output or view.output, view.output, Stage.REVIEW
+    spans: list[TextSpan] = []
+    for o in session.observed:
+        if o.lens.kind != "entities" or o.lens.subject is not subject:
+            continue
+        if said == shown or STAGE_ORDER.index(o.stage) > STAGE_ORDER.index(masked_at):
+            spans.extend(o.answer.spans)
+            continue
+        for span in o.answer.spans:
+            found = said[span.start : span.end]
+            if found:
+                spans.extend(
+                    TextSpan(start=m.start(), end=m.end(), label=span.label)
+                    for m in re.finditer(re.escape(found), shown)
+                )
+    return redact_all(shown, [(spans, "[{label}]")]) if spans else shown
 
 
 def _persist(session: TurnSession) -> str:

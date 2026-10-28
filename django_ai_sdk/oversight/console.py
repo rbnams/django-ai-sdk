@@ -13,6 +13,7 @@ from asgiref.sync import sync_to_async
 from django.utils import timezone
 
 from django_ai_sdk.errors import UserError
+from django_ai_sdk.logger import get_logger
 from django_ai_sdk.oversight import budget
 from django_ai_sdk.oversight.privacy import staff_label
 from django_ai_sdk.oversight.schemas import (
@@ -28,6 +29,8 @@ from django_ai_sdk.oversight.schemas import (
 )
 from django_ai_sdk.oversight.types import Answer
 from django_ai_sdk.permissions import Operation
+
+logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from django.contrib.auth.base_user import AbstractBaseUser
@@ -457,8 +460,7 @@ async def _console_policies() -> set[str]:
 
 def _agents() -> list[dict[str, Any]]:
     """Registered agent classes and runtime agents, with what their code asks for."""
-    from django.utils.module_loading import import_string
-
+    from django_ai_sdk.agents.config import get_runtime_agent_class
     from django_ai_sdk.agents.models import AgentSettings
     from django_ai_sdk.agents.registry import registry
     from django_ai_sdk.oversight.session import agent_key, code_policy
@@ -477,12 +479,9 @@ def _agents() -> list[dict[str, Any]]:
             }
         )
     for config in AgentSettings.objects.filter(active=True).order_by("name"):
-        try:
-            cls = import_string(config.agent) if config.agent else None
-        except ImportError:
-            cls = None
-        probe = type("Probe", (), {"oversight": getattr(cls, "oversight", None)})()
-        policy, reason = code_policy(probe)
+        # The class the runtime builds for this row: only a listed base, else the first.
+        cls = get_runtime_agent_class(config.agent)
+        policy, reason = code_policy(_runtime_probe(cls, config))
         rows.append(
             {
                 "id": str(config.id),
@@ -494,6 +493,15 @@ def _agents() -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _runtime_probe(cls: Any, config: Any) -> Any:
+    """The agent a row builds, so a per-instance get_oversight_policy() is asked; else its class."""
+    try:
+        return cls(config)
+    except Exception:
+        logger.opt(exception=True).debug("Could not build runtime agent {} to read its policy", config.slug)
+        return type("Probe", (), {"oversight": getattr(cls, "oversight", None)})()
 
 
 def _code_description(agent: Any) -> str:

@@ -38,7 +38,7 @@ from django_ai_sdk.oversight.models import Decision, Observation, ReviewItem, Tu
 from django_ai_sdk.oversight.policy import invalidate
 from django_ai_sdk.oversight.session import TurnSession, unobserved
 from django_ai_sdk.oversight.tasks import areflect
-from django_ai_sdk.oversight.types import Answer, Stage, Subject, ToolCall
+from django_ai_sdk.oversight.types import Answer, Capture, Stage, Subject, ToolCall
 from django_ai_sdk.permissions import AllowAll
 from haystack.components.generators.chat import MockChatGenerator
 from pydantic import BaseModel
@@ -253,6 +253,26 @@ class TestChat:
         decision = await Decision.objects.aget(rule="mask_mail_live")
         assert decision.stage == "review"
 
+    async def test_redacted_capture_keeps_what_was_passed_on(self):
+        @register
+        class RedactedCapture(Policy):
+            name = "test-redacted-capture"
+            capture = Capture.REDACTED
+            lenses = [
+                Entities(name="mail_in", question="?", stages=[Stage.GATE], answerers=[PII(["email"])]),
+                Entities(name="mail_out", question="?", subject=Subject.OUTPUT, stages=[Stage.REVIEW],
+                         answerers=[PII(["email"])]),
+            ]
+            rules = [Rule(f"mask_{name}", when=L(name).any, then=Redact(), mode=ENFORCE)
+                     for name in ("mail_in", "mail_out")]
+
+        agent = make_agent(["Ask piet@example.com, then reply."], Storage(), policy="test-redacted-capture")
+        await chat(agent, "Is jan@example.com right, or not?")
+        content = (await Turn.objects.select_related("evidence").aget()).evidence.content
+        # Masked once: the lenses' offsets index the unmasked text, not this one.
+        assert content["input"] == "Is [EMAIL] right, or not?"
+        assert content["output"] == "Ask [EMAIL], then reply."
+
     async def test_two_redact_rules_mask_one_text(self):
         text = "my key sk-proj-abcdefghijklmnopqrstuvwxyz12 and mail jan@example.com ok"
         masked = "my key [OPENAI_KEY] and mail [EMAIL] ok"
@@ -404,7 +424,8 @@ class TestTools:
             tool_calls=[HaystackToolCall(tool_name="send",
                                          arguments={"text": "sk-proj-abcdefghijklmnopqrstuvwxyz12"})]
         )
-        parts = await chat(make_agent([call, "Done."], Storage(), tools=[tool]), "send my key")
+        with override_settings(AI_SDK_OVERSIGHT={"CLIENT_DETAIL": "full"}):
+            parts = await chat(make_agent([call, "Done."], Storage(), tools=[tool]), "send my key")
         assert ran == []
         decision = await Decision.objects.aget(rule="no_secret_tools")
         assert decision.acted
@@ -412,6 +433,9 @@ class TestTools:
         outputs = [p for p in parts if p.get("type", "").startswith("tool-output")]
         assert len(outputs) == 1
         assert outputs[0]["type"] == "tool-output-error"
+        # And the answer's notice counts the refusal, so the badge under it does too.
+        review = next(n for n in oversight_parts(parts) if n["stage"] == "review")
+        assert "no_secret_tools" in {m["rule"] for m in review["detail"]["matches"]}
 
     async def test_the_gate_can_take_every_tool_away(self):
         agent = make_agent(["ok"], Storage())
