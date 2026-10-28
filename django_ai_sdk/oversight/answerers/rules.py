@@ -16,14 +16,30 @@ from django_ai_sdk.oversight.answerers.base import Answerer
 from django_ai_sdk.oversight.types import Answer, Subject, TextSpan
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
     from django_ai_sdk.oversight.lenses import Lens
     from django_ai_sdk.oversight.types import TurnView
 
-# Detectors read at most this much of a subject: it bounds every pattern's cost,
-# and the spans still index the text, since they fall in its prefix.
+# Detectors read a long subject in windows this size, so each pattern's cost stays
+# bounded, overlapping by enough that a match across a window edge is still found.
 MAX_SCAN_CHARS = 50_000
+SCAN_OVERLAP_CHARS = 1_000
+
+
+def scan(text: str, detect: Callable[[str], list[TextSpan]]) -> list[TextSpan]:
+    """`detect` over all of `text`, window by window, spans indexing `text`."""
+    if len(text) <= MAX_SCAN_CHARS:
+        return detect(text)
+    found: dict[tuple[int, int, str], TextSpan] = {}
+    step = MAX_SCAN_CHARS - SCAN_OVERLAP_CHARS
+    for offset in range(0, len(text), step):
+        for span in detect(text[offset : offset + MAX_SCAN_CHARS]):
+            moved = span.model_copy(update={"start": span.start + offset, "end": span.end + offset})
+            found.setdefault((moved.start, moved.end, moved.label), moved)
+        if offset + MAX_SCAN_CHARS >= len(text):
+            break
+    return list(found.values())
 
 
 class Detector(Answerer):
@@ -45,13 +61,11 @@ class Detector(Answerer):
         text = view.text(lens.subject)
         if not text:
             return None
-        spans = self.detect(text[:MAX_SCAN_CHARS], view, lens)
+        spans = scan(text, lambda chunk: self.detect(chunk, view, lens))
         labels = list(dict.fromkeys(span.label for span in spans))
         notes = [f"found {_listed(labels)}"] if labels else []
         if not labels and (kinds := self.looks_for()):
             notes.append(f"found none of: {_listed(kinds)}")
-        if len(text) > MAX_SCAN_CHARS:
-            notes.append(f"scanned the first {MAX_SCAN_CHARS:,} characters")
         return Answer(
             value=lens.from_detections(labels),
             confidence=1.0 if spans else self.miss_confidence,

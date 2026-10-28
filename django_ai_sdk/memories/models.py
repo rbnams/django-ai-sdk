@@ -223,6 +223,9 @@ class Entry(models.Model):
             metadata={
                 "memory_id": str(self.memory_id),
                 "name": self.name,
+                # Embedded with every chunk (meta_fields_to_embed), so a chunk says which
+                # document it is from: two CAOs with the same article read alike otherwise.
+                "title": self.name,
                 "keywords": ". ".join(extraction.keywords) if extraction else "",
                 "facts": ". ".join(f.text for f in extraction.facts) if extraction else "",
             },

@@ -97,3 +97,46 @@ class TestSharedIndex:
 
         agent.rag = FakeRag(SERVER)
         assert await provider.get_rag_instance(agent, "m1") is agent.rag
+
+    async def test_agents_of_different_classes_write_a_shared_index_once(self):
+        # Every agent class with a provider is told of a save; a server index is one.
+        class Other(FakeAgent):
+            pass
+
+        provider, rag = RAGProvider(), FakeRag(SERVER)
+        written: set[str] = set()
+
+        for agent in (FakeAgent(rag), Other(rag)):
+            assert await provider.add_documents(agent, "m1", [DOC], written=written)
+        for agent in (FakeAgent(rag), Other(rag)):
+            assert await provider.remove_documents(agent, "m1", ["e1"], written=set())
+
+        assert rag.added == [DOC]
+        assert rag.removed == ["e1", "e1"]  # each call had its own `written`
+        assert written == {"http://qdrant:6333/default"}
+
+
+@pytest.mark.asyncio
+async def test_an_edited_document_replaces_its_old_chunks():
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from django_ai_sdk.rags.qdrant_hybrid import QdrantBM25HybridRAG
+
+    rag = QdrantBM25HybridRAG(documents=[])
+    rag._cached_document_store = MagicMock()
+    calls: list[str] = []
+    with (
+        patch.object(
+            rag,
+            "remove_documents",
+            AsyncMock(side_effect=lambda ids: calls.append(f"remove {ids}")),
+        ),
+        patch.object(
+            rag,
+            "_index_documents",
+            AsyncMock(side_effect=lambda docs, store: calls.append("index")),
+        ),
+    ):
+        await rag.add_documents([DOC])
+
+    assert calls == ["remove ['e1']", "index"]

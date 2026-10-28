@@ -500,7 +500,9 @@ def _runtime_probe(cls: Any, config: Any) -> Any:
     try:
         return cls(config)
     except Exception:
-        logger.opt(exception=True).debug("Could not build runtime agent {} to read its policy", config.slug)
+        logger.opt(exception=True).debug(
+            "Could not build runtime agent {} to read its policy", config.slug
+        )
         return type("Probe", (), {"oversight": getattr(cls, "oversight", None)})()
 
 

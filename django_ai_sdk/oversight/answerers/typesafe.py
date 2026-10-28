@@ -17,10 +17,10 @@ import json
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from django_ai_sdk.logger import get_logger
-from django_ai_sdk.oversight.answerers.base import Answerer
+from django_ai_sdk.oversight.answerers.base import Answerer, clip
 from django_ai_sdk.oversight.answerers.llm import DEFAULT_LIMITS, HISTORY_ITEM_CHARS
 from django_ai_sdk.oversight.answerers.pii import mask_secrets
-from django_ai_sdk.oversight.types import Answer, Subject
+from django_ai_sdk.oversight.types import Answer, Source, Subject
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -32,6 +32,41 @@ logger = get_logger(__name__)
 
 # How long the first question of a stage waits for the others before the request goes.
 BATCH_DELAY = 0.005
+# Jev reads at most 32k tokens per question (the state and that question) and 64k
+# per request. The question and the answer: start and end of a longer text.
+TEXT_CHARS = 40_000
+# Sources: each in full up to SOURCE_CHARS, all of them up to SOURCES_CHARS together,
+# so a question, an answer and its sources stay inside one question's limit.
+SOURCE_CHARS = 8_000
+SOURCES_CHARS = 32_000
+# A Noul at or above YES reads as yes, at or below NO as no (TypeSafe's suggested
+# starting thresholds); between them Jev can't tell.
+YES, NO = 0.7, 0.3
+
+
+def labelled_sources(view: TurnView, *, earlier: bool = False) -> list[tuple[str, Source]]:
+    """The turn's evidence as Jev reads it, each labelled S1, S2, ... in order.
+
+    Every source is kept whole up to SOURCE_CHARS; once all of them together pass
+    SOURCES_CHARS, the rest are left out: earlier turns' sources first, as they come last.
+    """
+    labelled: list[tuple[str, Source]] = []
+    total = 0
+    for source in view.evidence(earlier=earlier):
+        content = clip(source.content, SOURCE_CHARS)
+        if labelled and total + len(content) > SOURCES_CHARS:
+            break
+        total += len(content)
+        labelled.append((f"S{len(labelled) + 1}", source.model_copy(update={"content": content})))
+    return labelled
+
+
+def _jev_source(label: str, source: Source) -> dict[str, str]:
+    return {
+        "id": label,
+        "title": mask_secrets(source.title),
+        "content": mask_secrets(source.content),
+    }
 
 
 def typesafe_state(lens: Lens, view: TurnView) -> dict[str, Any]:
@@ -43,7 +78,7 @@ def typesafe_state(lens: Lens, view: TurnView) -> dict[str, Any]:
     state: dict[str, Any] = {}
     if view.history and lens.subject in {Subject.INPUT, Subject.EXCHANGE}:
         state["history"] = [
-            {"role": h.role, "content": mask_secrets(h.content[:HISTORY_ITEM_CHARS])}
+            {"role": h.role, "content": mask_secrets(clip(h.content, HISTORY_ITEM_CHARS))}
             for h in view.history[-DEFAULT_LIMITS["history"] :]
         ]
     # An answer is judged against what was asked, as a model judge reads it too.
@@ -54,14 +89,14 @@ def typesafe_state(lens: Lens, view: TurnView) -> dict[str, Any]:
         Subject.SOURCES,
         Subject.TOOL_CALL,
     }:
-        state["user_message"] = mask_secrets(view.input)
+        state["user_message"] = mask_secrets(clip(view.input, TEXT_CHARS))
     if lens.subject in {Subject.OUTPUT, Subject.EXCHANGE}:
-        state["assistant_reply"] = mask_secrets(view.output)
-    if lens.subject in {Subject.SOURCES, Subject.OUTPUT} and (evidence := view.evidence()):
-        state["sources"] = [
-            {"title": mask_secrets(s.title), "content": mask_secrets(s.content[:1500])}
-            for s in evidence[:8]
-        ]
+        state["assistant_reply"] = mask_secrets(clip(view.output, TEXT_CHARS))
+    # An answer is judged against what earlier turns found too; a search on its own.
+    if lens.subject in {Subject.SOURCES, Subject.OUTPUT} and (
+        labelled := labelled_sources(view, earlier=lens.subject is Subject.OUTPUT)
+    ):
+        state["sources"] = [_jev_source(label, source) for label, source in labelled]
     if lens.subject is Subject.TOOL_CALL and view.tool_call:
         state["tool_call"] = {
             "name": view.tool_call.name,
@@ -194,6 +229,129 @@ class TypeSafe(Answerer):
         return judgment_answer(summary, lens.name, question, self.model)
 
 
+class TypeSafeSources(TypeSafe):
+    """Which sources the answer is taken from, by asking Jev about each one.
+
+    For an Entities lens. One request: the state is the question and the answer,
+    and each source is its own yes/no question with the source inside it (TypeSafe's
+    pattern for one judgment over many items). The value is the titles of the sources
+    the answer is taken from (yes at YES or above), empty for none; the rationale
+    keeps each source's probability, and so does `items` by source key; the confidence
+    is that of the least certain.
+
+    Sources earlier turns found count too, marked "(found earlier)": a follow-up may
+    answer from them. With no source at all, Jev is asked whether the reply states
+    facts; one that does, or may, is taken from none. So is an empty answer.
+    """
+
+    def __init__(self, model: str | None = None, *, name: str = "") -> None:
+        super().__init__(model, name=name or "typesafe_sources")
+
+    async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
+        from django_ai_sdk.typesafe.client import typesafe_missing
+
+        if lens.kind != "entities":
+            return None
+        if not view.output.strip():
+            return Answer(value=lens.parse([]), confidence=1.0, rationale="No answer.")
+        if typesafe_missing():
+            return None
+        labelled = labelled_sources(view, earlier=True)
+        state = {
+            "user_message": mask_secrets(clip(view.input, TEXT_CHARS)),
+            "assistant_reply": mask_secrets(clip(view.output, TEXT_CHARS)),
+        }
+        questions = {label: source_question(source) for label, source in labelled}
+        batch = _batch.get()
+        try:
+            summary = await _request(
+                state,
+                questions or {"facts": STATES_FACTS},
+                self.model,
+                batch.deadline if batch else None,
+            )
+        except Exception as exc:
+            logger.warning("Jev failed on lens {}: {!r}", lens.name, exc)
+            return Answer(error=f"jev: {type(exc).__name__}")
+        model = str(summary.get("model") or self.model or "")
+        if not labelled:
+            return _unsourced(lens, summary, model)
+
+        found: list[str] = []
+        certainty: list[float] = []
+        notes: list[str] = []
+        items: dict[str, float] = {}
+        for label, source in labelled:
+            judged = judgment_answer(summary, label, questions[label], self.model)
+            if judged is None or not isinstance(judged.value, int | float):
+                continue
+            yes = float(judged.value)
+            certainty.append(judged.confidence)
+            title = source.title or label
+            if source.seeded:
+                title = f"{title} (found earlier)"
+            if yes >= YES:
+                found.append(title)
+            notes.append(f"{label} {title}: {yes:.2f}")
+            items[source.key or label] = round(yes, 3)
+        if not certainty:
+            return None
+        return Answer(
+            value=lens.parse(found),
+            confidence=min(certainty),
+            model=model,
+            rationale="; ".join(notes),
+            items=items,
+        )
+
+
+STATES_FACTS: dict[str, Any] = {
+    "type": "noul",
+    "instructions": "Does `assistant_reply` state facts as its answer to `user_message`?",
+    "criteria": {
+        "true": "The reply gives a fact, rule, figure, date, amount or step as what is so.",
+        "false": (
+            "The reply only greets, thanks, asks something back, offers help, or says "
+            "it doesn't know."
+        ),
+    },
+}
+
+
+def _unsourced(lens: Lens, summary: dict[str, Any], model: str) -> Answer | None:
+    """An answer with no source to rest on: taken from none when it states facts, or may."""
+    judged = judgment_answer(summary, "facts", STATES_FACTS, model)
+    if judged is None or not isinstance(judged.value, int | float) or judged.value <= NO:
+        return None
+    return Answer(
+        value=lens.parse([]),
+        confidence=judged.confidence,
+        model=model,
+        rationale=f"No source found; states facts: {float(judged.value):.2f}",
+    )
+
+
+def source_question(source: Source) -> dict[str, Any]:
+    """Jev's yes/no question about one source, the source inside it."""
+    return {
+        "type": "noul",
+        "instructions": {
+            "source": {
+                "title": mask_secrets(source.title),
+                "content": mask_secrets(source.content),
+            },
+            "question": "Is `assistant_reply` taken from `source`?",
+        },
+        "criteria": {
+            "true": "The reply states at least one fact that is in the source and relies on it.",
+            "false": (
+                "The reply's facts are not in the source: it only shares the topic, or it "
+                "says something else."
+            ),
+        },
+    }
+
+
 def judgment_answer(
     summary: dict[str, Any], name: str, question: dict[str, Any], model: str | None = None
 ) -> Answer | None:
@@ -243,4 +401,13 @@ def _rationale(judgment: dict[str, Any], question: dict[str, Any] | None = None)
     return ", ".join(f"{label_name(label)} {float(p):.2f}" for label, p in top)
 
 
-__all__ = ["Batch", "TypeSafe", "batched", "judgment_answer", "typesafe_state"]
+__all__ = [
+    "Batch",
+    "TypeSafe",
+    "TypeSafeSources",
+    "batched",
+    "judgment_answer",
+    "labelled_sources",
+    "source_question",
+    "typesafe_state",
+]

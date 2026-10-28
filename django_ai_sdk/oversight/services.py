@@ -851,6 +851,7 @@ def _observation_out(
         confidence=obs.confidence,
         rationale="" if hide_reasons else obs.rationale,
         spans=[] if hide_reasons else obs.spans,
+        items={} if hide_reasons else obs.items,
         trail=obs.trail,
         error=obs.error,
         queued=obs.queued,

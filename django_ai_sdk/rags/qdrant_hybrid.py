@@ -221,11 +221,16 @@ class QdrantBM25HybridRAG(RAGBase[QdrantBM25HybridRAGConfig]):
             return False
 
     async def add_documents(self, documents: list[RagDocument]) -> None:
-        """Add documents to the existing Qdrant index."""
+        """Add documents to the existing Qdrant index, replacing earlier versions.
+
+        A chunk's id is a hash of its text, so an edited document's new chunks don't
+        overwrite its old ones: those are removed first, by the document's id.
+        """
         if self._cached_document_store is None:
             logger.warning("No document store available, cannot add documents")
             return
 
+        await self.remove_documents([doc.id for doc in documents])
         haystack_docs = [to_document(doc) for doc in documents]
         await self._index_documents(haystack_docs, self._cached_document_store)
         logger.info(f"Added {len(documents)} documents to Qdrant index")

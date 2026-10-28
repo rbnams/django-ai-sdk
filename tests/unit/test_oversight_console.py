@@ -740,8 +740,17 @@ class TestChecks:
                      answerers=[Keywords({"x": ["x"]}), "human"]),
                 Flag(name="late_question", question="?", stages=["review"], answerers=["human"]),
                 Flag(name="nobody", question="?", stages=["gate"], answerers=["nowhere?"]),
+                Flag(name="broken", question="?", stages=["gate"], answerers=["nowhere"]),
             ]
-            rules = [Rule("blind", when=L("nobody").is_true, then=Block(), mode=Mode.ENFORCE)]
+            rules = [
+                # Optional answerers left undefined are a choice: a warning, not an error.
+                Rule("blind", when=L("nobody").is_true, then=Block(), mode=Mode.ENFORCE),
+                Rule("broken", when=L("broken").is_true, then=Block(), mode=Mode.ENFORCE),
+            ]
 
-        ids = {m.id for m in _lens_checks("test-odd", build("test-odd"))}
-        assert ids == {"oversight.W006", "oversight.W007", "oversight.W009", "oversight.E007"}
+        found = {(m.id, m.msg.split("'")[1]) for m in _lens_checks("test-odd", build("test-odd"))}
+        assert ("oversight.W011", "blind") in found
+        assert ("oversight.E007", "broken") in found
+        assert {id for id, _ in found} == {
+            "oversight.W006", "oversight.W007", "oversight.W009", "oversight.W011", "oversight.E007"
+        }

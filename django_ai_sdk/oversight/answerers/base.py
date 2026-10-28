@@ -93,6 +93,20 @@ def _ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 2)
 
 
+def clip(text: str, limit: int) -> str:
+    """`text` in at most `limit` characters: its start and its end, the middle left out.
+
+    What a model answerer reads of a long text. Both ends, because what matters can
+    sit at the end as easily as at the start (an instruction after a page of padding).
+    """
+    if len(text) <= limit:
+        return text
+    marker = "\n[... {} characters left out ...]\n"
+    keep = max(limit - len(marker.format(len(text))), 0)
+    head, tail = keep - keep // 2, keep // 2
+    return text[:head] + marker.format(len(text) - keep) + text[len(text) - tail :]
+
+
 def sampled(key: str, rate: float) -> bool:
     """Whether `key` falls in the first `rate` share of a uniform hash space."""
     if rate >= 1:

@@ -17,13 +17,15 @@ def _make_docx(text: str = "Hello from docx") -> bytes:
     return buf.getvalue()
 
 
-def _patch_pdf_type(monkeypatch, pdf_type: str) -> None:
+def _patch_pdf_type(monkeypatch, pdf_type: str, needing_ocr: list[int] | None = None) -> None:
     import pdf_inspector
 
     monkeypatch.setattr(
         pdf_inspector,
         "classify_pdf_bytes",
-        lambda data: MagicMock(pdf_type=pdf_type),
+        lambda data: MagicMock(
+            pdf_type=pdf_type, page_count=10, pages_needing_ocr=needing_ocr or []
+        ),
     )
 
 
@@ -43,7 +45,7 @@ class TestAnyDocFileProcessor:
         _patch_pdf_type(monkeypatch, "text_based")
         assert await processor.is_valid(str(file)) is True
 
-    @pytest.mark.parametrize("pdf_type", ["scanned", "image_based", "mixed"])
+    @pytest.mark.parametrize("pdf_type", ["scanned", "image_based"])
     async def test_is_valid_rejects_pdf_needing_ocr(
         self, processor, tmp_path, monkeypatch, pdf_type
     ):
@@ -51,6 +53,40 @@ class TestAnyDocFileProcessor:
         file.write_bytes(b"%PDF-1.4 fake pdf")
         _patch_pdf_type(monkeypatch, pdf_type)
         assert await processor.is_valid(str(file)) is False
+
+    @pytest.mark.parametrize(
+        ("needing_ocr", "valid"), [([0, 9], True), ([0, 1, 2, 3, 4, 5], False)]
+    )
+    async def test_a_mixed_pdf_is_read_when_most_pages_have_text(
+        self, processor, tmp_path, monkeypatch, needing_ocr, valid
+    ):
+        # A text document with a scanned cover is read; a mostly scanned one goes to OCR.
+        file = tmp_path / "test.pdf"
+        file.write_bytes(b"%PDF-1.4 fake pdf")
+        _patch_pdf_type(monkeypatch, "mixed", needing_ocr)
+        assert await processor.is_valid(str(file)) is valid
+
+    def test_the_pages_without_text_are_left_out(self, monkeypatch):
+        import anydoc
+        import pdf_oxide
+
+        calls: list[bytes] = []
+
+        def convert(data, fmt=None):
+            calls.append(data)
+            if data == b"whole":
+                raise anydoc.NeedsOcrError("page 10 of 10 needs OCR")
+            return "Artikel 1 Begrippen"
+
+        document = MagicMock(page_count=MagicMock(return_value=10))
+        document.extract_pages_to_bytes.return_value = b"text pages"
+        monkeypatch.setattr(anydoc, "to_markdown_bytes", convert)
+        monkeypatch.setattr(pdf_oxide.PdfDocument, "from_bytes", MagicMock(return_value=document))
+        _patch_pdf_type(monkeypatch, "mixed", [0, 9])
+
+        assert AnyDocFileProcessor._extract_text(b"whole", "cao.pdf") == "Artikel 1 Begrippen"
+        assert calls == [b"whole", b"text pages"]
+        document.extract_pages_to_bytes.assert_called_once_with(list(range(1, 9)))
 
     async def test_is_valid_rejects_pdf_when_error(self, processor, tmp_path, monkeypatch):
         import pdf_inspector

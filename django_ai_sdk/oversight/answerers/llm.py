@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.utils.module_loading import import_string
 
-from django_ai_sdk.oversight.answerers.base import Answerer
+from django_ai_sdk.oversight.answerers.base import Answerer, clip
 from django_ai_sdk.oversight.answerers.pii import mask_secrets
 from django_ai_sdk.oversight.types import Answer, Subject
 from django_ai_sdk.pricing import cost_for, usage_from_meta
@@ -49,37 +49,30 @@ def render_turn(lens: Lens, view: TurnView, limits: dict[str, int] | None = None
     subject = lens.subject
     if view.history and subject in {Subject.INPUT, Subject.EXCHANGE}:
         recent = view.history[-limits["history"] :]
-        lines = "\n".join(f"{h.role}: {_cut(h.content, HISTORY_ITEM_CHARS)}" for h in recent)
+        lines = "\n".join(f"{h.role}: {clip(h.content, HISTORY_ITEM_CHARS)}" for h in recent)
         parts.append(f"<history>\n{_fence(lines)}\n</history>")
     if subject in {Subject.INPUT, Subject.EXCHANGE, Subject.SOURCES, Subject.OUTPUT}:
-        parts.append(f"<question>\n{_fence(_cut(view.input, limits['input']))}\n</question>")
+        parts.append(f"<question>\n{_fence(clip(view.input, limits['input']))}\n</question>")
+    # An answer is judged against what earlier turns found too; a search on its own.
     if subject in {Subject.SOURCES, Subject.OUTPUT, Subject.EXCHANGE} and (
-        evidence := view.evidence()
+        evidence := view.evidence(earlier=subject is not Subject.SOURCES)
     ):
         rendered = "\n".join(
-            f'<source n="{n}" title="{_attr(s.title)}">\n{_fence(_cut(s.content, limits["source"]))}'
+            f'<source n="{n}" title="{_attr(s.title)}">\n{_fence(clip(s.content, limits["source"]))}'
             "\n</source>"
             for n, s in enumerate(evidence[: limits["sources"]], start=1)
         )
         parts.append(f"<sources>\n{rendered}\n</sources>")
     if subject in {Subject.OUTPUT, Subject.EXCHANGE}:
-        parts.append(f"<answer>\n{_fence(_cut(view.output, limits['output']))}\n</answer>")
+        parts.append(f"<answer>\n{_fence(clip(view.output, limits['output']))}\n</answer>")
     if subject is Subject.TOOL_CALL and view.tool_call:
         call = view.tool_call
-        arguments = _cut(json.dumps(call.arguments, ensure_ascii=False, default=str), 4_000)
+        arguments = clip(json.dumps(call.arguments, ensure_ascii=False, default=str), 4_000)
         parts.append(
-            f"<question>\n{_fence(_cut(view.input, limits['input']))}\n</question>\n"
+            f"<question>\n{_fence(clip(view.input, limits['input']))}\n</question>\n"
             f'<tool_call name="{_attr(call.name)}">\n{_fence(arguments)}\n</tool_call>'
         )
     return "<turn>\n" + mask_secrets("\n".join(parts)) + "\n</turn>"
-
-
-def _cut(text: str, limit: int) -> str:
-    return (
-        text
-        if len(text) <= limit
-        else text[:limit] + f"\n[... {len(text) - limit} more characters]"
-    )
 
 
 def _fence(text: str) -> str:

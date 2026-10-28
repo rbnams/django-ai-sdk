@@ -20,6 +20,7 @@ call returns at once and allows everything.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import hashlib
@@ -50,6 +51,7 @@ from django_ai_sdk.oversight.types import (
     Answer,
     Capture,
     HistoryItem,
+    Mode,
     Outcome,
     Severity,
     Source,
@@ -70,9 +72,12 @@ if TYPE_CHECKING:
 
     from django_ai_sdk.agents.base import Agent
     from django_ai_sdk.common import ChatMessage
+    from django_ai_sdk.oversight.lenses import Lens
     from django_ai_sdk.oversight.policy import ResolvedPolicy
 
 logger = get_logger(__name__)
+
+TOO_LONG = "This message is too long to check. Shorten it and try again."
 
 _unobserved: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "django_ai_sdk_oversight_unobserved", default=False
@@ -168,6 +173,8 @@ class TurnSession:
     usage: _Usage = field(default_factory=_Usage)
     created_at: Any = None
     error: str = ""
+    # Refused at the gate unread, for being longer than MAX_INPUT_CHARS.
+    too_long: bool = False
     original_input: str = ""
     original_output: str = ""
     # data-oversight payloads waiting for the stream to send them.
@@ -252,10 +259,14 @@ class TurnSession:
     # Reporting.
 
     def set_sources(self, sources: Iterable[Any], *, seeded: Iterable[Any] = ()) -> None:
-        """What retrieval found, as NumberedSource, Source or dicts."""
+        """What retrieval found, as NumberedSource, Source or dicts.
+
+        `seeded` names those carried over from earlier turns: sources, or their keys
+        (a SourceRegistry keeps keys).
+        """
         if not self.active:
             return
-        seeded_keys = {_source(s).key for s in seeded}
+        seeded_keys = {s if isinstance(s, str) else _source(s).key for s in seeded}
         fresh = [_source(s) for s in sources]
         for source in fresh:
             source.seeded = source.seeded or (bool(source.key) and source.key in seeded_keys)
@@ -287,6 +298,15 @@ class TurnSession:
         due = len(self.view.output) - self._watched_chars >= int(setting("WATCH_EVERY_CHARS"))
         return due and self.policy is not None and bool(self.policy.active_lenses(Stage.WATCH))
 
+    def unwatched(self) -> bool:
+        """Whether answer text arrived since the last watch check, with lenses to judge it."""
+        if not self.active or self.policy is None or len(self.view.output) <= self._watched_chars:
+            return False
+        return any(
+            lens.subject in {Subject.OUTPUT, Subject.EXCHANGE}
+            for lens in self.policy.active_lenses(Stage.WATCH)
+        )
+
     # Deciding.
 
     async def gate(self) -> GateResult:
@@ -294,6 +314,31 @@ class TurnSession:
         result = GateResult(input=self.view.input)
         if not self.active:
             return result
+        limit = setting("MAX_INPUT_CHARS")
+        if limit and len(self.view.input) > limit and self.policy.active_lenses(Stage.GATE):
+            self.too_long = True
+            result.blocked = True
+            result.message = TOO_LONG
+            result.notice = {
+                "turn_id": self.id,
+                "stage": str(Stage.GATE),
+                "outcome": str(Outcome.BLOCKED),
+                "rules": [],
+                "message": TOO_LONG,
+            }
+            return result
+        try:
+            return await self._gate(result)
+        except Exception:
+            # Like watch and review: a broken lens or rule follows the gate's fail mode.
+            logger.exception("Oversight gate failed for turn {}", self.id)
+            self.error = "gate failed"
+            if _fail_closed(Stage.GATE):
+                result.blocked = True
+                result.message = Block.DEFAULT_MESSAGE
+            return result
+
+    async def _gate(self, result: GateResult) -> GateResult:
         matched = await self._stage(
             Stage.GATE, subjects={Subject.INPUT}, deadline=setting("GATE_DEADLINE_MS")
         )
@@ -323,6 +368,112 @@ class TurnSession:
         self.restrict = result.restrict
         result.notice = self._notice(Stage.GATE, matched, result.blocked, result.message)
         return result
+
+    async def mask_history(self, messages: list[ChatMessage]) -> None:
+        """Mask earlier messages the way the gate masks the question, in place.
+
+        For history the server did not store itself: what a client sends back can
+        carry what the gate masked on an earlier turn. Each message is judged on its
+        own by the lenses enforced redact rules read; nothing is recorded.
+        """
+        lenses = self._redacting_lenses()
+        if not lenses or len(messages) < 2:
+            return
+        earlier = messages[:-1]
+        token = budgets.activate(self._budget)
+        try:
+            masked = await asyncio.gather(*(self._masked(lenses, m.content or "") for m in earlier))
+        finally:
+            budgets.deactivate(token)
+        for message, text in zip(earlier, masked, strict=True):
+            message.content = text
+        self.view.history = [
+            HistoryItem(role=m.role, content=m.content or "")
+            for m in earlier
+            if m.role in {"user", "assistant"} and m.content
+        ][-12:]
+
+    async def mask_text(self, text: str) -> str:
+        """`text` masked the way the gate masks the question: for what tools hand the model.
+
+        What it masks is recorded at watch, where it happens: each lens's answer, without
+        its spans (they point into the tool's result, not the question), and the rule.
+        """
+        lenses = self._redacting_lenses()
+        if not lenses:
+            return text
+        token = budgets.activate(self._budget)
+        try:
+            masked, observed, matched = await self._masking(lenses, text)
+        finally:
+            budgets.deactivate(token)
+        if masked != text:
+            self._record_masked_result(observed, matched)
+        return masked
+
+    def _record_masked_result(self, observed: list[Observed], matched: list[Matched]) -> None:
+        """A tool result's masking, once per lens and rule however many results it masked."""
+        seen = {(o.lens.name, o.stage) for o in self.observed}
+        self.observed.extend(
+            Observed(o.lens, Stage.WATCH, o.answer.model_copy(update={"spans": []}))
+            for o in observed
+            if o.answer.ok and o.answer.value and (o.lens.name, Stage.WATCH) not in seen
+        )
+        recorded = {(m.rule.name, m.stage) for m in self.matched}
+        self.matched.extend(
+            Matched(m.rule, Stage.WATCH, m.acted)
+            for m in matched
+            if (m.rule.name, Stage.WATCH) not in recorded
+        )
+
+    def _redacting_lenses(self) -> list[Lens]:
+        """The gate's lenses that an enforced redact rule reads."""
+        if not self.active or self.policy is None:
+            return []
+        redacting = [
+            rule
+            for rule in self.policy.rules.values()
+            if rule.mode is Mode.ENFORCE and any(a.kind == "redact" for a in rule.then)
+        ]
+        names = {name for rule in redacting for name in rule.lenses()}
+        return [
+            lens
+            for lens in self.policy.active_lenses(Stage.GATE, Subject.INPUT)
+            if lens.kind == "entities" and lens.name in names
+        ]
+
+    async def _masked(self, lenses: list[Lens], text: str) -> str:
+        """`text` with what the enforced redact rules mask at the gate masked."""
+        return (await self._masking(lenses, text))[0]
+
+    async def _masking(
+        self, lenses: list[Lens], text: str
+    ) -> tuple[str, list[Observed], list[Matched]]:
+        """`text` masked, with the answers and the rules' masking that did it (none if nothing)."""
+        assert self.policy is not None
+        if not text:
+            return text, [], []
+        view = self.view.model_copy(update={"input": text, "answers": {}})
+        observed = await run_lenses(
+            lenses, view, Stage.GATE, deadline_ms=setting("GATE_DEADLINE_MS")
+        )
+        answers = {o.lens.name: o.answer for o in observed}
+        redactions = []
+        masking: list[Matched] = []
+        for match in evaluate_rules(self.policy, answers, Stage.GATE, done=set()):
+            masked = []
+            for action in match.acted:
+                if action.kind != "redact":
+                    continue
+                names = set(action.lenses) or match.rule.lenses()
+                if spans := spans_for(observed, names, Subject.INPUT, text):
+                    redactions.append((spans, action.template))
+                    masked.append(action)
+            if masked:
+                masking.append(Matched(match.rule, match.stage, masked))
+        if not redactions:
+            return text, [], []
+        return redact_all(text, redactions), observed, masking
 
     async def watch(self) -> ReviewResult:
         """Judge the answer so far, while it streams. Watch can only stop it.
@@ -354,6 +505,15 @@ class TurnSession:
         """Judge one tool call before it runs; the refusal's reason when it may not."""
         if not self.active or self.policy is None:
             return None
+        try:
+            return await self._check_tool(call)
+        except Exception:
+            logger.exception("Oversight tool check failed for turn {}", self.id)
+            self.error = "tool check failed"
+            return Block.DEFAULT_MESSAGE if _fail_closed(Stage.WATCH) else None
+
+    async def _check_tool(self, call: ToolCall) -> str | None:
+        assert self.policy is not None
         if self.restrict is not None and (not self.restrict or call.name in self.restrict):
             return "This tool is not available for this request."
         lenses = self.policy.active_lenses(Stage.WATCH, Subject.TOOL_CALL)
@@ -402,6 +562,11 @@ class TurnSession:
         """Judge the finished answer before it is stored."""
         if output is not None:
             self.view.output = output
+        if self.unwatched():
+            # The end of the answer is watched too, not only every WATCH_EVERY_CHARS.
+            watched = await self.watch()
+            if watched.blocked:
+                return watched
         self.original_output = self.original_output or self.view.output
         result = ReviewResult(output=self.view.output)
         if not self.active:
@@ -555,11 +720,13 @@ class TurnSession:
 
     @property
     def outcome(self) -> Outcome:
-        return worst(*(m.outcome() for m in self.matched if m.acted))
+        refused = [Outcome.BLOCKED] if self.too_long else []
+        return worst(*refused, *(m.outcome() for m in self.matched if m.acted))
 
     @property
     def shadow_outcome(self) -> Outcome:
-        return worst(*(m.outcome(shadow=True) for m in self.matched))
+        refused = [Outcome.BLOCKED] if self.too_long else []
+        return worst(*refused, *(m.outcome(shadow=True) for m in self.matched))
 
     async def close(self, *, error: str = "") -> str | None:
         """Write the turn to the ledger and queue the background stages. Never raises.
@@ -940,6 +1107,7 @@ def observation_fields(
         "confidence": answer.confidence if answer.ok else None,
         "rationale": answer.rationale if reasons else "",
         "spans": [s.model_dump() for s in answer.spans],
+        "items": answer.items if reasons else {},
         "trail": [_trail(a, text=text) for a in answer.trail],
         "error": answer.error[:200],
         "queued": answer.queued[:100],

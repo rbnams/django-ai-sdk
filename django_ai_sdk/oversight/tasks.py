@@ -20,6 +20,7 @@ from django_ai_sdk.oversight.stages import (
 from django_ai_sdk.oversight.types import (
     Answer,
     HistoryItem,
+    Outcome,
     Source,
     Stage,
     Subject,
@@ -126,8 +127,12 @@ async def areflect(turn_id: str) -> int:
     has_text = content is not None and "input" in content and "output" in content
     if not has_text:
         logger.info("Turn {} kept no text; reflect judges only what it kept", turn.id)
+    # The gate stopped the question: there is no answer to judge, empty as it is.
+    answered = bool(view.output.strip()) or turn.outcome != Outcome.BLOCKED
     lenses = [
-        lens for lens in policy.active_lenses(Stage.REFLECT) if _judgeable(lens, content, has_text)
+        lens
+        for lens in policy.active_lenses(Stage.REFLECT)
+        if _judgeable(lens, content, has_text, answered=answered)
     ]
     # A lens that ran out of time inline, or found Jev down, is answered here: late, not lost.
     timed_out = {
@@ -140,7 +145,7 @@ async def areflect(turn_id: str) -> int:
         for name in sorted(timed_out)
         if name in policy.lenses
         and policy.lenses[name] not in lenses
-        and _judgeable(policy.lenses[name], content, has_text)
+        and _judgeable(policy.lenses[name], content, has_text, answered=answered)
     ]
 
     budget = await budgets.aload()
@@ -168,13 +173,18 @@ async def areflect(turn_id: str) -> int:
     return len(observed)
 
 
-def _judgeable(lens: Lens, content: dict[str, Any] | None, has_text: bool) -> bool:
+def _judgeable(
+    lens: Lens, content: dict[str, Any] | None, has_text: bool, *, answered: bool = True
+) -> bool:
     """Whether reflect can answer `lens` from what the turn kept.
 
-    Never a tool call lens: reflect has no call to show it. Without the turn's
-    text, only a sources lens, and only when the sources were kept.
+    Never a tool call lens: reflect has no call to show it, nor a lens on the
+    answer when there was none to give (`answered`). Without the turn's text, only
+    a sources lens, and only when the sources were kept.
     """
     if lens.subject is Subject.TOOL_CALL:
+        return False
+    if not answered and lens.subject in {Subject.OUTPUT, Subject.EXCHANGE}:
         return False
     if has_text:
         return True

@@ -69,6 +69,28 @@ class TestEvidence:
         assert [s.title for s in evidence] == ["Policy", "get_weather result"]
         assert evidence[1].content == '{"temp_c": 12}'
 
+    def test_earlier_turns_sources_come_last_and_only_when_asked(self):
+        turn = TurnView(
+            sources=[
+                Source(title="Leave", content="25 days", seeded=True),
+                Source(title="Pay", content="the 25th"),
+                Source(title="Kept without text", seeded=True),
+            ],
+            tool_calls=[ToolCall(name="get_weather", result={"temp_c": 12})],
+        )
+        assert [s.title for s in turn.evidence()] == ["Pay", "get_weather result"]
+        assert [s.title for s in turn.evidence(earlier=True)] == [
+            "Pay",
+            "get_weather result",
+            "Leave",
+        ]
+
+    def test_an_answer_may_rest_on_an_earlier_turns_sources_a_search_may_not(self):
+        turn = TurnView(sources=[Source(title="Leave", content="25 days", seeded=True)])
+        assert self.grounded().applies(turn)
+        sources = Score(name="ctx", question="?", subject=Subject.SOURCES, answerers=["x"])
+        assert not sources.applies(turn)
+
     async def test_a_turn_without_evidence_is_not_judged(self):
         assert await answer_lens(self.grounded(), view("q", "a"), Stage.REFLECT) is None
         sources = Score(
@@ -96,8 +118,37 @@ class TestEvidence:
         )
         state = typesafe_state(self.grounded(), turn)
         assert state["user_message"] == "Weather?"
-        assert state["sources"] == [{"title": "w result", "content": "12, rain"}]
+        assert state["sources"] == [{"id": "S1", "title": "w result", "content": "12, rain"}]
         assert "12, rain" in render_turn(self.grounded(), turn)
+
+    def test_a_search_result_already_listed_as_sources_is_not_read_twice(self):
+        chunk = "Staff get 25 days of leave a year.\nUnused days lapse in July."
+        turn = TurnView(
+            sources=[Source(title="Leave · §1", content=chunk)],
+            tool_calls=[
+                ToolCall(name="search_handbook", result={"result": f"### Leave · §1\n{chunk}"}),
+                ToolCall(name="get_weather", result={"temp_c": 12}),
+            ],
+        )
+        assert [s.title for s in turn.evidence()] == ["Leave · §1", "get_weather result"]
+
+    def test_jev_reads_every_source_whole_and_labelled(self):
+        from django_ai_sdk.oversight.answerers.typesafe import (
+            SOURCE_CHARS,
+            SOURCES_CHARS,
+            labelled_sources,
+            typesafe_state,
+        )
+
+        chunks = [f"{n} " + "word " * 600 for n in range(10)]
+        state = typesafe_state(self.grounded(), view("q", "a", sources=chunks))
+        assert [s["id"] for s in state["sources"]] == [f"S{n}" for n in range(1, 11)]
+        assert [s["content"] for s in state["sources"]] == chunks
+        # Each is kept whole up to SOURCE_CHARS, and all of them up to SOURCES_CHARS.
+        long = view("q", "a", sources=["x" * (SOURCE_CHARS * 2)] * 20)
+        labelled = labelled_sources(long)
+        assert all(len(s.content) <= SOURCE_CHARS for _, s in labelled)
+        assert len(labelled) == SOURCES_CHARS // SOURCE_CHARS
 
 
 class TestChecksums:
@@ -170,15 +221,16 @@ class TestPII:
             assert email.search(address).group() == address
         assert email.search("a@b.nl.").group() == "a@b.nl"
 
-    async def test_detectors_scan_a_bounded_prefix(self):
+    async def test_detectors_read_all_of_a_long_text(self):
         from django_ai_sdk.oversight.answerers.rules import MAX_SCAN_CHARS
 
-        text = "x" * MAX_SCAN_CHARS + " a@b.nl"
-        answer = await ask(PII(), self.lens, view(text))
-        assert answer.value == []
-        assert "scanned the first 50,000 characters" in answer.rationale
-        early = await ask(PII(), self.lens, view("a@b.nl " + text))
-        assert early.value == ["email"] and early.spans[0].start == 0
+        # Padding must not hide what comes after it, nor a match on a window's edge.
+        late = "x " * MAX_SCAN_CHARS + "a@b.nl"
+        answer = await ask(PII(), self.lens, view(late))
+        assert answer.value == ["email"] and late[answer.spans[0].start :].startswith("a@b.nl")
+        edge = "x" * (MAX_SCAN_CHARS - 4) + " a@b.nl " + "y" * MAX_SCAN_CHARS
+        answer = await ask(PII(), self.lens, view(edge))
+        assert [edge[s.start : s.end] for s in answer.spans] == ["a@b.nl"]
 
     async def test_redact_masks_spans_by_label(self):
         text = "write to a@b.nl now"
@@ -519,7 +571,7 @@ class TestJevAnswerer:
         )
         state = typesafe_state(lens, turn)
         assert len(state["history"]) == 6
-        assert len(state["history"][0]["content"]) == 500
+        assert len(state["history"][0]["content"]) <= 500
 
     async def test_a_failed_request_is_an_error(self):
         from django_ai_sdk.oversight import TypeSafe
@@ -572,6 +624,119 @@ class TestJevAnswerer:
         assert [a.value for a in answers] == [True, True]
         assert mock.await_count == 1
         assert sorted(mock.await_args.args[1]) == ["f0", "f1", "f2"]
+
+    async def test_taken_from_names_the_sources_the_answer_rests_on(self):
+        from django_ai_sdk.oversight.packs.quality import TakenFrom
+
+        turn = view(
+            "How many leave days?",
+            "You get 25 days.",
+            sources=["Staff get 25 days of leave.", "Bikes are blue.", "Pay day is the 25th."],
+        )
+        summary = {
+            "model": "jev-1",
+            "judgments": [
+                {"id": "S1", "type": "noul", "value": 0.97},
+                {"id": "S2", "type": "noul", "value": 0.02},
+                {"id": "S3", "type": "noul", "value": 0.20},
+            ],
+        }
+        stack, mock = self.jev(summary)
+        with stack:
+            answer = await answer_lens(TakenFrom(), turn, Stage.REFLECT)
+        assert answer.value == ["s0"]
+        assert answer.confidence == pytest.approx(0.6)  # the least certain source: 0.20
+        assert answer.rationale == "S1 s0: 0.97; S2 s1: 0.02; S3 s2: 0.20"
+        # Each source's probability, kept for a view that shows it per source.
+        assert answer.items == {"S1": 0.97, "S2": 0.02, "S3": 0.2}
+        # One request: the question and the answer, and each source in its own question.
+        state, questions = mock.await_args.args
+        assert state == {"user_message": "How many leave days?", "assistant_reply": "You get 25 days."}
+        assert sorted(questions) == ["S1", "S2", "S3"]
+        assert [q["instructions"]["source"]["content"] for q in questions.values()] == [
+            s.content for s in turn.sources
+        ]
+
+    async def test_an_empty_answer_is_taken_from_none_without_asking_jev(self):
+        from django_ai_sdk.oversight.packs.quality import TakenFrom
+
+        stack, mock = self.jev()
+        with stack:
+            answer = await answer_lens(TakenFrom(), view("q", "", ["x"]), Stage.REFLECT)
+        assert (answer.value, answer.confidence, answer.rationale) == ([], 1.0, "No answer.")
+        assert mock.await_count == 0
+
+    @pytest.mark.parametrize(("facts", "taken"), [(0.92, []), (0.5, []), (0.1, None)])
+    async def test_an_answer_without_sources_is_taken_from_none_when_it_states_facts(
+        self, facts, taken
+    ):
+        from django_ai_sdk.oversight.packs.quality import TakenFrom
+
+        summary = {"judgments": [{"id": "facts", "type": "noul", "value": facts}]}
+        stack, mock = self.jev(summary)
+        with stack:
+            answer = await answer_lens(TakenFrom(), view("Leave?", "25 days."), Stage.REFLECT)
+        # Jev can't tell (0.5): still taken from none, for a person to look at.
+        assert (answer and answer.value) == taken
+        _, questions = mock.await_args.args
+        assert list(questions) == ["facts"]
+
+    async def test_without_a_key_taken_from_is_not_asked(self):
+        from django_ai_sdk.oversight.packs.quality import TakenFrom
+
+        with override_settings(TYPESAFE_API_KEY=""):
+            assert await answer_lens(TakenFrom(), view("q", "a", ["x"]), Stage.REFLECT) is None
+
+    async def test_a_follow_up_is_judged_against_earlier_sources_too(self):
+        from django_ai_sdk.oversight.packs.quality import TakenFrom
+
+        turn = TurnView(
+            turn_id="t1",
+            input="And part-time?",
+            output="Part-timers get leave pro rata.",
+            sources=[
+                Source(
+                    key="leave-1", title="Leave · §1", content="25 days; pro rata.", seeded=True
+                ),
+                Source(key="pay-2", title="Pay · §2", content="Paid on the 25th."),
+            ],
+        )
+        summary = {
+            "judgments": [
+                {"id": "S1", "type": "noul", "value": 0.05},
+                {"id": "S2", "type": "noul", "value": 0.95},
+            ]
+        }
+        stack, mock = self.jev(summary)
+        with stack:
+            answer = await answer_lens(TakenFrom(), turn, Stage.REFLECT)
+        # This turn's sources first: once the budget is spent, earlier ones are left out.
+        _, questions = mock.await_args.args
+        assert [q["instructions"]["source"]["title"] for q in questions.values()] == [
+            "Pay · §2",
+            "Leave · §1",
+        ]
+        assert answer.value == ["Leave · §1 (found earlier)"]
+        assert answer.items == {"pay-2": 0.05, "leave-1": 0.95}
+
+    def test_each_items_probability_is_kept_with_the_reasons(self):
+        from django_ai_sdk.oversight.session import observation_fields
+
+        answer = Answer(value=["Pay"], rationale="S1 Pay: 0.95", items={"pay-2": 0.95})
+        kept = observation_fields("taken_from", Stage.REFLECT, answer, reasons=True)
+        assert kept["items"] == {"pay-2": 0.95}
+        assert observation_fields("taken_from", Stage.REFLECT, answer, reasons=False)["items"] == {}
+
+    async def test_an_answer_from_no_source_goes_to_review(self):
+        from django_ai_sdk.oversight.conditions import L
+
+        rule = L("taken_from").present & ~L("taken_from").any
+        assert rule.evaluate({"taken_from": Answer(value=[], confidence=0.9)})
+        # One source Jev can't settle makes the answer unsure: reason to look, not to skip.
+        assert rule.evaluate({"taken_from": Answer(value=[], confidence=0.1)})
+        assert not rule.evaluate({"taken_from": Answer(value=["Leave · §1"], confidence=0.9)})
+        assert not rule.evaluate({"taken_from": Answer(error="jev: Timeout")})
+        assert not rule.evaluate({})
 
     async def test_the_client_is_reused_on_one_loop(self):
         from unittest.mock import patch

@@ -128,6 +128,9 @@ class Answer(BaseModel):
     confidence: float = 1.0
     rationale: str = ""
     spans: list[TextSpan] = Field(default_factory=list)
+    # What an answerer judging item by item weighed: each item's probability, by key
+    # (TypeSafeSources: each source's, by source key).
+    items: dict[str, float] = Field(default_factory=dict)
 
     answerer: str = ""
     model: str = ""
@@ -211,18 +214,43 @@ class TurnView(BaseModel):
         """Sources found for this turn, not those carried over from earlier ones."""
         return [s for s in self.sources if not s.seeded]
 
-    def evidence(self) -> list[Source]:
+    def evidence(self, *, earlier: bool = False) -> list[Source]:
         """What the answer could rest on: this turn's sources, then each tool's result.
 
         A weather tool's reply grounds "12°C and rain" the way a retrieved chunk does,
-        so judges of groundedness read both.
+        so judges of groundedness read both. A search tool's reply is the sources it
+        found, already listed, so it is left out rather than read twice. `earlier` adds
+        the sources earlier turns found, last: a follow-up may answer from them.
         """
+        sources = self.fresh_sources()
+        heads = [s.content.strip()[:120] for s in sources if s.content.strip()]
         results = [
             Source(title=f"{call.name} result", content=_compact(call.result), kind="tool")
             for call in self.tool_calls
-            if not call.error and call.result not in (None, "", [], {})
+            if not call.error
+            and call.result not in (None, "", [], {})
+            and not _echoes(call.result, heads)
         ]
-        return [*self.fresh_sources(), *results]
+        carried = [s for s in self.sources if s.seeded and s.content.strip()] if earlier else []
+        return [*sources, *results, *carried]
+
+
+def _echoes(result: Any, heads: list[str]) -> bool:
+    """Whether a tool's result carries one of these sources' text."""
+    if not heads:
+        return False
+    text = "\n".join(_strings(result))
+    return any(head in text for head in heads)
+
+
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for item in value.values() for s in _strings(item)]
+    if isinstance(value, list | tuple):
+        return [s for item in value for s in _strings(item)]
+    return []
 
 
 def _compact(value: Any) -> str:

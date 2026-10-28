@@ -48,6 +48,7 @@ def answer_out(answer: Answer) -> dict[str, Any]:
         "latency_ms": answer.latency_ms,
         "cost": answer.cost,
         "spans": [span.model_dump() for span in answer.spans],
+        "items": answer.items,
         "trail": [
             {
                 "answerer": step.answerer,

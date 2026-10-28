@@ -76,6 +76,16 @@ class RuntimeAgent(Agent):
         generator = self.get_llm()
         storage_adapter = await self.get_storage_adapter(thread_id)
         tools = await self.get_tools(thread_id=thread_id or "", user=user)
+        # One registry per turn, shared by the search tools and the stream, so what
+        # they find reaches citations and oversight.
+        citation_registry = self.get_citation_registry()
+        rag_tools = await self.get_linked_rag_tools(
+            thread_id or "",
+            user,
+            citation_registry=citation_registry,
+            citation_formatter=self.get_citation_formatter(),
+        )
+        tools.extend(rag_tools)
 
         tool_agent = ToolAgent(
             config=ToolAgentConfig(
@@ -93,6 +103,7 @@ class RuntimeAgent(Agent):
             pipeline=tool_agent.pipeline(),
             generator=generator,
             storage_adapter=storage_adapter,
+            citation_registry=citation_registry if rag_tools else None,
         )
 
     async def get_tools(

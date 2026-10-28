@@ -80,6 +80,7 @@ class ObservationOut(BaseModel):
     confidence: float | None = None
     rationale: str = ""
     spans: list[dict[str, Any]] = Field(default_factory=list)
+    items: dict[str, float] = Field(default_factory=dict)
     trail: list[dict[str, Any]] = Field(default_factory=list)
     error: str = ""
     queued: str = ""

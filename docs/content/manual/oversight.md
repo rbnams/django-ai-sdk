@@ -24,6 +24,7 @@ The [Oversight guide](/oversight/) covers the ideas. This page documents the cla
 | `ANSWERERS` | `{}` | Named answerers: `{"alias": {"class": ..., **kwargs}}`, or the name of another alias. |
 | `BUDGET_PER_DAY` / `CURRENCY` | `None` / `"EUR"` | Daily cap on metered answerers' spend, across the deployment. `None`: no cap. |
 | `GATE_DEADLINE_MS` | `1000` | What the gate may add before the model starts: room for Jev and code, not for a model judge. |
+| `MAX_INPUT_CHARS` | `100000` | A longer question is refused at the gate, unread. `None`: no limit. |
 | `REVIEW_DEADLINE_MS` | `2000` | What review may add after the answer is complete. |
 | `WATCH_EVERY_CHARS` | `400` | Streamed characters between watch checks. |
 | `WATCH_DEADLINE_MS` | `300` | How long a watch check may pause the stream; late lenses answer `deadline` and are asked again in reflect. |
@@ -88,13 +89,14 @@ Remote (`external` names who receives the turn's content, secrets masked first):
 | Class | Answers with |
 | --- | --- |
 | `TypeSafe(model=None)` | Jev (`external = "TypeSafe"`, not metered). `[typesafe]` extra and `TYPESAFE_API_KEY`; without them it abstains (`oversight.W008`). A failed request is the error `jev: <exception>`. One stage's questions about the same state go out as one request. |
+| `TypeSafeSources(model=None)` | Jev on each source of the turn, for an `Entities` lens such as `taken_from`: one yes/no per source in one request; the value is the titles of the sources the answer is taken from, the rationale each source's probability, the confidence the least certain source's. A source an earlier turn found is named "(found earlier)". With no source at all, Jev is asked whether the reply states facts: one that does, or may, is taken from none, and so is an empty answer. |
 | `LLMJudge(model, llm=None)` | Any SDK generator factory (`llm`, a callable or dotted path; OpenAI Responses by default). Metered. |
 | `AgentJudge(agent)` | A registered agent, by id, name or class name: its model and instructions; its tools are not run. Oversight is off inside the judge's run. Metered. |
 | `Moderation(model)` | OpenAI's moderation endpoint. |
 
 A lens's answerers are asked in order until one is sure (its confidence reaches the lens's `confident`); otherwise the most confident usable answer stands, so a fallback that is less sure cannot overrule the first. Every other answer is kept in its `trail`.
 
-A lens that judges the answer against evidence (subject `sources`, or `needs_evidence = True` such as `groundedness`) reads the turn's retrieved sources *and* its tool results, and is not asked on a turn that has neither: an answer from general knowledge is not "ungrounded".
+A lens that judges the answer against evidence (subject `sources`, or `needs_evidence = True` such as `groundedness`) reads the turn's retrieved sources *and* its tool results, and is not asked on a turn that has neither: an answer from general knowledge is not "ungrounded". A lens on the answer also reads the sources earlier turns of the thread found, after this turn's: a follow-up may answer from them. A lens on the sources judges this turn's search alone. Jev reads every source whole, labelled `S1`, `S2`, ..., up to `SOURCE_CHARS` (8,000) each and `SOURCES_CHARS` (32,000) together, earlier turns' sources the first to be left out; a search tool's result that only repeats sources already listed is read once. Reflect asks no lens on the answer of a turn the gate blocked: there is none.
 
 ## Rules and conditions
 
@@ -239,6 +241,7 @@ An exporter's `export(event)` returns a reference to what the receiver stored, o
 | `oversight.E005` | An alias cannot be built. |
 | `oversight.E006` | `DEFAULT_POLICY` names an unknown policy. |
 | `oversight.E007` | An enforced rule reads a lens no answerer here can answer. |
+| `oversight.W011` | An enforced rule reads lenses whose answerers are all optional (`"jev?"`) and none is defined: it never acts until one is. |
 | `oversight.W004` | Evidence is stored in the clear. |
 | `oversight.W005` | Checkpoints are unsigned. |
 | `oversight.W006` | A lens has no answerer here (its optional aliases are not defined, or Jev has no key). Console aliases are checked live. |

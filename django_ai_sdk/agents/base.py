@@ -760,6 +760,45 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
 
         return tools
 
+    async def get_linked_rag_tools(
+        self,
+        thread_id: str = "",
+        user: AbstractBaseUser | AnonymousUser | None = None,
+        *,
+        citation_registry: SourceRegistry | None = None,
+        citation_formatter: SourceFormatter | None = None,
+    ) -> list[Any]:
+        """Link this agent's `memories` to the thread, then build their RAG tools.
+
+        A no-op unless both `rag_provider` and `memories` are set. Linking is
+        permission-gated (LINK_MEMORY), so it needs a signed-in user; a memory the
+        user may not link is left out. Pass the turn's `citation_registry` so what
+        the tools find reaches citations and oversight.
+        """
+        if (
+            not self.rag_provider
+            or not thread_id
+            or not self.memories
+            or not getattr(user, "is_authenticated", False)
+        ):
+            return []
+
+        from django_ai_sdk.memories.services import MemoryService
+
+        try:
+            await MemoryService.link_memories(self.agent_id, thread_id, user=user)
+            return await self.get_rag_tools(
+                thread_id,
+                citation_registry=citation_registry,
+                citation_formatter=citation_formatter,
+                user=user,
+            )
+        except Exception as exc:
+            logger.opt(exception=exc).warning(
+                "RAG tools unavailable for agent {}, thread {}", self.agent_id, thread_id
+            )
+            return []
+
     async def get_rag_queryset(self, memory_id: str | None = None) -> Any:
         """
         Override to return a Django QuerySet of documents for RAG.
@@ -1173,6 +1212,19 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
             f"protocol messages to {len(messages)} chat messages"
         )
 
+        # Get storage adapter for thread
+        storage_adapter = await self.get_storage_adapter(thread_id)
+        # A stored thread is the history. What the client sends back is its own copy:
+        # unmasked where the gate masked, or made up. Only the new question is taken.
+        stored_history = bool(thread and storage_adapter)
+        if stored_history:
+            newest = messages[-1] if messages and messages[-1].role == "user" else None
+            messages = [
+                m for m in await storage_adapter.get_messages() if m.role in ("user", "assistant")
+            ]
+            if newest is not None:
+                messages.append(newest)
+
         # Apply max_history limiting if configured
         if self.max_history and len(messages) > self.max_history:
             messages = messages[-self.max_history :]
@@ -1204,6 +1256,8 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
             self, channel="chat", user=user, thread_id=thread_id, messages=messages
         )
         if oversight.active:
+            if not stored_history:
+                await oversight.mask_history(messages)
             gate = await oversight.gate()
             if gate.blocked:
                 from django_ai_sdk.oversight.stream import RefusalStream
@@ -1218,9 +1272,6 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                     question.content = gate.input
             if gate.notice:
                 oversight.notices.append(gate.notice)
-
-        # Get storage adapter for thread
-        storage_adapter = await self.get_storage_adapter(thread_id)
 
         # Store only the last user message (the new one just sent)
         # Many protocols send full conversation history, but we only want to store new messages

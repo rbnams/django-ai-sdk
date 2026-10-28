@@ -173,17 +173,20 @@ class RequireToolsHook:
 
 def default_hooks(agent: Any) -> dict[str, list[Any]]:
     """Standard hooks for a tool-capable agent."""
-    from django_ai_sdk.oversight.hooks import OversightToolHook
+    from django_ai_sdk.oversight.hooks import OversightToolHook, OversightToolResultHook
 
     hooks: dict[str, list[Any]] = {
         # First: a refused call is not counted against the budget, nor logged as run.
         "before_tool": [OversightToolHook(), LogToolCallsHook()],
+        "after_tool": [],
         "on_exit": [RequireToolsHook(getattr(agent, "required_tools", None))],
     }
     if agent.max_tool_calls is not None:
         hooks["before_tool"].append(ToolCallBudgetHook(agent.max_tool_calls))
     if (limit := tool_output_limit()) is not None:
-        hooks["after_tool"] = [ToolOutputLimitHook(limit)]
+        hooks["after_tool"].append(ToolOutputLimitHook(limit))
+    # After the cut: only what the model will read is masked.
+    hooks["after_tool"].append(OversightToolResultHook())
     return hooks
 
 
@@ -288,7 +291,7 @@ class ToolAgent:
 
     def _hooks(self) -> dict[str, list[Any]] | None:
         hooks = {point: list(items) for point, items in (self.config.hooks or {}).items()}
-        from django_ai_sdk.oversight.hooks import OversightToolHook
+        from django_ai_sdk.oversight.hooks import OversightToolHook, OversightToolResultHook
 
         before = hooks.setdefault("before_tool", [])
         if not any(isinstance(h, OversightToolHook) for h in before):
@@ -297,8 +300,13 @@ class ToolAgent:
             hooks.setdefault("before_tool", []).append(
                 ToolCallBudgetHook(self.config.max_tool_calls)
             )
-        if (limit := tool_output_limit(self.config.max_tool_output_chars)) is not None:
-            hooks.setdefault("after_tool", []).append(ToolOutputLimitHook(limit))
+        after = hooks.setdefault("after_tool", [])
+        if (limit := tool_output_limit(self.config.max_tool_output_chars)) is not None and not any(
+            isinstance(h, ToolOutputLimitHook) for h in after
+        ):
+            after.append(ToolOutputLimitHook(limit))
+        if not any(isinstance(h, OversightToolResultHook) for h in after):
+            after.append(OversightToolResultHook())
         on_exit = hooks.setdefault("on_exit", [])
         if not any(isinstance(h, RequireToolsHook) for h in on_exit):
             on_exit.append(RequireToolsHook(self.config.required_tools))

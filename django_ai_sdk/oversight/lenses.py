@@ -54,8 +54,9 @@ class Lens:
     # Share of turns the reflect stage judges, 0..1. Inline stages always run.
     sample: float = 1.0
     enabled: bool = True
-    # Only asked when the turn has sources or tool results to judge against
-    # (always so for subject SOURCES): groundedness means nothing without them.
+    # Only asked when the turn has sources or tool results to judge against, its own
+    # or an earlier turn's (for subject SOURCES, its own): groundedness means nothing
+    # without them.
     needs_evidence: bool = False
 
     def __init__(self, **overrides: Any) -> None:
@@ -69,8 +70,10 @@ class Lens:
 
     def applies(self, view: TurnView) -> bool:
         """Whether this turn has what the lens judges."""
-        if self.needs_evidence or self.subject is Subject.SOURCES:
+        if self.subject is Subject.SOURCES:
             return bool(view.evidence())
+        if self.needs_evidence:
+            return bool(view.evidence(earlier=True))
         return True
 
     def __repr__(self) -> str:

@@ -3,7 +3,10 @@
 The RAG triad (context relevance, groundedness, answer relevance) and helpfulness
 run in the background, so they cost the person nothing in latency. Jev scores the
 triad against the turn's sources and tool results, in one call of about 200 ms;
-a turn with nothing to check against is not scored for grounding. Helpfulness,
+a turn with nothing to check against is not scored for grounding. "Taken from"
+asks Jev about each source in turn, so it names the chunks the answer rests on,
+also those an earlier turn found; an answer that states facts with no source at
+all, and an empty answer, are taken from none. Helpfulness,
 the broadest judgment, asks the `judge` model where Jev is unsure. Jev also answers
 refusals and a reply in the wrong language at review. Empty retrieval and failed
 tools are facts about the turn, so code answers them.
@@ -11,9 +14,9 @@ tools are facts about the turn, so code answers them.
 
 from __future__ import annotations
 
-from django_ai_sdk.oversight.answerers import EmptyRetrieval, ToolErrors
+from django_ai_sdk.oversight.answerers import EmptyRetrieval, ToolErrors, TypeSafeSources
 from django_ai_sdk.oversight.conditions import L
-from django_ai_sdk.oversight.lenses import Flag, Score
+from django_ai_sdk.oversight.lenses import Entities, Flag, Score
 from django_ai_sdk.oversight.policy import Policy
 from django_ai_sdk.oversight.registry import register
 from django_ai_sdk.oversight.rules import Alert, Queue, Rule
@@ -48,6 +51,17 @@ class Groundedness(Score):
     stages = (Stage.REFLECT,)
     needs_evidence = True
     answerers = ["jev?"]
+
+
+class TakenFrom(Entities):
+    name = "taken_from"
+    label = "Taken from"
+    question = "Which of the retrieved sources is the answer taken from?"
+    guidance = "Name each source a fact in the answer comes from; none when it rests on none."
+    subject = Subject.OUTPUT
+    stages = (Stage.REFLECT,)
+    # Asked of every answer: one without sources may be taken from none.
+    answerers = [TypeSafeSources()]
 
 
 class AnswerRelevance(Score):
@@ -121,6 +135,7 @@ class QualityPack(Policy):
     lenses = [
         ContextRelevance,
         Groundedness,
+        TakenFrom,
         AnswerRelevance,
         Helpfulness,
         Refused,
@@ -134,6 +149,13 @@ class QualityPack(Policy):
             when=(L("groundedness") < 0.5) & L("groundedness").confident(0.7),
             then=Queue("quality"),
             description="Answers the sources do not support go to a person.",
+        ),
+        Rule(
+            "review_unsourced",
+            # Not gated on confidence: a source Jev can't settle is reason to look.
+            when=L("taken_from").present & ~L("taken_from").any,
+            then=Queue("quality"),
+            description="Answers taken from none of the sources, or no answer, go to a person.",
         ),
         Rule(
             "review_irrelevant_context",
@@ -164,4 +186,5 @@ __all__ = [
     "NothingFound",
     "QualityPack",
     "Refused",
+    "TakenFrom",
 ]

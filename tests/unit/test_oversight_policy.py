@@ -52,6 +52,17 @@ class TestConditions:
         assert L("broken").missing.evaluate(answers)
         assert L("absent").missing.evaluate(answers)
 
+    def test_a_test_that_cannot_be_evaluated_is_refused(self):
+        bad = [
+            {"lens": "a", "op": "confident"},
+            {"lens": "a", "op": "unsure", "value": 2},
+            {"lens": "a", "op": "gt", "value": "high"},
+            {"lens": "a", "op": "in", "value": "hr"},
+        ]
+        for node in bad:
+            with pytest.raises(ValueError):
+                from_dict(node)
+
     def test_round_trips_through_json(self):
         condition = (L("a").is_true & (L("b") >= 0.5)) | ~L("c").in_(["x"])
         again = from_dict(condition.to_dict())

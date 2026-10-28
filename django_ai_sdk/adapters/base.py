@@ -39,6 +39,7 @@ from django_ai_sdk.events import (
     TextChunkEvent,
     TextEndEvent,
     ToolCallStartEvent,
+    ToolInputChunkEvent,
     ToolInputCompleteEvent,
     ToolOutputEvent,
 )
@@ -178,6 +179,42 @@ def get_error_chunk(e: Exception, info: ErrorInfo) -> MessageChunk:
             "error_ref": info.ref,
         },
     )
+
+
+# What a held answer's tool cards show before review: that a tool ran, not what it
+# was given or found. Review then sends the real input and output, or WITHHELD.
+HELD_OUTPUT = {"result": {"held": "Shown once the answer is checked."}}
+WITHHELD_OUTPUT = {"result": {"withheld": "Not shown: oversight withheld this answer."}}
+
+
+def held_progress(event: StreamEvent) -> StreamEvent | None:
+    """A held tool event as it may show before review: its name and progress, no content."""
+    if isinstance(event, ToolCallStartEvent):
+        return event
+    if isinstance(event, ToolInputCompleteEvent):
+        return event.model_copy(update={"tool_input": {}})
+    if isinstance(event, ToolOutputEvent):
+        return event.model_copy(update={"tool_output": HELD_OUTPUT})
+    return None
+
+
+def released(held: list[StreamEvent], *, withheld: bool) -> list[StreamEvent]:
+    """What follows a held answer's review: the real tool input, output and data, or WITHHELD."""
+    if withheld:
+        return [
+            event.model_copy(update={"tool_output": WITHHELD_OUTPUT})
+            for event in held
+            if isinstance(event, ToolOutputEvent)
+        ]
+    # Starts were shown already; the complete input stands in for its chunks.
+    return [e for e in held if not isinstance(e, ToolCallStartEvent | ToolInputChunkEvent)]
+
+
+def _store_unreviewed(writer: StreamWriter) -> None:
+    """Store none of an answer oversight did not get to review: unchecked, it could hold anything."""
+    writer.replace_text("")
+    writer.drop_reasoning()
+    writer.drop_tool_details()
 
 
 def get_error_event(info: ErrorInfo) -> ErrorEvent:
@@ -950,11 +987,14 @@ class Stream:
                 # A refused call never reaches the ToolInvoker, so its stub is streamed here.
                 for index, stub in enumerate(stubs):
                     await queue.put(
-                        StreamingChunk(content="", index=index, tool_call_result=stub.tool_call_result)
+                        StreamingChunk(
+                            content="", index=index, tool_call_result=stub.tool_call_result
+                        )
                     )
 
             session.on_tool_results = refused_results
         stopped: ReviewResult | None = None
+        session_reviewed = False
 
         try:
             yield MessageStartEvent(message_id=message_id)
@@ -1003,6 +1043,8 @@ class Stream:
                     on_block=None if hold else lambda: queue.put_nowait(_CITED),
                 )
 
+            # A held answer's tool calls and results are shown with it, after review.
+            held: list[StreamEvent] = []
             async for event in self.get_events(queue, stream_writer):
                 if session is not None:
                     if isinstance(event, TextChunkEvent):
@@ -1019,6 +1061,11 @@ class Stream:
                             continue
                     else:
                         observe_event(session, event)
+                        if hold:
+                            held.append(event)
+                            if (progress := held_progress(event)) is not None:
+                                yield progress
+                            continue
                 yield event
 
             if stopped is not None:
@@ -1027,12 +1074,15 @@ class Stream:
                 pipeline_task.cancel()
                 for event in self._withdraw_citations():
                     yield event
+                for event in released(held, withheld=True):
+                    yield event
                 if stopped.notice:
                     sent.append(stopped.notice)
                     yield notice_event(stopped.notice)
                 if stream_writer:
                     stream_writer.replace_text(stopped.output)
                     stream_writer.drop_reasoning()
+                    stream_writer.drop_tool_details()
                     stream_writer.message.metadata["oversight"] = stored_notices(sent)
                 if hold:
                     yield TextChunkEvent(content=stopped.output)
@@ -1056,6 +1106,8 @@ class Stream:
                 )
                 if stream_writer:
                     stream_writer.add_chunk(get_error_chunk(pipeline_error, info))
+                    if session is not None:
+                        _store_unreviewed(stream_writer)
                     self.message_result = await stream_writer.finalize("error")
                     _finalize_called = True
                 yield get_error_event(info)
@@ -1072,16 +1124,21 @@ class Stream:
                     )
                 text = stream_writer.text if stream_writer else session.view.output
                 reviewed = await session.review(text)
+                session_reviewed = True
                 withheld = reviewed.blocked
                 if reviewed.replaced and stream_writer:
                     stream_writer.replace_text(reviewed.output)
-                if withheld and stream_writer:
+                    # Reasoning can say what the answer was masked or withheld for.
                     stream_writer.drop_reasoning()
+                if withheld and stream_writer:
+                    stream_writer.drop_tool_details()
                 if reviewed.notice:
                     sent.append(reviewed.notice)
                     yield notice_event(reviewed.notice)
                 if sent and stream_writer:
                     stream_writer.message.metadata["oversight"] = stored_notices(sent)
+                for event in released(held, withheld=withheld):
+                    yield event
                 if hold:
                     yield TextChunkEvent(content=reviewed.output)
                 if withheld:
@@ -1121,6 +1178,8 @@ class Stream:
             )
             if stream_writer and not _finalize_called:
                 stream_writer.add_chunk(get_error_chunk(critical_error, info))
+                if session is not None and not session_reviewed:
+                    _store_unreviewed(stream_writer)
                 self.message_result = await stream_writer.finalize("error")
                 _finalize_called = True
             yield get_error_event(info)
@@ -1137,6 +1196,8 @@ class Stream:
                 except (TimeoutError, asyncio.CancelledError, Exception):
                     pass
             if stream_writer and not _finalize_called:
+                if session is not None and not session_reviewed:
+                    _store_unreviewed(stream_writer)
                 self.message_result = await stream_writer.finalize("cancelled")
             if session is not None:
                 await session.close()

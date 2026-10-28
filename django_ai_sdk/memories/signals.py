@@ -31,14 +31,15 @@ async def on_entry_saved(
     memory_id = str(instance.memory_id)
     logger.info(f"Entry saved for memory_id={memory_id}")
 
+    documents = await queryset_to_rag_documents(Entry.objects.filter(id=instance.id))
+    if not documents:
+        return
+    written: set[str] = set()  # server indexes: shared by agent classes, written once
     for agent in await AgentService.get_rag_agents():
-        queryset = Entry.objects.filter(id=instance.id)
-        documents = await queryset_to_rag_documents(queryset)
-
-        if not documents:
-            continue
         try:
-            added = await agent.rag_provider.add_documents(agent, memory_id, documents)
+            added = await agent.rag_provider.add_documents(
+                agent, memory_id, documents, written=written
+            )
         except Exception:
             await forget_index_signature(memory_id)
             raise
@@ -54,10 +55,11 @@ async def on_entry_deleted(sender: type[Model], instance: Entry, **kwargs: objec
     memory_id = str(instance.memory_id)
     logger.info(f"Entry deleted for memory_id={memory_id}")
 
+    written: set[str] = set()
     for agent in await AgentService.get_rag_agents():
         try:
             removed = await agent.rag_provider.remove_documents(
-                agent, memory_id, [str(instance.id)]
+                agent, memory_id, [str(instance.id)], written=written
             )
         except Exception:
             await forget_index_signature(memory_id)

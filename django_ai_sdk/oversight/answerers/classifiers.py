@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.core.exceptions import ImproperlyConfigured
 
-from django_ai_sdk.oversight.answerers.base import Answerer
+from django_ai_sdk.oversight.answerers.base import Answerer, clip
 from django_ai_sdk.oversight.answerers.pii import mask_secrets
 from django_ai_sdk.oversight.types import Answer, TextSpan
 from django_ai_sdk.utils import resolve_setting
@@ -159,7 +159,7 @@ class HFClassifier(Answerer):
         return result[0] if result and isinstance(result[0], list) else result
 
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
-        text = mask_secrets(view.text(lens.subject)[: self.max_chars])
+        text = mask_secrets(clip(view.text(lens.subject), self.max_chars))
         if not text:
             return None
         scores = {str(item["label"]): float(item["score"]) for item in await self.classify(text)}
@@ -195,7 +195,7 @@ class Moderation(Answerer):
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
         from openai import AsyncOpenAI
 
-        text = mask_secrets(view.text(lens.subject)[:20_000])
+        text = mask_secrets(clip(view.text(lens.subject), 20_000))
         if not text:
             return None
         response = await AsyncOpenAI().moderations.create(model=self.model, input=text)

@@ -23,7 +23,7 @@ from django_ai_sdk.oversight.answerers.rules import (
     Refusal,
     ToolErrors,
 )
-from django_ai_sdk.oversight.answerers.typesafe import TypeSafe
+from django_ai_sdk.oversight.answerers.typesafe import TypeSafe, TypeSafeSources
 
 __all__ = [
     "PII",
@@ -46,6 +46,7 @@ __all__ = [
     "Secrets",
     "ToolErrors",
     "TypeSafe",
+    "TypeSafeSources",
     "ask",
     "redact",
     "resolve",

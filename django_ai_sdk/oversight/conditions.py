@@ -76,6 +76,14 @@ class Compare(Condition):
     def __init__(self, lens: str, op: str, value: Any = None) -> None:
         if op not in OPS and op not in META_OPS:
             raise ValueError(f"Unknown op {op!r}")
+        # A test that can't be evaluated is refused here, not on every turn it meets.
+        if op in {"confident", "unsure"}:
+            if _num(value) is None or not 0 <= float(value) <= 1:
+                raise ValueError(f"{op!r} needs a confidence from 0 to 1, not {value!r}")
+        elif op in {"gt", "ge", "lt", "le"} and _num(value) is None:
+            raise ValueError(f"{op!r} needs a number, not {value!r}")
+        elif op == "in" and not isinstance(value, list | tuple | set | frozenset):
+            raise ValueError(f"'in' needs a list of values, not {value!r}")
         self.lens = lens
         self.op = op
         self.value = sorted(value) if isinstance(value, set | frozenset) else value

@@ -48,6 +48,9 @@ DEFAULTS: dict[str, Any] = {
     # Room for Jev (~0.3 s plus network) and code, not for a model judge.
     "GATE_DEADLINE_MS": 1000,
     "REVIEW_DEADLINE_MS": 2_000,
+    # A question longer than this is refused at the gate, unread: past it, what the
+    # lenses read is only part of it. None: no limit.
+    "MAX_INPUT_CHARS": 100_000,
     # What the chat client is told: "actions" only when a rule changed the turn;
     # "full" every stage's answers and matches too, for a developer view; "staff"
     # that view only for users who may read oversight (it shows what a rule tests).

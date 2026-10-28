@@ -312,11 +312,21 @@ class AnyDocFileProcessor(BaseFileProcessor):
 
     @staticmethod
     def is_text_pdf(data: bytes) -> bool:
+        """Whether the PDF has a text layer: on every page, or on most ("mixed").
+
+        A mixed PDF, such as a text document with a scanned cover, is read without
+        the pages that have no text. One that is mostly scanned is left to OCR.
+        """
         try:
             # Local import: pdf_inspector ships in the `files` extra
             import pdf_inspector
 
-            return pdf_inspector.classify_pdf_bytes(data).pdf_type == "text_based"
+            kind = pdf_inspector.classify_pdf_bytes(data)
+            if kind.pdf_type == "text_based":
+                return True
+            if kind.pdf_type != "mixed":
+                return False
+            return len(kind.pages_needing_ocr) <= int(kind.page_count) / 2
         except Exception:
             logger.warning("Could not classify PDF as text-based", exc_info=True)
             return False
@@ -335,12 +345,34 @@ class AnyDocFileProcessor(BaseFileProcessor):
 
         try:
             fmt: str | None = anydoc.format_from_path(name) if name else None
-            text = anydoc.to_markdown_bytes(data, fmt) if fmt else anydoc.to_markdown_bytes(data)
+            try:
+                text = (
+                    anydoc.to_markdown_bytes(data, fmt) if fmt else anydoc.to_markdown_bytes(data)
+                )
+            except anydoc.NeedsOcrError:
+                if not (name or "").lower().endswith(".pdf"):
+                    raise
+                data, skipped = _text_pages(data)
+                text = (
+                    anydoc.to_markdown_bytes(data, fmt) if fmt else anydoc.to_markdown_bytes(data)
+                )
+                logger.warning("%s: pages %s have no text layer and were left out", name, skipped)
         except Exception:
             # Never hard-fail the pipeline, just pass on.
             logger.info("anydoc could not convert %s, passing on", name, exc_info=True)
             return None
         return text if text.strip() else None
+
+
+def _text_pages(data: bytes) -> tuple[bytes, list[int]]:
+    """The PDF without its pages that have no text layer, and their page numbers."""
+    import pdf_inspector
+    from pdf_oxide import PdfDocument
+
+    skip = set(pdf_inspector.classify_pdf_bytes(data).pages_needing_ocr)
+    document = PdfDocument.from_bytes(data)
+    keep = [page for page in range(int(document.page_count())) if page not in skip]
+    return bytes(document.extract_pages_to_bytes(keep)), sorted(page + 1 for page in skip)
 
 
 def get_vision_agent() -> Agent | None:

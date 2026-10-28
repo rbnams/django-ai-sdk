@@ -93,12 +93,18 @@ def _lens_checks(name: str, resolved: Any) -> list[Any]:
 
     messages: list[Any] = []
     dead: set[str] = set()
+    # Dead only because every answerer is an optional alias left undefined: a choice.
+    optional: set[str] = set()
     for lens in resolved.lenses.values():
         if not lens.enabled:
             continue
         health = lens_health(lens)
         if not health["runnable"]:
             dead.add(lens.name)
+            if lens.answerers and all(
+                isinstance(spec, str) and spec.endswith("?") for spec in lens.answerers
+            ):
+                optional.add(lens.name)
             why = (
                 f"{', '.join(health['skipped'])} not defined in AI_SDK_OVERSIGHT['ANSWERERS']"
                 if health["skipped"]
@@ -130,7 +136,17 @@ def _lens_checks(name: str, resolved: Any) -> list[Any]:
             )
     for rule in resolved.rules.values():
         blind = sorted(rule.lenses() & dead)
-        if rule.mode is Mode.ENFORCE and blind:
+        if rule.mode is not Mode.ENFORCE or not blind:
+            continue
+        if set(blind) <= optional:
+            messages.append(
+                Warning(
+                    f"Enforced rule {rule.name!r} in policy {name!r} reads {blind}, whose "
+                    "answerers are all optional and none is defined here: it never acts.",
+                    id="oversight.W011",
+                )
+            )
+        else:
             messages.append(
                 Error(
                     f"Enforced rule {rule.name!r} in policy {name!r} reads {blind}, which no "

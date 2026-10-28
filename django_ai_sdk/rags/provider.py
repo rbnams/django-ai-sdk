@@ -15,6 +15,14 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def server_index(rag: Any) -> str:
+    """Where a RAG's index lives when every process shares it (a server), else ""."""
+    storage = getattr(getattr(rag, "config", None), "storage", None)
+    if getattr(storage, "is_server", False) is not True:
+        return ""
+    return f"{storage.location}/{storage.extra.get('index', 'default')}"
+
+
 def _knowledge_unavailable(cache_key: str, exc: Exception) -> AiSdkError:
     if isinstance(exc, AiSdkError):
         return exc
@@ -147,37 +155,59 @@ class RAGProvider:
         logger.debug("RAG cache cleared")
 
     async def add_documents(
-        self, agent: Agent, memory_id: str | None, documents: list[RagDocument]
+        self,
+        agent: Agent,
+        memory_id: str | None,
+        documents: list[RagDocument],
+        *,
+        written: set[str] | None = None,
     ) -> bool:
         """Add documents to this memory's index; True when something was written.
 
         Writes to the RAG cached in this process, or else to the memory's index when it
         lives on a server (see `_shared_rag`), so a task worker's upload reaches chat.
+        `written` names the server indexes already written: agents of different classes
+        share one server index, so the document is embedded once, not once per class.
         """
         cache_key = self._get_cache_key(agent, memory_id)
         try:
             rag = self._cache.get(cache_key) or await self._shared_rag(agent, memory_id)
             if rag is None or not hasattr(rag, "add_documents"):
                 return False
+            shared = server_index(rag)
+            if shared and written is not None and shared in written:
+                return True
             await rag.add_documents(documents)
+            if shared and written is not None:
+                written.add(shared)
         except Exception as exc:
             raise _knowledge_unavailable(cache_key, exc) from exc
         logger.info(f"Added {len(documents)} documents to {cache_key}")
         return True
 
     async def remove_documents(
-        self, agent: Agent, memory_id: str | None, document_ids: list[str]
+        self,
+        agent: Agent,
+        memory_id: str | None,
+        document_ids: list[str],
+        *,
+        written: set[str] | None = None,
     ) -> bool:
         """Remove documents from this memory's index; True when something was removed.
 
-        Same index as `add_documents`: the cached RAG, or else a server index.
+        Same index, and the same `written`, as `add_documents`.
         """
         cache_key = self._get_cache_key(agent, memory_id)
         try:
             rag = self._cache.get(cache_key) or await self._shared_rag(agent, memory_id)
             if rag is None or not hasattr(rag, "remove_documents"):
                 return False
+            shared = server_index(rag)
+            if shared and written is not None and shared in written:
+                return True
             await rag.remove_documents(document_ids)
+            if shared and written is not None:
+                written.add(shared)
         except Exception as exc:
             raise _knowledge_unavailable(cache_key, exc) from exc
         logger.info(f"Removed {len(document_ids)} documents from {cache_key}")

@@ -200,6 +200,12 @@ class StreamWriter:
         """Store no reasoning: a withheld answer's would give it away."""
         self._reasoning_chunks = []
 
+    def drop_tool_details(self) -> None:
+        """Store tool calls by name only: a withheld answer's arguments and results would give it away."""
+        for call in self.message.tool_calls:
+            call["arguments"] = {}
+            call["result"] = None
+
     async def finalize(self, finish_reason: str = "") -> ChatMessage:
         """Complete the message"""
         logger.debug(f"Finalizing message with reason: {finish_reason}")

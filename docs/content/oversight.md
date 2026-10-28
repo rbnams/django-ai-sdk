@@ -151,7 +151,8 @@ What the reader sees follows from when each stage runs:
 - **The stream stays live.** The answer reaches the client as the model writes it. Watch can only stop it; it never rewrites text already shown.
 - **Review fixes it at stream end.** When review blocks or redacts, the last stream part tells the client to replace the answer on screen, and the stored message is already the fixed one.
 - **Reflect fixes only the stored copy.** It runs after the stream has closed, and nothing is pushed to the client then. The stored message is masked and carries a notice, so a reloaded thread shows it as adjusted.
-- **Hold is opt-in.** A policy with `stream_mode = "hold"` shows the answer only once review passed, at the cost of a live stream.
+- **Hold is opt-in.** A policy with `stream_mode = "hold"` shows the answer, and what its tools were given and found, only once review passed; meanwhile the chat shows which tools run. The cost is a live stream.
+- **The model reads masked text only.** With a stored thread the model gets the thread's own history, not what the client sends back; tool results are masked like the question before the model reads them.
 
 The client learns of every intervention as a `data-oversight` stream part: `{turn_id, stage, outcome, rules, message?, replace?, input?}`. A refused answer ends with finish reason `content-filter`.
 

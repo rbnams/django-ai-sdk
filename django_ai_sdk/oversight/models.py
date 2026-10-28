@@ -172,6 +172,7 @@ class Observation(models.Model):
     confidence = models.FloatField(null=True, blank=True)
     rationale = models.TextField(blank=True)
     spans = models.JSONField(default=list, blank=True)
+    items = models.JSONField(default=dict, blank=True)
     # The answers of earlier answerers in the lens's list, on the way to this one.
     trail = models.JSONField(default=list, blank=True)
     error = models.CharField(max_length=200, blank=True)
