@@ -1,6 +1,6 @@
 """A daily spend cap for model answerers, so oversight can never outspend the product.
 
-Unmetered answerers (local detectors, TypeSafe, people) are never counted. When the cap
+Unmetered answerers (local detectors and models, classifier services, people) are never counted. When the cap
 is reached, metered answerers abstain with error "budget" and the lens keeps the
 answers it has.
 """

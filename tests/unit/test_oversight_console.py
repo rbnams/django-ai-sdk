@@ -23,7 +23,8 @@ from django_ai_sdk.oversight.schemas import (
 )
 from django_ai_sdk.oversight.console import _write_override
 from django_ai_sdk.oversight.services import OversightService
-from django_ai_sdk.oversight.session import TurnSession, agent_key
+from django_ai_sdk.oversight.attach import agent_key
+from django_ai_sdk.oversight.session import TurnSession
 from django_ai_sdk.permissions import PermissionDenied
 from tests.factories.db import UserFactory
 from tests.unit.test_oversight_turns import make_agent  # registers the test-guard policy
@@ -88,8 +89,8 @@ class TestPolicies:
         )
         assert policy["origin"] == "db"
         assert policy["extends"] == ["security", "quality"]
-        # Examples keep streaming live: finish replaces the text when the answer ends.
-        assert policy["stream_mode"] == "live"
+        # Examples hold the answer only once a rule may change it at finish.
+        assert policy["stream_mode"] == "auto"
         assert policy["sources"].get("policy.stream_mode") is None
         names = {lens["name"]: lens for lens in policy["lenses"]}
         assert names["support_intent"]["origin"] == "db"

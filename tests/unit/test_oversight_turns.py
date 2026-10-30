@@ -776,7 +776,11 @@ class TestHold:
 
         tool, call = lookup_tool()
         storage = Storage()
-        with patch.object(MockChatGenerator, "_build_reply", spy):
+        # Live, so the result is shown as the tool returns it.
+        with (
+            patch.object(MockChatGenerator, "_build_reply", spy),
+            override_settings(AI_SDK_OVERSIGHT={"STREAM_MODE": "live"}),
+        ):
             parts = await chat(make_agent([call, "Done."], storage, tools=[tool]), "find Jan")
         assert seen and all("NL91ABNA0417164300" not in text for text in seen)
         assert "[IBAN]" in seen[-1]
@@ -820,7 +824,7 @@ class TestTools:
                 )
             ]
         )
-        with override_settings(AI_SDK_OVERSIGHT={"CLIENT_DETAIL": "full"}):
+        with override_settings(AI_SDK_OVERSIGHT={"CLIENT_DETAIL": "full", "STREAM_MODE": "live"}):
             parts = await chat(make_agent([call, "Done."], Storage(), tools=[tool]), "send my key")
         assert ran == []
         decision = await Decision.objects.aget(rule="no_secret_tools")
@@ -1401,7 +1405,7 @@ class TestAgentKey:
     def test_a_runtime_agent_is_known_by_its_own_id(self):
         from types import SimpleNamespace
 
-        from django_ai_sdk.oversight.session import agent_key
+        from django_ai_sdk.oversight.attach import agent_key
 
         class Registered:
             _agent_id = "class-id"

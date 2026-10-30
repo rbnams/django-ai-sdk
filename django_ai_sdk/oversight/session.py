@@ -24,7 +24,6 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
-import inspect
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -37,8 +36,9 @@ from django.utils.translation import gettext_lazy as _
 from django_ai_sdk.logger import get_logger
 from django_ai_sdk.oversight import budget as budgets
 from django_ai_sdk.oversight.answerers.pii import mask_all
+from django_ai_sdk.oversight.attach import FINGERPRINT_CHARS, acode_policy, agent_key, fingerprint
 from django_ai_sdk.oversight.conf import is_enabled, setting
-from django_ai_sdk.oversight.record import _persist, _source
+from django_ai_sdk.oversight.record import as_source, persist_turn
 from django_ai_sdk.oversight.rules import Block, Mask, Notify, RestrictTools
 from django_ai_sdk.oversight.stages import (
     Matched,
@@ -65,7 +65,6 @@ if TYPE_CHECKING:
     from django.contrib.auth.base_user import AbstractBaseUser
     from django.contrib.auth.models import AnonymousUser
 
-    from django_ai_sdk.agents.base import Agent
     from django_ai_sdk.common import ChatMessage
     from django_ai_sdk.oversight.lenses import Lens
     from django_ai_sdk.oversight.policy import Policy, ResolvedPolicy
@@ -86,8 +85,6 @@ HISTORY_TURNS = 12
 WATCH_OVERLAP_CHARS = 200
 # The most of a turn's errors the ledger keeps.
 ERROR_CHARS = 500
-# Hex characters of an agent's fingerprint: enough to tell its versions apart.
-FINGERPRINT_CHARS = 16
 
 _unobserved: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "django_ai_sdk_oversight_unobserved", default=False
@@ -385,8 +382,8 @@ class TurnSession:
         """
         if not self.active:
             return
-        seeded_keys = {s if isinstance(s, str) else _source(s).key for s in seeded}
-        fresh = [_source(s) for s in sources]
+        seeded_keys = {s if isinstance(s, str) else as_source(s).key for s in seeded}
+        fresh = [as_source(s) for s in sources]
         for source in fresh:
             source.seeded = source.seeded or (bool(source.key) and source.key in seeded_keys)
         self.view.sources = fresh
@@ -1087,7 +1084,7 @@ class TurnSession:
         await self._cancel_masking()
         self.note_error(error)
         try:
-            turn_id = await sync_to_async(_persist, thread_sensitive=True)(self)
+            turn_id = await sync_to_async(persist_turn, thread_sensitive=True)(self)
         except Exception:
             # No content: what the ledger lost, so an operator can tell.
             logger.exception(
@@ -1317,74 +1314,11 @@ async def _staff_view(user: Any) -> bool:
         return False
 
 
-def agent_key(agent: Agent) -> str:
-    """The id turns and console choices know an agent by: its runtime id, else its registry id.
-
-    A runtime agent built on a registered class has both; the console assigns it by
-    its own id.
-    """
-    return str(getattr(agent, "agent_id", "") or "")
-
-
-async def acode_policy(agent: Agent, *, channel: str = "", user: Any = None) -> tuple[str, str]:
-    """The policy the agent's code asks for this turn, and why: "agent", "off" or "default".
-
-    Awaits the agent's `get_oversight(channel=, user=)`; an object without one is
-    read by its `oversight` attribute. Raises what the hook raises, and TypeError
-    for what names no policy: the caller decides what a failure means.
-    """
-    getter = getattr(agent, "get_oversight", None)
-    if callable(getter):
-        chosen = getter(channel=channel, user=user)
-        if inspect.isawaitable(chosen):
-            chosen = await chosen
-    else:
-        chosen = getattr(agent, "oversight", None)
-    return _code_choice(chosen)
-
-
-def code_policy(agent: Any) -> tuple[str, str]:
-    """What the agent's class says, without asking its `get_oversight()`: for checks.
-
-    The policy's name and why: "agent", "off" or "default".
-    """
-    return _code_choice(getattr(agent, "oversight", None))
-
-
-def _code_choice(chosen: Any) -> tuple[str, str]:
-    from django_ai_sdk.oversight.registry import policy_name
-
-    if chosen is False:
-        return "", "off"
-    if chosen is None or chosen == "":
-        return str(setting("DEFAULT_POLICY") or ""), "default"
-    return policy_name(chosen), "agent"
-
-
-def fingerprint(agent: Agent) -> str:
-    """What the agent was, compactly: a change of model, prompt or tools changes it."""
-    parts: list[str] = []
-    for getter in ("get_model", "get_system_prompt"):
-        fn = getattr(agent, getter, None)
-        try:
-            parts.append(str(fn() if callable(fn) else ""))
-        except Exception:
-            parts.append("")
-    tools = getattr(type(agent), "tools", []) or []
-    parts.append(",".join(sorted(getattr(t, "__name__", str(t)) for t in tools)))
-    parts.append(",".join(sorted(getattr(agent, "integrations", []) or [])))
-    return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:FINGERPRINT_CHARS]
-
-
 __all__ = [
     "FinishResult",
     "GateResult",
     "TurnSession",
-    "acode_policy",
     "active",
-    "agent_key",
-    "code_policy",
     "current_session",
-    "fingerprint",
     "unobserved",
 ]

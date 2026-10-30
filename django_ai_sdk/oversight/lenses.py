@@ -167,7 +167,7 @@ class Flag(Lens):
     def value_type(self) -> Any:
         return bool
 
-    # What yes and no mean, for TypeSafe's criteria and a judge's guidance.
+    # What yes and no mean, for a classifier's criteria and a judge's guidance.
     yes: str = "Yes."
     no: str = "No."
 
@@ -219,7 +219,7 @@ class Score(Lens):
 
     kind = "score"
     # What 0 and 1 mean, for a model judge and for the screen; `middle` is the middle
-    # level of a classifier that scores in levels (TypeSafe).
+    # level of a classifier that scores in levels.
     low: str = "not at all"
     middle: str = "partly"
     high: str = "completely"

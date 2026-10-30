@@ -296,7 +296,7 @@ class ConsoleMixin:
     ) -> dict[str, Any]:
         """Define a named answerer, or withdraw the console's definition of one."""
         from django_ai_sdk.oversight.answerers.base import alias_table, build_alias
-        from django_ai_sdk.oversight.catalog import ALIAS_KINDS
+        from django_ai_sdk.oversight.catalog import alias_kinds
         from django_ai_sdk.oversight.policy import GLOBAL, aconsole, invalidate
 
         await cls._check(user, Operation.MANAGE_OVERSIGHT)
@@ -306,7 +306,7 @@ class ConsoleMixin:
         if not payload.reset:
             if not payload.config:
                 raise UserError("Give the answerer a configuration.")
-            config = _console_config(payload.config, ALIAS_KINDS)
+            config = _console_config(payload.config, alias_kinds())
             await aconsole(uncached=True)
             try:
                 build_alias(alias, {**alias_table(), alias: config})
@@ -328,13 +328,13 @@ class ConsoleMixin:
     async def try_answerer(cls, payload: TryAnswererIn, *, user: UserType) -> dict[str, Any]:
         """Ask a draft answerer one yes/no question: does it work, and how fast."""
         from django_ai_sdk.oversight.answerers.base import ask, resolve
-        from django_ai_sdk.oversight.catalog import ALIAS_KINDS
+        from django_ai_sdk.oversight.catalog import alias_kinds
         from django_ai_sdk.oversight.lenses import Flag
         from django_ai_sdk.oversight.simulate import answer_out
         from django_ai_sdk.oversight.types import TurnView
 
         await cls._check(user, Operation.MANAGE_OVERSIGHT)
-        config = _console_config(payload.config, ALIAS_KINDS)
+        config = _console_config(payload.config, alias_kinds())
         try:
             answerer = resolve(config)
         except Exception as exc:
@@ -476,7 +476,7 @@ async def _agents() -> list[dict[str, Any]]:
     channel, no user). One that raises shows as reason "error" instead of failing
     the listing.
     """
-    from django_ai_sdk.oversight.session import acode_policy
+    from django_ai_sdk.oversight.attach import acode_policy
 
     found = await sync_to_async(_agent_instances, thread_sensitive=True)()
     rows: list[dict[str, Any]] = []
@@ -495,7 +495,7 @@ def _agent_instances() -> list[tuple[dict[str, Any], Any]]:
     from django_ai_sdk.agents.config import get_runtime_agent_class
     from django_ai_sdk.agents.models import AgentSettings
     from django_ai_sdk.agents.registry import registry
-    from django_ai_sdk.oversight.session import agent_key
+    from django_ai_sdk.oversight.attach import agent_key
 
     found: list[tuple[dict[str, Any], Any]] = []
     for agent in registry.all().values():

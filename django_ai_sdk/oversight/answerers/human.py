@@ -7,9 +7,9 @@ measure how often each model agrees with people.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 
-from django_ai_sdk.oversight.answerers.base import Answerer
+from django_ai_sdk.oversight.answerers.base import Answerer, param
 from django_ai_sdk.oversight.types import Answer
 
 if TYPE_CHECKING:
@@ -21,6 +21,14 @@ class Human(Answerer):
     """Queue the lens for a person. `priority`: higher is sooner."""
 
     metered = False
+    console: ClassVar[dict[str, Any] | None] = {
+        "label": "A person",
+        "summary": "The turn goes to a review queue; someone answers later.",
+        "params": [
+            param("queue", "text", "Queue", default="default"),
+            param("priority", "number", "Priority", "Higher is sooner.", default=0),
+        ],
+    }
 
     def __init__(self, queue: str = "default", *, priority: int = 0, name: str = "") -> None:
         self.queue = queue

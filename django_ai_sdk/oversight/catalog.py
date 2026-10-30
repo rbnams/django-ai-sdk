@@ -19,6 +19,7 @@ from django.utils.module_loading import import_string
 
 from django_ai_sdk.logger import get_logger
 from django_ai_sdk.oversight.answerers import pii
+from django_ai_sdk.oversight.answerers.base import SDK_ANSWERERS, param
 from django_ai_sdk.oversight.examples import LENS_EXAMPLES, POLICY_EXAMPLES, RULE_EXAMPLES
 from django_ai_sdk.oversight.rules import ACTIONS
 from django_ai_sdk.oversight.types import Severity
@@ -31,54 +32,12 @@ logger = get_logger(__name__)
 P = dict[str, Any]
 
 
-def _param(name: str, type: str, label: str, help: str = "", **extra: Any) -> P:
-    return {"name": name, "type": type, "label": label, "help": help, **extra}
+_param = param
 
 
-# Answerers an alias can name: the ones worth configuring once and reusing.
-ALIAS_KINDS: list[dict[str, Any]] = [
-    {
-        "class": "LLMJudge",
-        "label": "Model judge",
-        "summary": "A chat model reads the question and answers it with a value, a confidence "
-        "and a reason. Any model your gateway serves.",
-        "metered": True,
-        "external": "model gateway",
-        "params": [
-            _param("model", "model", "Model", "Which chat model judges.", required=True),
-            _param(
-                "timeout",
-                "number",
-                "Timeout (seconds)",
-                "After this the answer counts as failed.",
-                default=45,
-            ),
-        ],
-    },
-    {
-        "class": "TypeSafe",
-        "label": "TypeSafe",
-        "summary": "A hosted, paid classification service: answers yes/no, label and score "
-        "lenses, and rates each source for a lens about which sources an answer is taken "
-        "from. Needs django-ai-sdk[typesafe] and TYPESAFE_API_KEY.",
-        "metered": False,
-        "external": "TypeSafe",
-        "params": [
-            _param("model", "model", "Model", "Empty uses TYPESAFE_MODEL.", kind="TypeSafe"),
-        ],
-    },
-    {
-        "class": "Human",
-        "label": "A person",
-        "summary": "The turn goes to a review queue; someone answers later.",
-        "metered": False,
-        "external": "",
-        "params": [
-            _param("queue", "text", "Queue", default="default"),
-            _param("priority", "number", "Priority", "Higher is sooner.", default=0),
-        ],
-    },
-]
+# The SDK's answerers an alias can name, in the order the console lists them. Each
+# says how it is offered (`Answerer.console`); one whose package is missing is not.
+SDK_KINDS = ("LLMJudge", "LocalClassifier", "TypeSafe", "Human")
 
 PII_KINDS = list(pii.KINDS)
 
@@ -323,6 +282,124 @@ for _action in ACTION_KINDS:
     _action["stages"] = [str(s) for s in ACTIONS[_action["kind"]].effective]
 
 
+def alias_kinds(*, installed_only: bool = False) -> list[dict[str, Any]]:
+    """The answerers the console may name: ANSWERER_KINDS, or else the SDK's (SDK_KINDS).
+
+    Each kind is its class's `console` form, with the class (short for the SDK's own,
+    else its dotted path), whether it is metered and who receives turn content. A
+    judge's server is one of ENDPOINTS. `installed_only`: what the editor offers, so
+    a class whose package is missing is not offered, though an alias stored with it
+    still loads (and abstains, ai_sdk.oversight.W005).
+    """
+    from django.utils.module_loading import import_string
+
+    from django_ai_sdk.oversight.answerers.base import Answerer
+    from django_ai_sdk.oversight.conf import setting
+
+    configured = setting("ANSWERER_KINDS")
+    names = SDK_KINDS if configured is None else configured
+    # A name without a dot is one of the SDK's answerers.
+    paths = [name if "." in name else f"{SDK_ANSWERERS}{name}" for name in names]
+    endpoints = ["", *sorted(setting("ENDPOINTS"))]
+    kinds = []
+    for path in paths:
+        try:
+            cls = import_string(path)
+        except ImportError:
+            logger.warning("ANSWERER_KINDS names {!r}, which does not import", path)
+            continue
+        if not (isinstance(cls, type) and issubclass(cls, Answerer)) or not cls.console:
+            continue
+        if installed_only and not cls.installed():
+            continue
+        kinds.append(
+            {
+                "class": path.removeprefix(SDK_ANSWERERS),
+                "metered": cls.metered,
+                "external": cls.external,
+                **cls.console,
+                "params": [
+                    {**p, "choices": endpoints} if p["name"] == "endpoint" else p
+                    for p in cls.console.get("params", [])
+                ],
+            }
+        )
+    return kinds
+
+
+# Words in a model id that say it is not a chat model, so it cannot judge.
+NOT_CHAT = (
+    "embed", "rerank", "moderation", "whisper", "tts", "transcribe", "ocr", "image",
+    "dall-e", "flux", "minilm", "bge-", "e5-", "retriever",
+)  # fmt: skip
+
+
+# Seconds a model list is reused: long when every server answered, short when one did not.
+MODELS_TTL = 600.0
+MODELS_RETRY_TTL = 60.0
+_models: tuple[float, float, list[dict[str, Any]]] | None = None
+
+
+def endpoint_models(timeout: float = 8.0) -> list[dict[str, Any]]:
+    """The chat models of the default gateway and of every ENDPOINTS server, from /models.
+
+    For MODEL_CHOICES: "django_ai_sdk.oversight.catalog.endpoint_models". Any
+    OpenAI-compatible server lists its models there (Ollama, vLLM, LM Studio and most
+    gateways). A server that does not answer is left out and logged, and the list is
+    asked again after MODELS_RETRY_TTL seconds instead of MODELS_TTL.
+    """
+    import time
+
+    global _models
+    if _models and time.monotonic() - _models[0] < _models[1]:
+        return _models[2]
+    choices, complete = _list_models(timeout)
+    _models = (time.monotonic(), MODELS_TTL if complete else MODELS_RETRY_TTL, choices)
+    return choices
+
+
+def _list_models(timeout: float) -> tuple[list[dict[str, Any]], bool]:
+    import httpx
+
+    from django_ai_sdk.oversight.answerers.llm import _key
+    from django_ai_sdk.oversight.conf import setting
+    from django_ai_sdk.utils import resolve_setting
+
+    servers = []
+    if key := _key("OPENAI_API_KEY"):
+        url = resolve_setting("OPENAI_API_URL") or "https://api.openai.com/v1"
+        servers.append(("", "Default", url, key))
+    for name, config in sorted(setting("ENDPOINTS").items()):
+        if isinstance(config, dict) and config.get("base_url"):
+            key_env = str(config.get("api_key_env") or "")
+            label = str(config.get("label") or name)
+            servers.append((name, label, str(config["base_url"]), _key(key_env) if key_env else ""))
+    choices: list[dict[str, Any]] = []
+    complete = True
+    for endpoint, group, url, key in servers:
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        try:
+            response = httpx.get(f"{url.rstrip('/')}/models", headers=headers, timeout=timeout)
+            response.raise_for_status()
+            ids = sorted(m["id"] for m in response.json().get("data", []) if m.get("id"))
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Could not list the models of {}: {}", group, type(exc).__name__)
+            complete = False
+            continue
+        choices += [
+            {
+                "id": model_id,
+                "label": model_id.split("/")[-1],
+                "group": group,
+                "kinds": ["LLMJudge"],
+                "endpoint": endpoint,
+            }
+            for model_id in ids
+            if not any(word in model_id.lower() for word in NOT_CHAT)
+        ]
+    return choices, complete
+
+
 def model_choices() -> list[dict[str, Any]]:
     """The models the console offers, from AI_SDK_OVERSIGHT["MODEL_CHOICES"]."""
     from django_ai_sdk.oversight.conf import setting
@@ -346,6 +423,7 @@ def model_choices() -> list[dict[str, Any]]:
             "label": str(choice.get("label") or choice["id"]),
             "group": str(choice.get("group") or ""),
             "kinds": list(choice.get("kinds") or ["LLMJudge"]),
+            "endpoint": str(choice.get("endpoint") or ""),
         }
         for choice in configured or []
         if isinstance(choice, dict) and choice.get("id")
@@ -366,8 +444,6 @@ def console_shape(config: Any) -> tuple[Any, bool]:
     Only the class and that kind's catalog parameters are shown: a settings config
     may hold headers or tokens. Anything the console could not write is read-only.
     """
-    from django_ai_sdk.oversight.answerers.base import SDK_ANSWERERS
-
     if isinstance(config, str):
         return config, True
     if not isinstance(config, dict):
@@ -375,7 +451,7 @@ def console_shape(config: Any) -> tuple[Any, bool]:
     path = config.get("class")
     short = path.__name__ if isinstance(path, type) else str(path or "")
     short = short.removeprefix(SDK_ANSWERERS)
-    kind = next((k for k in ALIAS_KINDS if k["class"] == short), None)
+    kind = next((k for k in alias_kinds() if k["class"] == short), None)
     params = {p["name"] for p in kind["params"]} if kind else set()
     shown = {"class": short, **{k: v for k, v in config.items() if k in params or k == "name"}}
     editable = kind is not None and set(config) <= {"class", "name", *params}
@@ -426,7 +502,7 @@ def catalog() -> dict[str, Any]:
         "stages": STAGE_INFO,
         "ops": OPS,
         "actions": ACTION_KINDS,
-        "alias_kinds": ALIAS_KINDS,
+        "alias_kinds": alias_kinds(installed_only=True),
         "inline_kinds": INLINE_KINDS,
         "aliases": aliases,
         "models": model_choices(),
@@ -440,10 +516,13 @@ def catalog() -> dict[str, Any]:
 
 __all__ = [
     "ACTION_KINDS",
-    "ALIAS_KINDS",
     "INLINE_KINDS",
+    "NOT_CHAT",
+    "SDK_KINDS",
+    "alias_kinds",
     "catalog",
     "console_shape",
+    "endpoint_models",
     "lens_example",
     "model_choices",
     "rule_example",

@@ -22,8 +22,9 @@ Add `"django_ai_sdk.oversight"` to `INSTALLED_APPS` and run `migrate`. The app n
 | `ENABLED` | `True` | Kill switch: off leaves every agent unwatched, whatever its policy says. |
 | `DEFAULT_POLICY` | `""` | The policy of agents whose `oversight` is `None`, and of runtime agents whose base class names none. Empty: they are unwatched (`ai_sdk.oversight.W012` warns about runtime agents). |
 | `CAPTURE` | `"masked"` | The most content the ledger keeps (`none`, `metadata`, `masked`, `full`); a policy may keep less, never more. |
-| `STREAM_MODE` | `"live"` | `live` streams the answer as it is written; `hold` shows it once finish passed it. A policy may set its own. |
+| `STREAM_MODE` | `"auto"` | `live` streams the answer as it is written; `hold` shows it once finish passed it; `auto` holds it only while an enforced rule may mask or withhold it at finish, decided per turn. A policy may set its own. |
 | `POLICIES` | `{}` | Per policy, the tuning the console allows, kept in settings: `{"support": {"rules": {"block_injection": {"mode": "enforce"}}, "capture": "masked"}}`. |
+| `ANSWERER_KINDS` | `None` | The answerer classes the console may name, each by its `console` form: SDK class names (`"LLMJudge"`) and dotted paths of your own. `None`: the SDK's (`catalog.SDK_KINDS`); a list replaces them, so a host can leave any out. The editor offers only those whose package is installed (`installed()`); an alias stored with another still loads, and abstains. |
 | `ANSWERERS` | `{}` | Named answerers: `{"alias": {"class": ..., **kwargs}}`, or the name of another alias. A class without a dot is one of `django_ai_sdk.oversight.answerers`. |
 | `BUDGET_PER_DAY` | `None` | Cap on metered answerers' spend per UTC day, across the deployment. `None`: no cap. |
 | `CURRENCY` | `"USD"` | The currency `AI_SDK_MODEL_PRICES` and `BUDGET_PER_DAY` are in: a label, never converted. |
@@ -41,7 +42,8 @@ Add `"django_ai_sdk.oversight"` to `INSTALLED_APPS` and run `migrate`. The app n
 | `SIGNING_NAME` | `""` (the log origin) | The key's name in the signature; a verifier key carries it too. |
 | `LOG_ORIGIN` | `""` (first `ALLOWED_HOSTS` entry + `/oversight`) | The checkpoint's origin line. |
 | `EXPORTERS` | `[]` | Where notifying decisions and checkpoints are sent: instances, dotted paths, or `{"class": "<dotted path>", **kwargs}` (unlike `ANSWERERS`, always the full path: `"django_ai_sdk.oversight.exporters.Webhook"`). One that cannot be built is logged and left out. |
-| `MODEL_CHOICES` | `[]` | Models the console offers for judges: `[{"id", "label", "group", "kinds"}]`, or the dotted path of a function returning that list. |
+| `MODEL_CHOICES` | `[]` | Models the console offers for judges: `[{"id", "label", "group", "kinds", "endpoint"}]`, or the dotted path of a function returning that list. `"django_ai_sdk.oversight.catalog.endpoint_models"` lists the chat models of the default gateway and of every `ENDPOINTS` server, from their `/models`. |
+| `ENDPOINTS` | `{}` | OpenAI-compatible servers a judge may use besides the default gateway, by name: `{"ollama": {"base_url": "http://localhost:11434/v1", "api_key_env": "", "label": "Ollama"}}`. `api_key_env` names the environment variable (or else Django setting) holding the key; empty for a server that wants none. The console picks a server by name only: it never writes a URL or names a key. |
 | `POLICY_CACHE_SECONDS` | `10` | How long a resolved policy (code plus database overlay) is reused per process. |
 
 Outside the dict:
@@ -114,6 +116,7 @@ Local (`external = ""`: nothing leaves the process; not metered):
 | `Language()` | The language (a `Choice`), or "answered in another language" (a `Flag`). |
 | `Length(max_chars)`, `Refusal()`, `EmptyRetrieval()`, `ToolErrors()` | As named. |
 | `LexicalSupport()` | Word-overlap groundedness (output) and context relevance (sources). Low confidence by design: a floor under the judges. |
+| `LocalClassifier(model=ENGLISH, *, file="onnx/model_quantized.onnx", positive="", template="This text is about {}.")` | An ONNX model from the Hugging Face Hub, run by onnxruntime in this process (the `local` extra, no torch). Zero-shot by default: yes/no (entails the lens's `yes`), label (the criterion it entails most) and score lenses, about 20 ms each on a CPU. `ENGLISH` (87 MB) and `MULTILINGUAL` (340 MB) are MIT-licensed NLI models; `positive=` makes a model trained for one question (a prompt-injection detector) answer yes/no lenses. Reads one text, the question or the answer, of at most 1,600 characters: lenses on sources or tool calls, lenses that need evidence and "taken from" go to the next answerer. Steps aside until its model is loaded, loading it in the background; `answerers.local.load()` loads it at startup. |
 | `Function(fn, *, name="", metered=False)` | Any function `fn(lens, view)`, sync or async, returning a value, an `Answer` or `None`; or its dotted path. |
 | `Human(queue="default", *, priority=0)` | Queues the lens for a person; the answer arrives later. Also the built-in alias `human`. |
 
@@ -123,10 +126,12 @@ Remote (`external` names who receives the turn's content; secrets are masked fir
 
 | Class | Answers with |
 | --- | --- |
-| `LLMJudge(model=None, *, llm=None, instructions=..., generation_kwargs=None, timeout=None)` | Any chat model an SDK generator factory builds (`llm`: the factory or its dotted path; OpenAI Responses by default). `external = "model gateway"`, metered, 45 s timeout. Structured output where the generator supports it, parsed JSON where not. |
+| `LLMJudge(model=None, *, llm=None, endpoint="", base_url="", api_key_env="", instructions=..., generation_kwargs=None, timeout=None)` | Any chat model. `endpoint` names an `ENDPOINTS` server; `base_url` and `api_key_env` give one directly: the judge then speaks Chat Completions (Ollama, vLLM, LM Studio, llama.cpp), and abstains while the key's variable is unset. Without them, the default gateway (OpenAI Responses, `OPENAI_API_URL`). `llm`: an SDK generator factory or its dotted path, for another provider. `external = "model gateway"`, metered, 45 s timeout. Structured output where the generator supports it, parsed JSON where not. |
 | `TypeSafe(model=None)` | TypeSafe, a hosted commercial classification service. `external = "TypeSafe"`, not metered, 20 s timeout. Needs the `typesafe` extra and `TYPESAFE_API_KEY`, else abstains (`ai_sdk.oversight.W005`). Import it from `django_ai_sdk.oversight.answerers`. Answers `Flag`, `Choice` and `Score` lenses, and an `Entities` lens with `per_source = True` by asking one yes/no per source: the value is the titles of the sources that answer yes, `items` each source's probability. One stage's questions about the same turn go out as one request. A failed request is an `unavailable` error, so `FAIL_MODE` applies and reflect asks again. |
 
-What each remote answerer sends, per lens subject and with every limit, is in the guide's [Where turn content goes](/oversight/#where-turn-content-goes) and in the two modules' docstrings (`answerers/llm.py`, `answerers/typesafe.py`).
+`TypeSafe` is a `Classifier` (`answerers.classifier`), the base for any model that answers typed questions: see the guide's [Your own answerer](/oversight/#your-own-answerer).
+
+What each remote answerer sends, per lens subject and with every limit, is in the guide's [Where turn content goes](/oversight/#where-turn-content-goes) and in the modules' docstrings (`answerers/llm.py`, `answerers/classifier.py`, `answerers/typesafe.py`).
 
 A lens's answerers are asked in order until one is sure (its confidence reaches the lens's `min_confidence`). When none is, the last one that answered decides: confidences from different answerers are on different scales and are never compared. Every other answer is kept in its `trail`. A chain that ends on an error or the deadline after only unsure answers counts as failed for `FAIL_MODE`, and keeps the unsure answer for the record.
 
@@ -167,7 +172,7 @@ class Policy:
     lenses: list[Lens | type[Lens]]
     rules: list[Rule]
     capture: Capture | None     # none, metadata, masked, full; None inherits
-    stream_mode: str | None     # live, hold; None inherits
+    stream_mode: str | None     # auto, live, hold; None inherits
     retention: dict[str, int]   # content, metadata (days); either alone
 
     def get_lenses(self) -> list[Lens]: ...   # override to build them at runtime

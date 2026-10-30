@@ -1072,7 +1072,7 @@ class TestTakenFromIsTheClassifiers:
 class TestOpenRelease:
     """Vendor-neutral by default: no deployment's names, limits that say what they are."""
 
-    VENDOR = ("jev", "system one", "nemotron")
+    VENDOR = ("jev", "system one", "nemotron", "nebul")
 
     def test_no_deployment_words_in_the_core(self):
         from pathlib import Path

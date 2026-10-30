@@ -553,7 +553,7 @@ class TestRecordingFailures:
         assert (await session.gate()).blocked
         with (
             log_lines() as lines,
-            patch("django_ai_sdk.oversight.session._persist", side_effect=DatabaseError("x")),
+            patch("django_ai_sdk.oversight.session.persist_turn", side_effect=DatabaseError("x")),
         ):
             assert await session.close() is None
         text = "\n".join(lines)

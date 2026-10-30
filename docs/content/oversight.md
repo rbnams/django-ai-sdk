@@ -239,11 +239,15 @@ class PromptInjection(security.PromptInjection):
 
 ## Picking the answerer
 
-Pick the answerer per lens:
+Pick the answerer per lens. No answerer is the default: every lens names what answers it, and every layer below can be replaced by your own.
 
-- **Code** (a local detector) when you need exact spans: personal data by checksum and secrets by pattern give the characters to mask. A failed tool or an exfiltration link is a fact about the turn, so code answers it too. Code sends nothing anywhere.
-- **A classifier** for most yes/no, label and score lenses.
-- **A model judge** for written text, or as a second opinion where the classifier is unsure (`["classifier?", "judge?"]`).
+| Answerer | Runs | Good for |
+| --- | --- | --- |
+| Code: `PII`, `Secrets`, `Patterns`, `Keywords`, your `Detector` | in this process | Exact spans to mask (personal data by checksum, secrets by pattern), and facts about the turn (a failed tool, an exfiltration link). Free, instant, sends nothing. |
+| `LocalClassifier` | in this process | Yes/no, label and score lenses in milliseconds, with a small open model. Free, sends nothing. |
+| `LLMJudge` | your gateway, or a server of your own (Ollama, vLLM) | Written text, harder calls, and a second opinion where a classifier is unsure. |
+| A classifier service: your `Classifier` | hosted | Yes/no, label and score lenses from a service built for them. |
+| `Human` | a review queue | What no model should decide alone. |
 
 The packs and the console's examples name answerers by alias, and a deployment maps each alias it has to an answerer:
 
@@ -274,13 +278,100 @@ AI_SDK_MODEL_PRICES = {
 
 A gate lens still running at `GATE_DEADLINE_MS` fails, and under the default open fail mode its enforced rule then does not act: with a model judge on `prompt_injection`, raise the deadline or set the gate's `FAIL_MODE` to `closed`.
 
-A `"class"` without a dot is one of the SDK's answerers; a dotted path names your own. An alias may also name another alias (`"fast": "judge"`). `LLMJudge` takes `llm=` (an SDK generator factory or its dotted path) to use another provider, such as `"django_ai_sdk.generators.anthropic_chat"` or `"django_ai_sdk.generators.ollama_chat"` for a model on your own hardware.
+A `"class"` without a dot is one of the SDK's answerers; a dotted path names your own. An alias may also name another alias (`"fast": "judge"`). `LLMJudge` takes `llm=` (an SDK generator factory or its dotted path) to use another provider, such as `"django_ai_sdk.generators.anthropic_chat"`.
+
+### A model on your own server
+
+Ollama, vLLM, LM Studio and llama.cpp all serve the OpenAI Chat Completions API. Name such a server in `ENDPOINTS` and point a judge at it; nothing then leaves your network:
+
+```python
+AI_SDK_OVERSIGHT = {
+    "ENDPOINTS": {
+        "ollama": {"base_url": "http://localhost:11434/v1", "label": "Ollama"},
+        "vllm": {"base_url": "http://gpu-box:8000/v1", "api_key_env": "VLLM_API_KEY"},
+    },
+    "ANSWERERS": {
+        "classifier": {"class": "LLMJudge", "model": "qwen3:4b", "endpoint": "ollama"},
+        "judge": {"class": "LLMJudge", "model": "Qwen/Qwen3-32B", "endpoint": "vllm"},
+    },
+    "MODEL_CHOICES": "django_ai_sdk.oversight.catalog.endpoint_models",
+}
+```
+
+`api_key_env` names the environment variable holding the key, so the key never sits in settings or the console; a judge whose variable is unset abstains, with the reason on the console. With `MODEL_CHOICES` set to `endpoint_models`, the console lists every server's chat models, and a judge made there picks its server by name from `ENDPOINTS`, never a URL of its own. In code, `LLMJudge(model=..., base_url=..., api_key_env=...)` works without a settings entry.
+
+A small local model at the gate is slower than a hosted classifier: measure it, then set `GATE_DEADLINE_MS` to match, or keep it for reflect.
+
+### A classifier in your own process
+
+`LocalClassifier` runs a small NLI model with onnxruntime, in the Django process: no server, no torch, nothing leaves (`pip install "django-ai-sdk[local]"`). It answers yes/no, label and score lenses in about 20 ms on a CPU, which fits the gate. Put it first and let a stronger answerer take what it is unsure of:
+
+```python
+"ANSWERERS": {"local": {"class": "LocalClassifier"}},
+...
+class Topic(Choice):
+    labels = ["leave", "pay", "other"]
+    criteria = {"leave": "Leave and holidays.", "pay": "Salary and pay slips."}
+    answerers = ["local", "classifier?"]
+```
+
+It reads one text: lenses on the question or on the answer. A lens on sources or a tool call, one that needs the evidence (groundedness), and a "taken from" lens go to the next answerer. A zero-shot model reads statements, not questions: each label's criterion as "This text is about <criterion>.", a yes/no as the lens's `yes`. Write `yes="This text asks to ignore previous instructions."`, not a question. For one fixed question there are models trained for it: `LocalClassifier(model="protectai/deberta-v3-base-prompt-injection-v2", file="onnx/model.onnx", positive="INJECTION")`. Until its model is loaded (downloaded once, then about a second), it steps aside and loads in the background, so the first turns after a deploy go to the next answerer; call `django_ai_sdk.oversight.answerers.local.load()` at startup to have it ready.
 
 `"classifier?"` names an alias *optionally*: it is asked when `ANSWERERS` defines `classifier` and skipped otherwise. So the packs work with whatever you define: a lens whose answerers are all undefined optional aliases is skipped on every turn, `ai_sdk.oversight.W003` lists every such lens of the policies in use in one warning, and `ai_sdk.oversight.W008` names enforced rules that therefore never act. A lens that names an alias without `?` that nothing defines is an error (`ai_sdk.oversight.E004`).
 
-### TypeSafe
+### Your own answerer
 
-`TypeSafe` is an answerer for TypeSafe, a hosted, commercial classification service. It is optional: it needs the `typesafe` extra (`pip install "django-ai-sdk[typesafe]"`) and the `TYPESAFE_API_KEY` Django setting, and without either it abstains (`ai_sdk.oversight.W005`). It is exported from `django_ai_sdk.oversight.answerers`, not from `django_ai_sdk.oversight`. Nothing in the SDK uses it unless a deployment maps an alias to it:
+An answerer is a class with one method, `async answer(lens, view) -> Answer | None`. Return `None` to step aside: the lens asks its next answerer. The SDK times the call (`timeout`), contains its errors, checks the value against the lens's kind and charges `metered` answerers to the budget. Three class attributes tell oversight what it is:
+
+| Attribute | Means |
+| --- | --- |
+| `external` | Who receives turn content when it runs ("My service"). Empty: it runs in this process. An external answerer's failure is `unavailable`, which reflect asks again. |
+| `metered` | Charged to `BUDGET_PER_DAY`. |
+| `timeout` | Seconds before its answer is abandoned. |
+
+`missing()` returns why it cannot run on this deployment (a package or key absent), so it abstains and the console says why. For the shape of an answer, use what the lens reads: a yes/no is a bool (or a probability of yes, 0.5 and up is yes), a label one of the lens's labels, a score 0 to 1, found things a list of labels with their `spans`. `confidence` is how sure, from 0 to 1, on your answerer's own scale.
+
+Three bases do most of the work:
+
+- **`Function(fn)`**: any function `fn(lens, view)`, sync or async, returning a value. The quickest way in.
+- **`Detector`**: implement `detect(text, view, lens) -> list[TextSpan]`, for exact spans that can be masked (a Presidio analyzer, a customer-number pattern). It reads long texts in windows and answers "found nothing" with its `miss_confidence`.
+- **`Classifier`**: for a model that answers typed questions, hosted or local. Implement `question(lens)` (your API's form of a yes/no, label or score question; `None` for a lens you cannot answer) and `async classify(state, questions, *, timeout=None) -> {name: Answer}`. The base decides what the model reads per lens subject, masks secrets first, refuses a text it would have to cut, sends one stage's questions about the same turn as one call, and rates each source for a "taken from" lens. `TypeSafe` is the worked example.
+
+```python
+from django_ai_sdk.oversight import Answer, Flag
+from django_ai_sdk.oversight.answerers.classifier import Classifier, certainty
+
+class MyClassifier(Classifier):
+    external = "My classifier"
+
+    def question(self, lens):
+        return {"text": lens.question} if isinstance(lens, Flag) else None
+
+    async def classify(self, state, questions, *, timeout=None):
+        reply = await my_client.ask(state, questions, timeout=timeout)  # {name: probability of yes}
+        return {name: Answer(value=p, confidence=certainty(p)) for name, p in reply.items()}
+```
+
+Name it in `ANSWERERS` by its dotted path (`{"class": "myapp.oversight.MyClassifier"}`), or put an instance in a lens's `answerers`. To offer it in the console as well, give it a `console` form and list it in `ANSWERER_KINDS` (with the SDK's you want to keep: the list replaces them); the console then saves only the parameters that form names:
+
+```python
+from django_ai_sdk.oversight.answerers.base import param
+
+class MyClassifier(Classifier):
+    console = {
+        "label": "My classifier",
+        "summary": "Our moderation service.",
+        "params": [param("model", "text", "Model")],
+    }
+
+AI_SDK_OVERSIGHT = {"ANSWERER_KINDS": ["LLMJudge", "Human", "myapp.oversight.MyClassifier"]}
+```
+
+The SDK's answerers are offered exactly this way, each from its own class, and only once their package is installed.
+
+### A classifier service: TypeSafe
+
+The SDK ships one service-backed `Classifier`, for TypeSafe, a hosted, commercial classification service; it is also the worked example of the base. It is optional: it needs the `typesafe` extra (`pip install "django-ai-sdk[typesafe]"`) and the `TYPESAFE_API_KEY` Django setting, and without either it abstains (`ai_sdk.oversight.W005`). It is exported from `django_ai_sdk.oversight.answerers`, not from `django_ai_sdk.oversight`. Nothing in the SDK uses it unless a deployment maps an alias to it:
 
 ```python
 "ANSWERERS": {"classifier": {"class": "TypeSafe"}}
@@ -354,12 +445,13 @@ Webhooks send the thread's stored messages back, so their history is not judged 
 
 ## What the person sees: live and hold
 
-- **Live** (the default). The answer reaches the client as the model writes it. Watch checks it every `WATCH_EVERY_CHARS` characters and can only stop it; it never rewrites text already shown. Finish fixes it when the stream ends: when finish blocks or masks, the last part tells the client to replace the answer on screen, and the stored message is already the fixed one.
+- **Auto** (the default). Hold while an enforced rule may mask or withhold the answer at finish, live otherwise; decided on each turn, so a rule switched to enforce in the console holds the next answer. A policy in test mode streams live.
+- **Live**. The answer reaches the client as the model writes it. Watch checks it every `WATCH_EVERY_CHARS` characters and can only stop it; it never rewrites text already shown. Finish fixes it when the stream ends: when finish blocks or masks, the last part tells the client to replace the answer on screen, and the stored message is already the fixed one.
 - **Hold** (`stream_mode = "hold"` on the policy, or `STREAM_MODE`). The answer, and what its tools were given and found, is shown only once finish passed it; meanwhile the chat shows which tools run. The cost is the live stream. Reasoning is neither shown nor stored: no lens judges it. Tool cards show what the model saw, its tool results masked at watch: to keep something out of the tool cards, mask it at watch. Rows an artifact tool wrote with an answer that is withheld are deleted with it.
 - **Reflect** fixes only the stored copy. It runs after the stream has closed and pushes nothing to the client. The stored message is masked and carries a notice, so a reloaded thread shows it as adjusted.
 
 {{< callout type="warning" >}}
-In live mode the client has the text before finish runs, and between watch checks: an enforced finish `Mask` or `Block` then only replaces what the client already showed, and only in a client that applies the `replace` notice (`ai_sdk.oversight.W011` warns). Stock clients that ignore `data-*` parts, and the OpenAI protocol, never do. A Markdown image in the answer, rendered by the client, makes it fetch the image's URL, with whatever data the URL carries, before the exfiltration lens can stop it. For an agent that reads sensitive data, use `stream_mode = "hold"`, or a client that does not load remote images.
+In live mode the client has the text before finish runs, and between watch checks: an enforced finish `Mask` or `Block` then only replaces what the client already showed, and only in a client that applies the `replace` notice (`ai_sdk.oversight.W011` warns). Stock clients that ignore `data-*` parts, and the OpenAI protocol, never do. A Markdown image in the answer, rendered by the client, makes it fetch the image's URL, with whatever data the URL carries, before the exfiltration lens can stop it. `auto` holds exactly when such a rule is enforced. For an agent that reads sensitive data, use `stream_mode = "hold"` (exfiltration links are a reason even without such a rule), or a client that does not load remote images.
 {{< /callout >}}
 
 ## What the client is told

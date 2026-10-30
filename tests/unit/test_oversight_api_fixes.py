@@ -860,8 +860,12 @@ class TestChecks:
         assert "ai_sdk.oversight.W010" not in check_ids(AI_SDK_OVERSIGHT={"DEFAULT_POLICY": ""})
 
     def test_a_live_stream_with_an_enforced_finish_mask_warns(self):
-        ids = check_ids(AI_SDK_OVERSIGHT={"DEFAULT_POLICY": "test-guard"})
-        assert "ai_sdk.oversight.W011" in ids
+        live = check_ids(AI_SDK_OVERSIGHT={"DEFAULT_POLICY": "test-guard", "STREAM_MODE": "live"})
+        assert "ai_sdk.oversight.W011" in live
+        # The default holds the answer exactly while such a rule is enforced.
+        assert "ai_sdk.oversight.W011" not in check_ids(
+            AI_SDK_OVERSIGHT={"DEFAULT_POLICY": "test-guard"}
+        )
         held = check_ids(AI_SDK_OVERSIGHT={"DEFAULT_POLICY": "test-guard", "STREAM_MODE": "hold"})
         assert "ai_sdk.oversight.W011" not in held
 

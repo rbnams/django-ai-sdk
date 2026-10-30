@@ -46,8 +46,9 @@ LENS_FIELDS = {"enabled", "sample", "answerers", "min_confidence", "stages"}
 RULE_FIELDS = {"mode", "when", "then", "message", "stages"}
 POLICY_FIELDS = {"capture", "stream_mode", "retention"}
 RETENTION_KEYS = ("content", "metadata")
-# "live" streams the answer as it is written; "hold" sends it once finish passed it.
-STREAM_MODES = ("live", "hold")
+# "live" streams the answer as it is written; "hold" sends it once finish passed it;
+# "auto" holds it only when an enforced rule may mask or withhold it at finish.
+STREAM_MODES = ("auto", "live", "hold")
 
 # The overlay scope for what is not one policy's: answerer aliases, agent choices.
 GLOBAL = "*"
@@ -117,7 +118,7 @@ class ResolvedPolicy:
     lenses: dict[str, Lens] = field(default_factory=dict)
     rules: dict[str, Rule] = field(default_factory=dict)
     capture: Capture = Capture.FULL
-    stream_mode: str = "live"
+    stream_mode: str = "auto"
     retention: dict[str, int] = field(default_factory=dict)
     # "lens:pii.sample" -> "pack:security" | "code" | "settings" | "db"
     sources: dict[str, str] = field(default_factory=dict)
@@ -126,6 +127,28 @@ class ResolvedPolicy:
     # "code", "pack:<name>", or "db" for a policy defined in the console.
     origin: str = "code"
     extends: list[str] = field(default_factory=list)
+
+    def changes_answer_at_finish(self) -> list[str]:
+        """The enforced rules that may mask or withhold the answer at finish, by name."""
+        finished = {
+            lens.name
+            for lens in self.active_lenses(Stage.FINISH)
+            if lens.subject in {Subject.OUTPUT, Subject.EXCHANGE}
+        }
+        return sorted(
+            rule.name
+            for rule in self.rules.values()
+            if rule.mode is Mode.ENFORCE
+            and any(action.kind in {"mask", "block"} for action in rule.then)
+            and rule.lenses() & finished
+            and (not rule.stages or Stage.FINISH in rule.stages)
+        )
+
+    def holds(self) -> bool:
+        """Whether the answer is held until finish passed it: always, never, or when needed."""
+        if self.stream_mode == "auto":
+            return bool(self.changes_answer_at_finish())
+        return self.stream_mode == "hold"
 
     def active_lenses(self, stage: Stage, subject: Subject | None = None) -> list[Lens]:
         return [
@@ -163,6 +186,7 @@ class ResolvedPolicy:
             "extends": list(self.extends),
             "capture": str(self.capture),
             "stream_mode": self.stream_mode,
+            "holds": self.holds(),
             "retention": dict(self.retention),
             "lenses": [
                 {
@@ -418,13 +442,13 @@ def apply_overlay(
 def console_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """`entry` with every answerer in it as the console may write it; ValueError otherwise."""
     from django_ai_sdk.oversight.answerers.base import console_config
-    from django_ai_sdk.oversight.catalog import ALIAS_KINDS, INLINE_KINDS
+    from django_ai_sdk.oversight.catalog import INLINE_KINDS, alias_kinds
 
     kind, key, value = entry["target_kind"], entry["field"], entry.get("value")
     if value is None:
         return entry
     if kind == "answerer":
-        value = console_config(value, kinds=ALIAS_KINDS)
+        value = console_config(value, kinds=alias_kinds())
     elif kind == "lens" and key == "answerers":
         value = [console_config(spec, kinds=INLINE_KINDS) for spec in value]
     elif kind == "lens" and key == "definition":

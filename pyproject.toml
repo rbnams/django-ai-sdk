@@ -48,7 +48,7 @@ Issues = "https://github.com/django-ai-sdk/django-ai-sdk/issues"
 Changelog = "https://github.com/django-ai-sdk/django-ai-sdk/releases"
 
 [project.optional-dependencies]
-all = ["django-ai-sdk[haystack,rag,mcp,files,providers,transformers,automations,typesafe,oversight]"]
+all = ["django-ai-sdk[haystack,rag,mcp,files,providers,transformers,automations,local,oversight]"]
 # Automations only schedule by cron, so APScheduler's CronTrigger — used for parsing
 # and DST-correct next-occurrence math, not as a running scheduler — is only needed
 # once you declare one.
@@ -87,6 +87,8 @@ openrouter = ["openrouter-haystack>=2.0.0"]
 transformers = ["transformers-haystack>=2.0.0"]
 # TypeSafe, a hosted answerer for oversight: typed judgments, not a chat generator.
 typesafe = ["typesafe-sdk>=0.5.7"]
+# LocalClassifier: an ONNX model in this process for oversight lenses, without torch.
+local = ["onnxruntime>=1.18", "tokenizers>=0.19", "huggingface-hub>=0.23", "numpy>=1.26"]
 # Oversight's encrypted evidence (crypto-shredding) and signed ledger checkpoints.
 # Without it the ledger still chains and verifies; content is stored in the clear.
 oversight = ["cryptography>=44"]

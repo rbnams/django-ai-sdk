@@ -1008,9 +1008,12 @@ all = [
     { name = "firecrawl-anydoc" },
     { name = "haystack-ai" },
     { name = "huggingface-api-haystack" },
+    { name = "huggingface-hub" },
     { name = "mcp-haystack" },
     { name = "mistral-haystack" },
+    { name = "numpy" },
     { name = "ollama-haystack" },
+    { name = "onnxruntime" },
     { name = "openpyxl" },
     { name = "openrouter-haystack" },
     { name = "pdf-inspector" },
@@ -1019,8 +1022,8 @@ all = [
     { name = "python-docx" },
     { name = "python-pptx" },
     { name = "qdrant-haystack" },
+    { name = "tokenizers" },
     { name = "transformers-haystack" },
-    { name = "typesafe-sdk" },
 ]
 anthropic = [
     { name = "anthropic-haystack" },
@@ -1054,6 +1057,12 @@ haystack = [
 ]
 huggingface = [
     { name = "huggingface-api-haystack" },
+]
+local = [
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "onnxruntime" },
+    { name = "tokenizers" },
 ]
 mcp = [
     { name = "authlib" },
@@ -1139,7 +1148,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'oversight'", specifier = ">=44" },
     { name = "django", specifier = ">=5.2.6,<6.2" },
     { name = "django-ai-sdk", extras = ["anthropic", "huggingface", "mistral", "ollama", "openrouter"], marker = "extra == 'providers'" },
-    { name = "django-ai-sdk", extras = ["automations", "files", "haystack", "mcp", "oversight", "providers", "rag", "transformers", "typesafe"], marker = "extra == 'all'" },
+    { name = "django-ai-sdk", extras = ["automations", "files", "haystack", "local", "mcp", "oversight", "providers", "rag", "transformers"], marker = "extra == 'all'" },
     { name = "django-ai-sdk", extras = ["chroma", "qdrant"], marker = "extra == 'rag'" },
     { name = "django-ai-sdk", extras = ["embeddings"], marker = "extra == 'chroma'" },
     { name = "django-ai-sdk", extras = ["embeddings"], marker = "extra == 'qdrant'" },
@@ -1153,10 +1162,13 @@ requires-dist = [
     { name = "haystack-ai", marker = "extra == 'haystack'", specifier = ">=3.4.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "huggingface-api-haystack", marker = "extra == 'huggingface'", specifier = ">=3.1.0" },
+    { name = "huggingface-hub", marker = "extra == 'local'", specifier = ">=0.23" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "mcp-haystack", marker = "extra == 'mcp'", specifier = ">=2.1.0" },
     { name = "mistral-haystack", marker = "extra == 'mistral'", specifier = ">=3.0.0" },
+    { name = "numpy", marker = "extra == 'local'", specifier = ">=1.26" },
     { name = "ollama-haystack", marker = "extra == 'ollama'", specifier = ">=7.0.2" },
+    { name = "onnxruntime", marker = "extra == 'local'", specifier = ">=1.18" },
     { name = "openpyxl", marker = "extra == 'files'", specifier = ">=3.1.5" },
     { name = "openrouter-haystack", marker = "extra == 'openrouter'", specifier = ">=2.0.0" },
     { name = "pdf-inspector", marker = "extra == 'files'", specifier = ">=1.25.2" },
@@ -1168,10 +1180,11 @@ requires-dist = [
     { name = "python-pptx", marker = "extra == 'files'", specifier = ">=1.0.2" },
     { name = "qdrant-haystack", marker = "extra == 'qdrant'", specifier = ">=13.0.0" },
     { name = "tenacity", specifier = ">=9.2.1" },
+    { name = "tokenizers", marker = "extra == 'local'", specifier = ">=0.19" },
     { name = "transformers-haystack", marker = "extra == 'transformers'", specifier = ">=2.0.0" },
     { name = "typesafe-sdk", marker = "extra == 'typesafe'", specifier = ">=0.5.7" },
 ]
-provides-extras = ["all", "automations", "providers", "rag", "haystack", "mcp", "ninja", "drf", "files", "embeddings", "chroma", "qdrant", "anthropic", "huggingface", "mistral", "ollama", "openrouter", "transformers", "typesafe", "oversight"]
+provides-extras = ["all", "automations", "providers", "rag", "haystack", "mcp", "ninja", "drf", "files", "embeddings", "chroma", "qdrant", "anthropic", "huggingface", "mistral", "ollama", "openrouter", "transformers", "typesafe", "local", "oversight"]
 
 [package.metadata.requires-dev]
 dev = [

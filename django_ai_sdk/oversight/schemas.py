@@ -248,6 +248,8 @@ class PolicyOut(BaseModel):
     extends: list[str] = Field(default_factory=list)
     capture: str
     stream_mode: str
+    # Whether this policy holds the answer now: "auto" holds it while a rule needs to.
+    holds: bool = False
     retention: dict[str, int] = Field(default_factory=dict)
     # A lens's or rule's fields depend on its kind.
     lenses: list[dict[str, Any]] = Field(default_factory=list)

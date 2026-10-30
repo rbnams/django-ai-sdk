@@ -10,7 +10,7 @@ from django.test import AsyncClient, override_settings
 from django.urls import path
 from django_ai_sdk.oversight.models import AccessRecord, PolicyOverride, Turn
 from django_ai_sdk.oversight.policy import invalidate
-from django_ai_sdk.oversight.session import agent_key
+from django_ai_sdk.oversight.attach import agent_key
 from tests.factories.db import UserFactory
 from tests.unit.test_oversight_console import BLOCK_WORD
 from tests.unit.test_oversight_service import a_turn

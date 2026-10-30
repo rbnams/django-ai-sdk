@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
-from django_ai_sdk.oversight.answerers.base import TOO_LONG, Answerer, clip
+from django_ai_sdk.oversight.answerers.base import TOO_LONG, Answerer, clip, param
 from django_ai_sdk.oversight.answerers.pii import mask_secrets
 from django_ai_sdk.oversight.types import Answer, Subject
 from django_ai_sdk.pricing import cost_for, usage_from_meta
@@ -60,7 +62,7 @@ answer, say so in the rationale and give a low confidence."""
 # Per field, the most a judge is shown: characters of the question, the answer and
 # each source, and how many sources and earlier messages. Long texts are cut, not dropped.
 DEFAULT_LIMITS = {"input": 6_000, "output": 8_000, "source": 1_500, "sources": 8, "history": 6}
-# Characters of each earlier message shown; TypeSafe's state uses the same.
+# Characters of each earlier message shown; classifiers read as many.
 HISTORY_ITEM_CHARS = 500
 # Characters of a source's title or a tool's name.
 TITLE_CHARS = 200
@@ -174,23 +176,55 @@ def parse_json_reply(text: str) -> dict[str, Any] | None:
 class LLMJudge(Answerer):
     """A chat model as an answerer, built with any SDK generator factory.
 
-        LLMJudge(model="gpt-4.1-mini")                                   # OpenAI
+        LLMJudge(model="gpt-4.1-mini")                          # the default gateway
+        LLMJudge(model="llama3.2", endpoint="ollama")           # an ENDPOINTS entry
+        LLMJudge(model="qwen3:4b", base_url="http://localhost:8000/v1")  # any OpenAI-compatible server
         LLMJudge(llm="django_ai_sdk.generators.anthropic_chat", model="claude-haiku-4-5")
-        LLMJudge(llm="django_ai_sdk.generators.ollama_chat", model="llama3.2")  # on-prem
 
-    `llm` is the factory itself or its dotted path; it is called as `llm(model=...)`
-    exactly as Agent.get_llm calls it. Models without a structured-output kwarg are
+    `endpoint` names an AI_SDK_OVERSIGHT["ENDPOINTS"] entry; `base_url` and
+    `api_key_env` (the environment variable, or else Django setting, holding the key)
+    give one directly. Either way the judge speaks Chat Completions, which Ollama,
+    vLLM, LM Studio, llama.cpp and most gateways serve; a server without a key gets a
+    placeholder. Without them it uses the default gateway (OPENAI_API_URL and
+    OPENAI_API_KEY). `llm` is a generator factory or its dotted path, called as
+    `llm(model=...)` exactly as Agent.get_llm calls it, plus `api_base_url` and
+    `api_key` when a server is given. Models without a structured-output kwarg are
     asked for JSON and parsed.
     """
 
     external: ClassVar[str] = "model gateway"
     timeout = JUDGE_TIMEOUT
+    console: ClassVar[dict[str, Any] | None] = {
+        "label": "Model judge",
+        "summary": "A chat model reads the question and answers it with a value, a confidence "
+        "and a reason: any model your gateway, or a server of your own, serves.",
+        "params": [
+            param("model", "model", "Model", "Which chat model judges.", required=True),
+            param(
+                "endpoint",
+                "choice",
+                "Server",
+                "Empty: the default gateway. Others are defined in settings.",
+                choices=[],
+            ),
+            param(
+                "timeout",
+                "number",
+                "Timeout (seconds)",
+                "After this the answer counts as failed.",
+                default=45,
+            ),
+        ],
+    }
 
     def __init__(
         self,
         model: str | None = None,
         *,
         llm: Callable[..., Any] | str | None = None,
+        endpoint: str = "",
+        base_url: str = "",
+        api_key_env: str = "",
         instructions: str = JUDGE_INSTRUCTIONS,
         generation_kwargs: dict[str, Any] | None = None,
         timeout: float | None = None,
@@ -198,6 +232,9 @@ class LLMJudge(Answerer):
     ) -> None:
         self.model = model
         self.llm = llm
+        self.endpoint = endpoint
+        self.base_url = base_url
+        self.api_key_env = api_key_env
         self.instructions = instructions
         self.generation_kwargs = generation_kwargs or {}
         if timeout is not None:
@@ -206,18 +243,54 @@ class LLMJudge(Answerer):
         self._generator: Any = None
 
     def describe(self) -> dict[str, Any]:
-        return {**super().describe(), "model": self.model or ""}
+        return {**super().describe(), "model": self.model or "", "endpoint": self.endpoint}
+
+    def server(self) -> tuple[str, str]:
+        """The base url and the key's variable this judge uses; ("", "") for the default gateway."""
+        base_url, key_env = self.base_url, self.api_key_env
+        if self.endpoint:
+            from django_ai_sdk.oversight.conf import setting
+
+            config = setting("ENDPOINTS").get(self.endpoint)
+            if not isinstance(config, dict) or not config.get("base_url"):
+                raise ImproperlyConfigured(
+                    f"No endpoint {self.endpoint!r}; add it to AI_SDK_OVERSIGHT['ENDPOINTS']"
+                )
+            base_url = base_url or str(config["base_url"])
+            key_env = key_env or str(config.get("api_key_env") or "")
+        return base_url, key_env
+
+    def missing(self) -> str:
+        try:
+            _, key_env = self.server()
+        except ImproperlyConfigured as exc:
+            return str(exc)
+        if key_env and not _key(key_env):
+            return f"{key_env} is not set"
+        return ""
 
     def get_generator(self) -> Any:
         if self._generator is None:
             factory = self.llm
             if isinstance(factory, str):
                 factory = import_string(factory)
+            base_url, key_env = self.server()
+            kwargs: dict[str, Any] = {"model": self.model} if self.model else {}
+            if base_url:
+                from haystack.utils import Secret
+
+                # A local server usually wants no key, but the OpenAI client wants one.
+                key = _key(key_env) if key_env else "none"
+                kwargs |= {"api_base_url": base_url, "api_key": Secret.from_token(key or "none")}
+                if factory is None:
+                    from django_ai_sdk.generators import openai_chat
+
+                    factory = openai_chat
             if factory is None:
                 from django_ai_sdk.generators import openai_responses_chat
 
                 factory = openai_responses_chat
-            self._generator = factory(model=self.model) if self.model else factory()
+            self._generator = factory(**kwargs)
         return self._generator
 
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
@@ -225,6 +298,10 @@ class LLMJudge(Answerer):
 
         from django_ai_sdk.generators.schema import schema_kwargs
 
+        if self.missing():
+            # Its server is gone from settings, or its key is unset: step aside, never
+            # send a placeholder key that fails as an outage and is asked again forever.
+            return None
         if too_long(lens, view):
             return Answer(error=TOO_LONG, answerer=self.label())
         generator = self.get_generator()
@@ -265,6 +342,13 @@ class LLMJudge(Answerer):
 
     def _model_name(self, reply: Any) -> str:
         return str((reply.meta or {}).get("model") or self.model or "")
+
+
+def _key(name: str) -> str:
+    """The key in environment variable `name`, or else in the Django setting of that name."""
+    from django_ai_sdk.utils import resolve_setting
+
+    return os.environ.get(name) or str(resolve_setting(name, "") or "")
 
 
 def _unit(value: Any, default: float) -> float:

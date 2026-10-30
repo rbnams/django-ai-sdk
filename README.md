@@ -144,7 +144,7 @@ except Blocked as refused:
 ```
 
 `prompt_injection` is answered by whatever your deployment maps to the `classifier`
-alias (a model judge, or the optional hosted TypeSafe service); without one it is
+alias (a local classifier, a model judge or a classifier service); without one it is
 skipped and a system check says so. Personal data is found by checksum, in-process.
 Each agent runs under its own policy: a subagent or a nested `run()` under another
 policy opens a child turn of its own. See the [Oversight guide](docs/content/oversight.md).

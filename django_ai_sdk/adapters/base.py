@@ -1038,11 +1038,7 @@ class Stream:
                 turn_artifacts.reset(artifacts_token)
             pipeline_task.add_done_callback(lambda _: queue.put_nowait(_SENTINEL))
 
-            hold = (
-                session is not None
-                and session.policy is not None
-                and (session.policy.stream_mode == "hold")
-            )
+            hold = session is not None and session.policy is not None and session.policy.holds()
             registry = self.citation_registry
             if registry is not None and self.thread_id and self.citation_agent and stream_writer:
                 # Held answers show no citations as they stream: a block must hide them too.

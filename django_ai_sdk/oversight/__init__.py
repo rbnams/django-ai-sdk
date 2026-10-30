@@ -38,8 +38,8 @@ Lenses observe, rules act; a rule starts in report mode, recording what it would
 have done. Use `@register` for a policy no agent class names. See
 docs/content/oversight.md.
 
-Only the declaration API is re-exported here. Specialised detectors and vendor
-answerers (TypeSafe) live in `django_ai_sdk.oversight.answerers`, the built-in
+Only the declaration API is re-exported here. Specialised detectors, classifiers
+and service answerers live in `django_ai_sdk.oversight.answerers`, the built-in
 packs in `django_ai_sdk.oversight.packs`; models, services and tasks in their own
 modules, so importing this package needs no app registry.
 """

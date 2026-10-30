@@ -5,13 +5,16 @@ AI_SDK_OVERSIGHT = {
     # Named answerers. The built-in packs name "classifier?" and "judge?": optional,
     # so a lens whose aliases are all undefined is skipped, never an error.
     "ANSWERERS": {
-        # Yes/no, label and score lenses: a small model, or a hosted classifier such
-        # as {"class": "TypeSafe"} (django-ai-sdk[typesafe] and a TYPESAFE_API_KEY).
+        # Yes/no, label and score lenses: a small model in this process
+        # ({"class": "LocalClassifier"}), a model judge, or a hosted classifier.
         "classifier": {"class": "LLMJudge", "model": "gpt-4.1-mini"},
+        # A model on your own server (an ENDPOINTS entry): nothing leaves your network.
+        "ollama": {"class": "LLMJudge", "model": "llama3.2", "endpoint": "ollama"},
         # A chat model for text lenses and second opinions, and a stronger one.
         "judge": {"class": "LLMJudge", "model": "gpt-4.1-mini"},
         "strong": {"class": "LLMJudge", "model": "gpt-4.1"},
     },
+    "ENDPOINTS": {"ollama": {"base_url": "http://localhost:11434/v1", "label": "Ollama"}},
     "BUDGET_PER_DAY": 5.0,
     "CURRENCY": "USD",
 }
@@ -42,13 +45,18 @@ DEFAULTS: dict[str, Any] = {
     # The most content the ledger keeps; a policy may keep less, never more. "masked"
     # keeps text with every mask a rule found applied; "full" keeps it as it was.
     "CAPTURE": Capture.MASKED,
-    # "live" streams the answer as it comes; "hold" shows it once finish passed it.
-    "STREAM_MODE": "live",
+    # "live" streams the answer as it comes; "hold" shows it once finish passed it;
+    # "auto" holds it only while an enforced rule may mask or withhold it at finish.
+    "STREAM_MODE": "auto",
     # Per policy, the same tuning the console's overlay allows, kept in settings:
     # {"support": {"rules": {"block_injection": {"mode": "enforce"}}, "capture": "masked"}}
     "POLICIES": {},
     # Named answerers, so a lens says "judge" and settings say which model that is.
     "ANSWERERS": {},
+    # The answerer classes the console offers to name, each by its `console` form:
+    # SDK class names ("LLMJudge") and dotted paths of your own. None: the SDK's
+    # (catalog.SDK_KINDS); a list replaces them, so a host can leave any out.
+    "ANSWERER_KINDS": None,
     # Spend cap for model answerers across the deployment, per UTC day. None: no cap.
     "BUDGET_PER_DAY": None,
     # The currency AI_SDK_MODEL_PRICES and BUDGET_PER_DAY are in: a label, never converted.
@@ -91,9 +99,15 @@ DEFAULTS: dict[str, Any] = {
     "LOG_ORIGIN": "",
     # Dotted paths or instances of Exporter, sent every decision that notifies.
     "EXPORTERS": [],
-    # Models the console offers for judges: a list of {"id", "label", "group", "kinds"},
-    # or the dotted path of a function that returns one (say, a gateway's /models).
+    # Models the console offers for judges: a list of {"id", "label", "group", "kinds",
+    # "endpoint"}, or the dotted path of a function that returns one, such as
+    # "django_ai_sdk.oversight.catalog.endpoint_models" (every server's /models).
     "MODEL_CHOICES": [],
+    # OpenAI-compatible servers a judge may use besides the default gateway, by name:
+    # {"ollama": {"base_url": "http://localhost:11434/v1", "api_key_env": "", "label": "Ollama"}}.
+    # A judge names one (LLMJudge(endpoint="ollama")). The console only picks a name,
+    # so it never writes a url, nor names a key.
+    "ENDPOINTS": {},
     # Seconds a resolved policy (code + database overlay) is reused per process.
     "POLICY_CACHE_SECONDS": 10,
 }

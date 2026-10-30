@@ -377,7 +377,7 @@ class TestPolicyFields:
             [{"target_kind": "policy", "target": "", "field": "stream_mode", "value": "held"}],
             source="db",
         )
-        assert resolved.stream_mode == "live"
+        assert resolved.stream_mode == "auto"
         assert "stream_mode 'held'" in resolved.rejected[0]["reason"]
 
     @override_settings(AI_SDK_OVERSIGHT={"STREAM_MODE": "held"})

@@ -237,7 +237,7 @@ def _batching(lenses: list[Lens]) -> list[Any]:
     """The `batched(deadline_ms)` of each answerer these lenses may ask, where it has one.
 
     Inside it, such an answerer collects what the stage's lenses ask of it and may
-    send that together (TypeSafe: one request per state).
+    send that together (a Classifier: one call per state).
     """
     found: list[Any] = []
     for lens in lenses:
@@ -263,7 +263,7 @@ def _at_deadline(asked: list[Answer]) -> Answer:
 def lens_health(lens: Lens) -> dict[str, Any]:
     """Whether `lens` can run on this deployment, and what in it never will.
 
-    runnable: some answerer is usable here (one with nothing `missing()`: TypeSafe
+    runnable: some answerer is usable here (one with nothing `missing()`: a service
     only with its key and package).
     skipped: optional aliases that are not defined. unreachable: answerers after a
     detector whose "found nothing" is already sure enough to stop at, and

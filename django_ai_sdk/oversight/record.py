@@ -1,6 +1,6 @@
 """Writing a closed turn: its evidence, the turn row, answers and decisions, chained.
 
-TurnSession.close() hands the session to `_persist`, in one transaction; reflect and
+TurnSession.close() hands the session to `persist_turn`, in one transaction; reflect and
 a person's verdict add their answers later through `tasks.record`.
 
 Everything that can quote the turn lives with its evidence: judges' reasons, `Text`
@@ -59,7 +59,7 @@ FOUND = "[found]"
 MIN_LITERAL = 3
 
 
-def _source(item: Any) -> Source:
+def as_source(item: Any) -> Source:
     if isinstance(item, Source):
         return item
     if isinstance(item, dict):
@@ -252,7 +252,7 @@ def _detectors() -> tuple[Any, ...]:
 _CAPTURED = Entities(name="captured")
 
 
-def _persist(session: TurnSession) -> str:
+def persist_turn(session: TurnSession) -> str:
     """Write evidence, turn, observations and decisions, chained, in one transaction.
 
     A forgotten thread keeps no new content, nor what judges said about it, nor who
@@ -597,11 +597,13 @@ def _enqueue_reflect(turn_id: Any) -> None:
 __all__ = [
     "FOUND",
     "Masker",
+    "as_source",
     "build_observations",
     "evidence_content",
     "found_literals",
     "keeper",
     "mask_detected",
+    "persist_turn",
     "record_judgments",
     "split_answer",
     "stored_value",

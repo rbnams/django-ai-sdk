@@ -293,30 +293,16 @@ def _rejected_settings(name: str, resolved: Any) -> list[Any]:
 
 def _live_checks(name: str, resolved: Any) -> list[Any]:
     """An enforced finish mask or block on the answer, while the answer streams live."""
-    from django_ai_sdk.oversight.types import Mode, Stage, Subject
-
     if resolved.stream_mode != "live":
         return []
-    finished = {
-        lens.name
-        for lens in resolved.active_lenses(Stage.FINISH)
-        if lens.subject in {Subject.OUTPUT, Subject.EXCHANGE}
-    }
-    acting = sorted(
-        rule.name
-        for rule in resolved.rules.values()
-        if rule.mode is Mode.ENFORCE
-        and any(action.kind in {"mask", "block"} for action in rule.then)
-        and rule.lenses() & finished
-        and (not rule.stages or Stage.FINISH in rule.stages)
-    )
+    acting = resolved.changes_answer_at_finish()
     if not acting:
         return []
     return [
         Warning(
             f"Policy {name!r} masks or withholds the answer at finish ({', '.join(acting)}), "
             "but streams it live: the client has the text before finish judges it.",
-            hint="Set stream_mode 'hold' on the policy (or AI_SDK_OVERSIGHT['STREAM_MODE']), "
+            hint="Set stream_mode 'auto' or 'hold' on the policy (or AI_SDK_OVERSIGHT['STREAM_MODE']), "
             "or use a client that applies the data-oversight 'replace'.",
             id=f"{PREFIX}.W011",
         )

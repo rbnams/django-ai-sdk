@@ -37,6 +37,19 @@ UNAVAILABLE = "unavailable"
 TOO_LONG = "too long"
 
 
+def param(name: str, type: str, label: str, help: str = "", **extra: Any) -> dict[str, Any]:
+    """One field of a console form. Types the editor renders: text, number, bool, choice
+    (from `choices`), multi (several of `choices`), lines, labelled_lines, model."""
+    return {"name": name, "type": type, "label": label, "help": help, **extra}
+
+
+def modules_installed(*modules: str) -> bool:
+    """Whether every one of `modules` can be imported, without importing it."""
+    from importlib.util import find_spec
+
+    return all(find_spec(module) is not None for module in modules)
+
+
 def unavailable(exc: BaseException) -> str:
     """The error an answer carries when an external answerer failed with `exc`."""
     return f"{UNAVAILABLE}: {type(exc).__name__}"
@@ -52,12 +65,21 @@ class Answerer(ABC):
 
     # Charged to and capped by the model budget. Set on the class; Function sets it per instance.
     metered: bool = True
-    # Who receives turn content when this answerer runs ("TypeSafe", "model gateway").
+    # Who receives turn content when this answerer runs ("model gateway", a service's name).
     # Empty: it runs in this process and nothing leaves.
     external: ClassVar[str] = ""
     # Seconds before the answer is abandoned.
     timeout: float = DEFAULT_TIMEOUT
     name: str = ""
+    # How the console offers this class as a named answerer, or None when it does not:
+    # {"label", "summary", "params": [param(...)]}. The SDK's own answerers and the
+    # classes in AI_SDK_OVERSIGHT["ANSWERER_KINDS"] are offered alike.
+    console: ClassVar[dict[str, Any] | None] = None
+
+    @classmethod
+    def installed(cls) -> bool:
+        """Whether what this class needs is installed, so the console may offer it."""
+        return True
 
     @abstractmethod
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None: ...
@@ -342,6 +364,14 @@ def console_config(config: Any, *, kinds: list[dict[str, Any]]) -> str | dict[st
     extra = sorted(set(config) - allowed)
     if extra:
         raise ValueError(f"{short} does not take {', '.join(extra)} from the console")
+    for param in kind["params"]:
+        # A choice is one the kind offers: say, a judge's server is one settings define.
+        value, choices = config.get(param["name"]), param.get("choices")
+        if value is None or choices is None or param["type"] not in {"choice", "multi"}:
+            continue
+        picked = value if isinstance(value, list) else [value]
+        if any(v not in choices for v in picked):
+            raise ValueError(f"{value!r} is not a {param['label'].lower()} the console offers")
     return {**config, "class": short}
 
 
@@ -369,6 +399,8 @@ __all__ = [
     "build_alias",
     "console_config",
     "is_unavailable",
+    "modules_installed",
+    "param",
     "resolve",
     "sampled",
     "set_console_aliases",

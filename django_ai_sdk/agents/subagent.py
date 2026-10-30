@@ -378,7 +378,8 @@ class SubagentStreamFilter:
 
         if not is_enabled():
             return False
-        from django_ai_sdk.oversight.session import code_policy, current_session
+        from django_ai_sdk.oversight.attach import code_policy
+        from django_ai_sdk.oversight.session import current_session
 
         try:
             own = code_policy(self._subagent)[0]

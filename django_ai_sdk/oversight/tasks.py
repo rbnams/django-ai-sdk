@@ -223,7 +223,7 @@ async def _judge(
         for lens in policy.active_lenses(Stage.REFLECT)
         if _judgeable(lens, content, has_text, answered=answered)
     ]
-    # A lens that ran out of time inline, or found TypeSafe down, is answered here: late, not lost.
+    # A lens that ran out of time inline, or found its service down, is answered here: late, not lost.
     timed_out = {
         o.lens
         for o in existing
