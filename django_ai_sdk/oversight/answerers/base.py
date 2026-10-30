@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import re
 import time
 from abc import ABC, abstractmethod
@@ -23,17 +24,39 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Seconds an answerer may take before its answer is abandoned, unless it sets its own.
+DEFAULT_TIMEOUT = 30.0
+
+# The error of an answer whose service failed: down, refused, or broke on its side
+# ("unavailable: ConnectionError"). Reflect asks such a lens again: late, not lost.
+UNAVAILABLE = "unavailable"
+
+
+# The error of an answer whose answerer would have had to cut the text it judges:
+# it judged none of it, so FAIL_MODE decides, as for any failure.
+TOO_LONG = "too long"
+
+
+def unavailable(exc: BaseException) -> str:
+    """The error an answer carries when an external answerer failed with `exc`."""
+    return f"{UNAVAILABLE}: {type(exc).__name__}"
+
+
+def is_unavailable(error: str) -> bool:
+    """Whether `error` says the answerer's service failed, so asking again later may work."""
+    return error.startswith(f"{UNAVAILABLE}: ")
+
 
 class Answerer(ABC):
     """Answers lenses. Return None to abstain: the next answerer, if any, is asked."""
 
-    # Charged to and capped by the model budget.
-    metered: ClassVar[bool] = True
+    # Charged to and capped by the model budget. Set on the class; Function sets it per instance.
+    metered: bool = True
     # Who receives turn content when this answerer runs ("TypeSafe", "model gateway").
     # Empty: it runs in this process and nothing leaves.
     external: ClassVar[str] = ""
     # Seconds before the answer is abandoned.
-    timeout: float = 30.0
+    timeout: float = DEFAULT_TIMEOUT
     name: str = ""
 
     @abstractmethod
@@ -41,6 +64,10 @@ class Answerer(ABC):
 
     def label(self) -> str:
         return self.name or type(self).__name__.lower()
+
+    def missing(self) -> str:
+        """Why this answerer can't run on this deployment, so it abstains; "" when it can."""
+        return ""
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -54,14 +81,26 @@ class Answerer(ABC):
         return f"<{type(self).__name__} {self.label()!r}>"
 
 
-async def ask(answerer: Answerer, lens: Lens, view: TurnView) -> Answer | None:
+async def ask(
+    answerer: Answerer | str | dict[str, Any], lens: Lens, view: TurnView
+) -> Answer | None:
     """Ask one answerer, timed, typed and contained: a failure is an Answer with `error`.
 
-    A metered answerer is charged to the active Budget, and refused once it is spent.
+    `answerer` may be a spec (`resolve`): one that does not build is an error too, so
+    the answers the lens already has are kept. A metered answerer is charged to the
+    active Budget, and refused once it is spent. An external answerer that raises is
+    `unavailable`: its service failed, not the lens. An answerer that cancels itself
+    (we did not cancel it) has failed; a cancellation from outside passes through.
     """
     from django_ai_sdk.oversight import budget
 
     started = time.perf_counter()
+    label = _spec_label(answerer)
+    try:
+        answerer = resolve(answerer)
+    except Exception as exc:
+        logger.warning("Answerer {} for lens {} does not build: {}", label, lens.name, exc)
+        return Answer(answerer=label, error=type(exc).__name__)
     spend = budget.current() if answerer.metered else None
     if spend is not None and not spend.allows():
         return Answer(answerer=answerer.label(), error="budget")
@@ -69,24 +108,61 @@ async def ask(answerer: Answerer, lens: Lens, view: TurnView) -> Answer | None:
         answer = await asyncio.wait_for(answerer.answer(lens, view), timeout=answerer.timeout)
     except TimeoutError:
         return Answer(answerer=answerer.label(), error="timeout", latency_ms=_ms(started))
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise
+        logger.warning("Answerer {} cancelled itself on lens {}", answerer.label(), lens.name)
+        return Answer(answerer=answerer.label(), error="CancelledError", latency_ms=_ms(started))
     except Exception as exc:
-        logger.opt(exception=exc).warning(
-            "Answerer {} failed on lens {}", answerer.label(), lens.name
-        )
-        return Answer(answerer=answerer.label(), error=type(exc).__name__, latency_ms=_ms(started))
+        if answerer.external:
+            # Only the type: a service's error message may quote the request or its reply.
+            logger.warning(
+                "Answerer {} failed on lens {}: {}", answerer.label(), lens.name, type(exc).__name__
+            )
+            error = unavailable(exc)
+        else:
+            logger.opt(exception=exc).warning(
+                "Answerer {} failed on lens {}", answerer.label(), lens.name
+            )
+            error = type(exc).__name__
+        return Answer(answerer=answerer.label(), error=error, latency_ms=_ms(started))
     if answer is None:
         return None
+    if not isinstance(answer, Answer):
+        logger.warning(
+            "Answerer {} answered lens {} with a {}, not an Answer",
+            answerer.label(),
+            lens.name,
+            type(answer).__name__,
+        )
+        return Answer(
+            answerer=answerer.label(),
+            error=f"not an answer: {type(answer).__name__}",
+            latency_ms=_ms(started),
+        )
     if spend is not None:
         spend.charge(answerer.label(), answer.cost)
     if answer.value is not None and not answer.error:
         try:
             answer.value = lens.parse(answer.value)
-        except (TypeError, ValueError) as exc:
-            answer = answer.model_copy(update={"value": None, "error": f"unparsable: {exc}"})
+        except Exception as exc:
+            # Only the kind of failure: the error is hashed into the ledger, the value may quote.
+            answer = answer.model_copy(
+                update={"value": None, "error": f"unparsable: {type(exc).__name__}"}
+            )
     answer.answerer = answer.answerer or answerer.label()
     if answer.latency_ms is None:
         answer.latency_ms = _ms(started)
     return answer
+
+
+def _spec_label(spec: Any) -> str:
+    if isinstance(spec, Answerer):
+        return spec.label()
+    if isinstance(spec, dict):
+        return str(spec.get("name") or spec.get("class") or "answerer")
+    return str(spec)
 
 
 def _ms(started: float) -> float:
@@ -120,7 +196,9 @@ def sampled(key: str, rate: float) -> bool:
 class Function(Answerer):
     """Any function as an answerer: `fn(lens, view)` returns a value, an Answer, or None.
 
-    Sync or async. Not charged to the budget unless `metered=True` says it calls a model.
+    Sync or async. A sync function runs in a thread, so a slow one cannot hold the
+    event loop past a stage's deadline. Not charged to the budget unless
+    `metered=True` says it calls a model.
     """
 
     def __init__(
@@ -135,15 +213,14 @@ class Function(Answerer):
             fn = import_string(fn)
         self.fn = fn
         self.name = name or getattr(fn, "__name__", "function")
-        self._metered = metered
-
-    @property
-    def metered(self) -> bool:  # ty: ignore[invalid-method-override]
-        return self._metered
+        self.metered = metered
 
     async def answer(self, lens: Lens, view: TurnView) -> Answer | None:
-        result = self.fn(lens, view)
-        if asyncio.iscoroutine(result):
+        if inspect.iscoroutinefunction(self.fn):
+            result = await self.fn(lens, view)
+        else:
+            result = await asyncio.to_thread(self.fn, lens, view)
+        if inspect.isawaitable(result):
             result = await result
         if result is None or isinstance(result, Answer):
             return result
@@ -239,7 +316,7 @@ def _from_config(config: dict[str, Any]) -> Answerer:
 
 
 SDK_ANSWERERS = "django_ai_sdk.oversight.answerers."
-# An alias, optionally skipped where missing ("jev?"), or a code-built answerer ("code:0").
+# An alias, optionally skipped where missing ("classifier?"), or a code-built answerer ("code:0").
 CONSOLE_SPEC = re.compile(r"^[a-z0-9_-]+\??$|^code:\d+$")
 
 
@@ -280,6 +357,9 @@ BUILTIN_ALIASES: dict[str, Callable[[], Answerer]] = {"human": _human}
 
 __all__ = [
     "BUILTIN_ALIASES",
+    "DEFAULT_TIMEOUT",
+    "TOO_LONG",
+    "UNAVAILABLE",
     "Answerer",
     "Function",
     "alias_defined",
@@ -288,7 +368,9 @@ __all__ = [
     "ask",
     "build_alias",
     "console_config",
+    "is_unavailable",
     "resolve",
     "sampled",
     "set_console_aliases",
+    "unavailable",
 ]

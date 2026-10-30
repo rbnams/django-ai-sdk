@@ -23,7 +23,7 @@ from django_ai_sdk.contrib.ninja.schemas import (
     ThreadSourcesResponse,
     ThreadTracesResponse,
 )
-from django_ai_sdk.errors import NotFound
+from django_ai_sdk.errors import Blocked, NotFound
 from django_ai_sdk.memories.services import MemoryService
 from django_ai_sdk.permissions import Operation
 from django_ai_sdk.storage.services import (
@@ -134,7 +134,12 @@ async def run_thread(request: HttpRequest, thread_id: str, payload: ChatRequest)
     agent = await AgentService.get_agent(thread_id, user=request.user)
     await AgentService.has_perms(request.user, Operation.CHAT, agent=agent)
     chat_messages = agent.protocol_handler.to_chat_messages(payload.messages)
-    result = await agent.run(chat_messages, thread_id=thread_id, user=request.user)
+    try:
+        result = await agent.run(
+            chat_messages, thread_id=thread_id, user=request.user, channel="api"
+        )
+    except Blocked as blocked:
+        return RunResponse(result=blocked.message, thread_id=thread_id, blocked=True)
     return RunResponse(result=result, thread_id=thread_id)
 
 

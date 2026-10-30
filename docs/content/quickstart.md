@@ -45,11 +45,12 @@ allauth, DRF, django-cors-headers, a `django-tasks` backend - is a dependency of
 SDK either.
 
 ```bash
+pip install "django-ai-sdk[haystack]"
 ```
 
 The `haystack` extra pulls in Haystack and the components agents run on. That's all you need to start.
 
-Want the full set of extras (MCP, vector stores, document parsing, providers, TypeSafe)?
+Want the full set of extras (MCP, vector stores, document parsing, providers, oversight)?
 
 ```bash
 pip install "django-ai-sdk[all]"
@@ -67,7 +68,8 @@ Optional extras you can install narrowly:
 
 | Extra | Adds |
 | --- | --- |
-| `typesafe` | TypeSafe / Jev client for turn screening and tool gating |
+| `oversight` | `cryptography`, for [oversight](/oversight/)'s encrypted evidence and signed checkpoints |
+| `typesafe` | The client for oversight's optional `TypeSafe` answerer (a hosted commercial service) |
 | `rag` / `chroma` / `qdrant` | Vector stores |
 | `mcp` | MCP integrations |
 | `files` | Document parsers |

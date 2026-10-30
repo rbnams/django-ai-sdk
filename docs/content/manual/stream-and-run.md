@@ -128,12 +128,20 @@ handoff, where a lost result means a lost answer to the user mid-conversation.
 A headless run has no ongoing conversation to lose context from — the caller
 gets back whatever the last message says, cut short or not.
 
-{{< callout type="warning" >}}
-No shipped code calls `agent.run(tools=True)` yet — not in `django_ai_sdk`,
-not in the demo project. The mechanism is tested and correct, but there's no
-example to copy from; a workflow step that needs tool access is the obvious
-first real caller.
-{{< /callout >}}
+Webhooks (`run_inbound`) run their agent this way.
+
+Under an [oversight](../oversight/#agents-and-runs) policy, `Agent.run()` is one
+turn: the gate judges the history and the question before the work above starts,
+every tool call is checked before it runs (`OversightToolHook`, in
+`django_ai_sdk.agents.tool_agent.default_hooks(agent)`), every result is masked
+before the model reads it (`OversightToolResultHook`), and finish judges what the
+loop did before the answer is returned. A refusal raises
+`django_ai_sdk.errors.Blocked`.
+
+`stream_response()` called from your own view opens no turn: only `as_view()`
+does. A `get_pipeline_adapter()` that returns an adapter other than the SDK's
+`Stream` (or a subclass) gets the gate only; its answers are never watched or
+finished (`ai_sdk.oversight.W013` warns when the return annotation says so).
 
 ## Stream
 

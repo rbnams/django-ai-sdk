@@ -83,7 +83,7 @@ class Operation(StrEnum):
     # Decisions, checkpoints and the chain, never content.
     AUDIT_OVERSIGHT = "audit_oversight"
     # Learn who asked a turn. Always recorded with a reason.
-    REVEAL_ACTOR = "reveal_actor"
+    REVEAL_OVERSIGHT_ACTOR = "reveal_oversight_actor"
     # Tune policies, shred scopes, export.
     MANAGE_OVERSIGHT = "manage_oversight"
 
@@ -547,16 +547,18 @@ def _owned_by(owner_id: Any, user: UserType) -> bool:
 class OversightDefaultPermission(BasePermission):
     """Staff read, review and audit; only superusers reveal who asked or tune policy.
 
-    Reading the ledger is itself recorded, so this is who may look, not who may
-    look unseen. Split purposes between groups by overriding the `oversight`
-    domain, e.g. with IsInAllowedGroups per purpose.
+    Any staff user may read every user's turns, content included (what the ledger
+    captured), through the review and view purposes. Reading turns and reviews is
+    itself recorded, so this is who may look, not who may look unseen. Narrow it
+    by overriding the `oversight` domain in AI_SDK_PERMISSIONS, e.g. with
+    IsInAllowedGroups per purpose.
     """
 
     STAFF: frozenset[Operation] = frozenset(
         {Operation.VIEW_OVERSIGHT, Operation.REVIEW_OVERSIGHT, Operation.AUDIT_OVERSIGHT}
     )
     SUPERUSER: frozenset[Operation] = frozenset(
-        {Operation.REVEAL_ACTOR, Operation.MANAGE_OVERSIGHT}
+        {Operation.REVEAL_OVERSIGHT_ACTOR, Operation.MANAGE_OVERSIGHT}
     )
 
     async def has_permission(self, user: UserType, operation: Operation, **kwargs: Any) -> bool:

@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 def server_index(rag: Any) -> str:
     """Where a RAG's index lives when every process shares it (a server), else ""."""
     storage = getattr(getattr(rag, "config", None), "storage", None)
-    if getattr(storage, "is_server", False) is not True:
+    if storage is None or getattr(storage, "is_server", False) is not True:
         return ""
     return f"{storage.location}/{storage.extra.get('index', 'default')}"
 

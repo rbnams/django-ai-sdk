@@ -11,6 +11,7 @@ from asgiref.sync import async_to_sync
 from django_tasks import task
 
 from django_ai_sdk.common import ChatMessage
+from django_ai_sdk.errors import Blocked
 from django_ai_sdk.integrations.registry import get_integrations
 from django_ai_sdk.integrations.webhooks.base import (
     InboundEvent,
@@ -18,6 +19,7 @@ from django_ai_sdk.integrations.webhooks.base import (
     current_event,
 )
 from django_ai_sdk.memories.services import MemoryService
+from django_ai_sdk.oversight.types import Stage
 from django_ai_sdk.utils import resolve_setting
 
 if TYPE_CHECKING:
@@ -77,48 +79,27 @@ async def run_inbound(payload: dict[str, Any]) -> None:
     user_message = ChatMessage(role="user", content=event.text)
     messages = [*history, user_message]
 
-    from django_ai_sdk.oversight.session import TurnSession
-    from django_ai_sdk.oversight.session import active as oversee
-
-    # The same gate chat has: a refused question gets the policy's message and is
-    # never stored or sent to the model.
-    oversight = await TurnSession.start(
-        agent,
-        channel=f"webhook:{event.integration}",
-        user=principal,
-        thread_id=thread_id,
-        messages=messages,
-    )
-    gate = await oversight.gate()
-    if gate.blocked:
-        await oversight.close()
-        await integration.reply(event, gate.message)
-        return
-    if gate.redacted:
-        user_message.content = gate.input
-
-    screener = agent.get_typesafe_screener()
-    # Await inbound before agent.run so control hints can filter get_tools().
-    inbound_payload: dict[str, Any] | None = None
-    if screener is not None:
-        # The question as the gate left it: a pasted secret never reaches the screener.
-        inbound_payload = await _safe_screen_input(screener, user_message.content)
-        if inbound_payload:
-            from django_ai_sdk.typesafe.control import enrich_payload_acted
-
-            control = inbound_payload.get("control")
-            if isinstance(control, dict):
-                agent.typesafe_control = control
-                inbound_payload = enrich_payload_acted(inbound_payload)
-
     timeout = resolve_setting("AI_SDK_WEBHOOK_TIMEOUT", 120)
     token = current_event.set(event)
     try:
-        with oversee(oversight):
-            text = await asyncio.wait_for(
-                agent.run(messages, tools=True, user=principal, thread_id=thread_id),
-                timeout=timeout,
-            )
+        # The agent's policy runs here as in chat: the gate masks the question in
+        # place, so what is stored below is the masked copy.
+        text = await asyncio.wait_for(
+            agent.run(
+                messages,
+                tools=True,
+                user=principal,
+                thread_id=thread_id,
+                channel=f"webhook:{event.integration}",
+            ),
+            timeout=timeout,
+        )
+    except Blocked as blocked:
+        if blocked.stage == Stage.GATE:
+            # A refused question gets the policy's message and is never stored.
+            await integration.reply(event, blocked.message)
+            return
+        text = blocked.message
     except TimeoutError:
         logger.warning(
             "Agent %r timed out after %s seconds on a %r event",
@@ -134,51 +115,13 @@ async def run_inbound(payload: dict[str, Any]) -> None:
         text = ERROR_MESSAGE
     finally:
         current_event.reset(token)
-        agent.typesafe_control = None
 
     reply_text = str(text) if text else ERROR_MESSAGE
-    if reply_text not in (TIMEOUT_MESSAGE, ERROR_MESSAGE):
-        reply_text = (await oversight.review(reply_text)).output
-    await oversight.close(error="" if text else "no reply")
-    # Score cards are channel chrome only — never store them, or the next turn
-    # feeds Jev's numbers back into the model. When typesafe_publish is on,
-    # three posts: inbound card → answer → reply card. When it is off, the
-    # inbound screen still ran (for control hints) and only the answer is posted.
+    # The fallbacks are persisted too: the channel shows them, so a thread that
+    # omitted them would disagree with what the person can scroll back to.
     if storage is not None:
         await _persist_turn(storage, user_message, reply_text)
-
-    publish_scores = getattr(agent, "typesafe_publish", True)
-    if (
-        publish_scores
-        and screener is not None
-        and reply_text not in (TIMEOUT_MESSAGE, ERROR_MESSAGE)
-    ):
-        from django_ai_sdk.typesafe.format import format_typesafe_card
-
-        if inbound_payload:
-            await integration.reply(event, format_typesafe_card(inbound_payload))
-        await integration.reply(event, reply_text)
-        outbound_payload = await _safe_screen_output(screener, user_message.content, reply_text)
-        if outbound_payload:
-            await integration.reply(event, format_typesafe_card(outbound_payload))
-    else:
-        await integration.reply(event, reply_text)
-
-
-async def _safe_screen_input(screener: Any, text: str) -> dict[str, Any] | None:
-    try:
-        return await screener.screen_input(text)
-    except Exception:
-        logger.exception("TypeSafe inbound screen failed on webhook; continuing")
-        return None
-
-
-async def _safe_screen_output(screener: Any, user_text: str, reply: str) -> dict[str, Any] | None:
-    try:
-        return await screener.screen_output(user_text, reply)
-    except Exception:
-        logger.exception("TypeSafe outbound screen failed on webhook; continuing")
-        return None
+    await integration.reply(event, reply_text)
 
 
 async def _load_conversation(

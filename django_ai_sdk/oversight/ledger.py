@@ -5,16 +5,25 @@
 Each domain row's payload is a fixed set of its fields in canonical JSON. Edit a
 row and its payload no longer matches; edit or drop an entry and every later
 `prev_hash` stops matching. Content is committed to only by `evidence_hash`,
-so shredding it changes nothing here.
+so shredding it changes nothing here; verify recomputes it for evidence it can
+still read. Drop the newest entries and the chain no longer reaches `LedgerHead`,
+unless the head was rolled back too: only a published checkpoint protects the end.
+
+Retention deletes old turns with their observations and decisions, never their
+entries: it chains a "prune" entry naming the run of entries whose rows went,
+and verify accepts a missing row only under one. Delete any other way and
+verify says "record missing". A prune entry is itself only a claim: anyone who
+can write the chain can append one, so check what was pruned against retention.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from django.db import transaction
 
@@ -57,6 +66,16 @@ def entry_digest(seq: int, kind: str, ref: str, payload_hash: str, prev_hash: st
     return sha256(f"{seq}\n{kind}\n{ref}\n{payload_hash}\n{prev_hash}")
 
 
+# Sections of a turn's evidence kept beside what its hash commits to: what judges and
+# reviewers wrote, added as they write it. They go when the evidence goes.
+UNHASHED = frozenset({"texts", "notes"})
+
+
+def evidence_digest(content: dict[str, Any]) -> str:
+    """The hash a turn commits to for its evidence: all of it but the UNHASHED sections."""
+    return sha256(canonical({k: v for k, v in content.items() if k not in UNHASHED}))
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -76,7 +95,7 @@ def turn_payload(turn: Turn) -> dict[str, Any]:
         "message_id": turn.message_id,
         "actor": turn.actor_pseudonym,
         "outcome": turn.outcome,
-        "shadow_outcome": turn.shadow_outcome,
+        "report_outcome": turn.report_outcome,
         "evidence": turn.evidence_hash,
     }
 
@@ -156,6 +175,22 @@ KINDS: dict[str, Kind] = {
     "shred": Kind("DataKey", shred_payload),
 }
 
+# Chained by `prune_turns`, ref "first-last": the run of entries whose rows retention
+# deleted. It commits to the chain itself, so it has no row and is not in KINDS.
+PRUNE = "prune"
+# What retention deletes. A missing row of any other kind is never pruning.
+PRUNABLE = frozenset({"turn", "observation", "decision"})
+
+
+def prune_payload(ref: str) -> dict[str, Any]:
+    first, last = _span(ref)
+    return {"from": first, "to": last}
+
+
+def _span(ref: str) -> tuple[int, int]:
+    first, _, last = ref.partition("-")
+    return int(first), int(last)
+
 
 def append(kind: str, row: models.Model) -> LedgerEntry:
     """Chain `row` onto the ledger. Call inside transaction.atomic(), synchronously."""
@@ -168,6 +203,16 @@ def append_many(items: list[tuple[str, models.Model]]) -> list[LedgerEntry]:
     The head row's lock serializes appenders: one gapless sequence, one tip. Take
     it last in the transaction, so other turns wait for it as briefly as they can.
     """
+    return _chain(
+        [
+            (kind, str(row.pk), sha256(canonical(KINDS[kind].payload(row))), row)
+            for kind, row in items
+        ]
+    )
+
+
+def _chain(items: list[tuple[str, str, str, models.Model | None]]) -> list[LedgerEntry]:
+    """Link (kind, ref, payload hash, row) onto the tip, under the head row's lock."""
     from django_ai_sdk.oversight.models import LedgerEntry, LedgerHead
 
     if not transaction.get_connection().in_atomic_block:
@@ -177,32 +222,70 @@ def append_many(items: list[tuple[str, models.Model]]) -> list[LedgerEntry]:
     head, _ = LedgerHead.objects.select_for_update().get_or_create(id=1)
     seq, previous = head.seq, head.entry_hash
     entries: list[LedgerEntry] = []
-    stamped: list[models.Model] = []
-    for kind, row in items:
-        spec = KINDS[kind]
+    stamped: list[Turn] = []
+    for kind, ref, payload_hash, row in items:
         seq += 1
-        payload_hash = sha256(canonical(spec.payload(row)))
-        digest = entry_digest(seq, kind, str(row.pk), payload_hash, previous)
+        digest = entry_digest(seq, kind, ref, payload_hash, previous)
         entries.append(
             LedgerEntry(
                 seq=seq,
                 kind=kind,
-                ref=str(row.pk),
+                ref=ref,
                 payload_hash=payload_hash,
                 prev_hash=previous,
                 entry_hash=digest,
             )
         )
-        if spec.stamps:
-            row.entry_hash = digest  # type: ignore[attr-defined]
-            stamped.append(row)
+        if row is not None and KINDS[kind].stamps:
+            # Only turns stamp (see KINDS), and a Turn has an entry_hash.
+            turn = cast("Turn", row)
+            turn.entry_hash = digest
+            stamped.append(turn)
         previous = digest
     LedgerEntry.objects.bulk_create(entries)
     head.seq, head.entry_hash = seq, previous
     head.save(update_fields=["seq", "entry_hash"])
-    for row in stamped:
-        type(row)._default_manager.filter(pk=row.pk).update(entry_hash=row.entry_hash)  # type: ignore[attr-defined]
+    for turn in stamped:
+        type(turn)._default_manager.filter(pk=turn.pk).update(entry_hash=turn.entry_hash)
     return entries
+
+
+def prune_turns(turns: models.QuerySet[Turn], *, batch: int = 100) -> int:
+    """Delete `turns` with their observations and decisions, and chain what went.
+
+    Each run of consecutive entries whose rows went gets one "prune" entry: the
+    only way verify accepts a missing row. Returns the rows deleted, cascades
+    included. Call inside transaction.atomic(), synchronously.
+    """
+    from django_ai_sdk.oversight.models import Decision, LedgerEntry, Observation
+
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("ledger.prune_turns must run inside transaction.atomic()")
+    ids = list(turns.values_list("pk", flat=True))
+    seqs: list[int] = []
+    deleted = 0
+    for i in range(0, len(ids), batch):
+        chunk = ids[i : i + batch]
+        refs = {
+            "turn": chunk,
+            "observation": list(
+                Observation.objects.filter(turn__in=chunk).values_list("pk", flat=True)
+            ),
+            "decision": list(Decision.objects.filter(turn__in=chunk).values_list("pk", flat=True)),
+        }
+        for kind, pks in refs.items():
+            found = LedgerEntry.objects.filter(kind=kind, ref__in=[str(pk) for pk in pks])
+            seqs.extend(found.values_list("seq", flat=True))
+        deleted += turns.model._default_manager.filter(pk__in=chunk).delete()[0]
+    runs: list[list[int]] = []
+    for seq in sorted(seqs):
+        if runs and runs[-1][1] == seq - 1:
+            runs[-1][1] = seq
+        else:
+            runs.append([seq, seq])
+    spans = [f"{first}-{last}" for first, last in runs]
+    _chain([(PRUNE, ref, sha256(canonical(prune_payload(ref))), None) for ref in spans])
+    return deleted
 
 
 @dataclass
@@ -211,7 +294,7 @@ class Verification:
 
     ok: bool = True
     checked: int = 0
-    # Rows the retention prune removed: their entries still chain, their payload is gone.
+    # Rows retention deleted under a "prune" entry: their entries still chain.
     pruned: int = 0
     head: str = GENESIS
     problems: list[dict[str, Any]] = field(default_factory=list)
@@ -234,18 +317,24 @@ class Verification:
 def verify(*, start: int = 1, stop: int | None = None, batch: int = 2_000) -> Verification:
     """Walk the chain from `start`, recomputing every link and every payload.
 
-    Synchronous and read-only; run it from a command or sync_to_async.
+    A row may be missing only when a later "prune" entry covers its entry; prune
+    entries past `stop` are read but not walked. A turn's evidence that still opens
+    here must hash to the turn's `evidence_hash`. Without `stop`, the chain must
+    reach the head as it stood when the walk began. Synchronous and read-only; run
+    it from a command or sync_to_async.
     """
     from django.apps import apps
 
-    from django_ai_sdk.oversight.models import APP_LABEL, LedgerEntry
+    from django_ai_sdk.oversight.models import APP_LABEL, LedgerEntry, LedgerHead
 
     result = Verification()
     previous = GENESIS
     expected_seq = start
+    head = LedgerHead.objects.filter(id=1).first() if stop is None else None
     if start > 1:
         prior = LedgerEntry.objects.filter(seq=start - 1).first()
         previous = prior.entry_hash if prior else GENESIS
+    starts, ends = _pruned_spans(start)
     query = LedgerEntry.objects.filter(seq__gte=start).order_by("seq")
     if stop is not None:
         query = query.filter(seq__lte=stop)
@@ -263,7 +352,10 @@ def verify(*, start: int = 1, stop: int | None = None, batch: int = 2_000) -> Ve
             if spec is None:
                 continue
             model = apps.get_model(APP_LABEL, spec.model)
-            for row in model._default_manager.filter(pk__in=refs):
+            found = model._default_manager.filter(pk__in=refs)
+            if kind == "turn":
+                found = found.select_related("evidence__key")
+            for row in found:
                 rows[(kind, str(row.pk))] = row
         for entry in entries:
             result.checked += 1
@@ -279,25 +371,129 @@ def verify(*, start: int = 1, stop: int | None = None, batch: int = 2_000) -> Ve
                 result.fail(entry.seq, "entry altered")
             spec = KINDS.get(entry.kind)
             row = rows.get((entry.kind, entry.ref))
-            if spec is None:
+            if entry.kind == PRUNE:
+                if _prune_hash(entry.ref) != entry.payload_hash:
+                    result.fail(entry.seq, "record altered", kind=entry.kind, ref=entry.ref)
+            elif spec is None:
                 result.fail(entry.seq, "unknown kind", kind=entry.kind)
             elif row is None:
-                result.pruned += 1
+                i = bisect_right(starts, entry.seq) - 1
+                if entry.kind in PRUNABLE and i >= 0 and entry.seq <= ends[i]:
+                    result.pruned += 1
+                else:
+                    result.fail(entry.seq, "record missing", kind=entry.kind, ref=entry.ref)
             elif sha256(canonical(spec.payload(row))) != entry.payload_hash:
                 result.fail(entry.seq, "record altered", kind=entry.kind, ref=entry.ref)
+            elif entry.kind == "turn" and (problem := _evidence_problem(row)):
+                result.fail(entry.seq, problem, kind=entry.kind, ref=entry.ref)
             previous = entry.entry_hash
         last = entries[-1].seq
     result.head = previous
+    if stop is None:
+        _reaches_head(result, head, walked=last)
     return result
+
+
+def _reaches_head(result: Verification, head: Any, *, walked: int) -> None:
+    """Whether the chain still holds the head it had when the walk began.
+
+    Read before the walk, so entries appended meanwhile do not count against it.
+    Deleting the newest entries (and their rows) leaves the head pointing past the
+    end; rolling the head back with them is not caught here, only by a checkpoint
+    published where the database's writers cannot change it.
+    """
+    from django_ai_sdk.oversight.models import LedgerEntry, LedgerHead
+
+    if head is None:
+        head = LedgerHead.objects.filter(id=1).first()
+        if head is None:
+            if walked > 0:
+                result.fail(walked, "head missing")
+            return
+    if head.seq == 0:
+        return
+    tip = LedgerEntry.objects.filter(seq=head.seq).values_list("entry_hash", flat=True).first()
+    if tip is None:
+        result.fail(head.seq, "chain ends early", head=head.entry_hash, last=walked)
+    elif tip != head.entry_hash:
+        result.fail(head.seq, "head mismatch", head=head.entry_hash, found=tip)
+
+
+def _evidence_problem(turn: Any) -> str:
+    """What is wrong with a turn's evidence, if it still opens here: "" when nothing.
+
+    Shredded or expired evidence, and evidence sealed under another MASTER_KEY, have
+    nothing to compare. Evidence that is neither shredded nor holds content is missing.
+    """
+    from django.core.exceptions import ImproperlyConfigured
+
+    from django_ai_sdk.oversight import vault
+
+    evidence = turn.evidence
+    if evidence is None or evidence.shredded_at is not None:
+        return ""
+    content = evidence.content
+    if content is None:
+        if evidence.ciphertext is None:
+            return "evidence missing"
+        try:
+            content = vault.decrypt_json(evidence.key, evidence.ciphertext, evidence.scope)
+        except (vault.VaultError, ImproperlyConfigured, ValueError):
+            return ""
+        if content is None:
+            return ""
+    if not isinstance(content, dict) or evidence_digest(content) != turn.evidence_hash:
+        return "evidence altered"
+    return ""
+
+
+def _pruned_spans(start: int) -> tuple[list[int], list[int]]:
+    """The seq runs that "prune" entries from `start` on cover, merged: (starts, ends).
+
+    A prune entry covers only entries before itself: it cannot excuse a later deletion.
+    """
+    from django_ai_sdk.oversight.models import LedgerEntry
+
+    spans: list[tuple[int, int]] = []
+    for seq, ref in LedgerEntry.objects.filter(kind=PRUNE, seq__gte=start).values_list(
+        "seq", "ref"
+    ):
+        try:
+            first, last = _span(ref)
+        except ValueError:
+            continue  # The walk reports it as altered.
+        if first <= last < seq:
+            spans.append((first, last))
+    starts: list[int] = []
+    ends: list[int] = []
+    for first, last in sorted(spans):
+        if ends and first <= ends[-1] + 1:
+            ends[-1] = max(ends[-1], last)
+        else:
+            starts.append(first)
+            ends.append(last)
+    return starts, ends
+
+
+def _prune_hash(ref: str) -> str | None:
+    try:
+        return sha256(canonical(prune_payload(ref)))
+    except ValueError:
+        return None
 
 
 __all__ = [
     "GENESIS",
     "KINDS",
+    "PRUNABLE",
+    "PRUNE",
+    "UNHASHED",
     "Verification",
     "append",
     "append_many",
     "canonical",
+    "evidence_digest",
+    "prune_turns",
     "sha256",
     "verify",
 ]

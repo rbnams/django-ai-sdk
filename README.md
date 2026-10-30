@@ -97,6 +97,58 @@ async def chat(request, payload: ChatRequest):
     )
 ```
 
+## Oversight
+
+Give an agent a policy and every turn it runs, by chat, `run()`, the HTTP endpoints,
+webhooks or workflow steps, is checked by the policy's lenses, acted on by its rules
+and recorded on a hash-chained ledger. Add `"django_ai_sdk.oversight"` to
+`INSTALLED_APPS` and `pip install "django-ai-sdk[oversight]"`.
+
+```python
+from django_ai_sdk import Agent
+from django_ai_sdk.errors import Blocked
+from django_ai_sdk.oversight import PII, Entities, L, Mask, Mode, Policy, Queue, Rule, Stage, Subject, pick
+from django_ai_sdk.oversight.packs import SecurityPack
+
+
+class SupportPolicy(Policy):
+    name = "support"
+    # Show the answer once finish has masked it; "live" streams it before.
+    stream_mode = "hold"
+    lenses = [
+        *pick(SecurityPack.lenses, "prompt_injection"),
+        Entities(
+            name="pii",
+            question="Which kinds of personal data does the answer contain?",
+            subject=Subject.OUTPUT,
+            stages=(Stage.FINISH,),
+            answerers=[PII()],
+        ),
+    ]
+    rules = [
+        *pick(SecurityPack.rules, "block_injection", mode=Mode.ENFORCE),
+        Rule("mask_pii", when=L("pii").any, then=Mask(), mode=Mode.ENFORCE),
+        # Report mode: recorded as what it would have done, nothing changes.
+        Rule("iban_to_people", when=L("pii").contains("iban"), then=Queue("privacy"), mode=Mode.REPORT),
+    ]
+
+
+class SupportAgent(Agent):
+    oversight = SupportPolicy
+
+
+try:
+    answer = await SupportAgent().run(messages, user=request.user)
+except Blocked as refused:
+    answer = refused.message  # the policy's own text for the person asking
+```
+
+`prompt_injection` is answered by whatever your deployment maps to the `classifier`
+alias (a model judge, or the optional hosted TypeSafe service); without one it is
+skipped and a system check says so. Personal data is found by checksum, in-process.
+Each agent runs under its own policy: a subagent or a nested `run()` under another
+policy opens a child turn of its own. See the [Oversight guide](docs/content/oversight.md).
+
 ## Features
 
 - **Agents**: A Django `Agent` class you can run from a view, a task, or the API,
@@ -118,11 +170,10 @@ async def chat(request, payload: ChatRequest):
   circuit breaking and OAuth built in.
 - **Tracing**: Opt-in Haystack tracing persisted to the ORM, with per-thread and
   per-message token accounting.
-- **TypeSafe**: Optional Jev judgments on chat turns — score cards, tool gating via
-  `control` hints, webhook channel footers. Install `django-ai-sdk[typesafe]`.
-- **Oversight**: Lenses ask one typed question about every turn, answered by Jev, code or a
-  model judge as you pick per lens; rules block, redact or queue for a person, starting in
-  test mode; a hash-chained audit ledger with a console API. Install `django-ai-sdk[oversight]`.
+- **Oversight**: Lenses ask one typed question about every turn, answered by code, a
+  classifier or a model judge as you pick per lens; rules block, mask or queue for a
+  person, starting in report mode; every way an agent runs is checked; a hash-chained
+  audit ledger with a console API. Install `django-ai-sdk[oversight]`.
 - **Reindexing**: Hot-reload documents. Cached embeddings with simple refresh API.
 
 ## Documentation

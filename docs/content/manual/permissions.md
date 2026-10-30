@@ -23,8 +23,9 @@ PermissionDomain.MEMORY   # "memory"
 | `thread` | `ThreadDefaultPermission` |
 | `memory` | `MemoryDefaultPermission` |
 | `integrations` | `IntegrationDefaultPermission` |
+| `automations` | `AutomationDefaultPermission` |
 | `workflow` | `WorkflowDefaultPermission` |
-| `oversight` | `OversightDefaultPermission`: staff view, review and audit; superusers reveal who asked and manage policies. |
+| `oversight` | `OversightDefaultPermission`: staff view, review and audit; superusers reveal who asked and manage policies. Any staff user may so read every user's turns, content included as far as `CAPTURE` keeps it: override the domain (for example `IsInAllowedGroups` per purpose) to narrow that. |
 
 Managing oversight includes configuring answerers: a host that grants `MANAGE_OVERSIGHT` more widely also lets those users choose which model or service judges turns, within the catalog's kinds and parameters.
 
@@ -58,7 +59,7 @@ USE_INTEGRATION, MANAGE_INTEGRATION
 # Workflows
 VIEW_WORKFLOW, RUN_WORKFLOW, MANAGE_WORKFLOW
 # Oversight (VIEW_OVERSIGHT is checked with purpose="review", AUDIT_OVERSIGHT with "audit")
-VIEW_OVERSIGHT, REVIEW_OVERSIGHT, AUDIT_OVERSIGHT, REVEAL_ACTOR, MANAGE_OVERSIGHT
+VIEW_OVERSIGHT, REVIEW_OVERSIGHT, AUDIT_OVERSIGHT, REVEAL_OVERSIGHT_ACTOR, MANAGE_OVERSIGHT
 # Misc
 CHAT, REINDEX
 ```

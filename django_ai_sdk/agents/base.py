@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
+import inspect
 import uuid
+import weakref
 from abc import ABC
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
+from django.core.exceptions import ImproperlyConfigured
 from pydantic import BaseModel
 
 from django_ai_sdk.adapters.citations import (
@@ -42,7 +46,7 @@ from django_ai_sdk.storage.schemas import ThreadDetail
 from django_ai_sdk.storage.services import ThreadService
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from django.contrib.auth.base_user import AbstractBaseUser
     from django.contrib.auth.models import AnonymousUser
@@ -54,14 +58,86 @@ if TYPE_CHECKING:
     from django_ai_sdk.artifacts.tool_artifacts import ToolArtifact
     from django_ai_sdk.common import Prompt
     from django_ai_sdk.files.pipeline import FilePipeline
+    from django_ai_sdk.oversight.policy import Policy
+    from django_ai_sdk.oversight.session import TurnSession
     from django_ai_sdk.rags.schemas import RagDocument
     from django_ai_sdk.storage.base import BaseStorageAdapter
-    from django_ai_sdk.typesafe import TypeSafeScreener
+    from django_ai_sdk.storage.schemas import ThreadInfo
 
 
 T = TypeVar("T", bound=BaseModel)
 
 logger = get_logger(__name__)
+
+# Subclass run() overrides already wrapped in the agent's turn (see _overseen_run).
+_overseen: weakref.WeakSet[Callable[..., Any]] = weakref.WeakSet()
+
+
+def _check_oversight(cls: type, value: Any) -> None:
+    """`Agent.oversight` names a policy: a Policy subclass, a name, False or None.
+
+    Anything else would leave the agent unwatched without a word, so it fails at
+    import. A Policy subclass is registered with the agent, so the console sees it.
+    """
+    if value is None or value is False or (isinstance(value, str) and value):
+        return
+    if isinstance(value, type):
+        from django_ai_sdk.oversight.policy import Policy
+
+        if issubclass(value, Policy):
+            from django_ai_sdk.oversight.registry import policy_name
+
+            policy_name(value)
+            return
+    raise ImproperlyConfigured(
+        f"{cls.__qualname__}.oversight must be a Policy subclass, a policy's name, False "
+        f"or None, not {value!r}."
+    )
+
+
+def _overseen_run(run: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """A subclass's own `run()`, wrapped in the agent's turn: overriding it cannot skip the policy.
+
+    The turn opens around the outermost `run()`; the base `run()` the override
+    calls resolves the same policy and joins it. Its arguments are read as
+    `Agent.run` takes them: messages, thread_id, user, channel and oversight.
+    """
+
+    @functools.wraps(run)
+    async def overseen(self: Agent, *args: Any, **kwargs: Any) -> Any:
+        call = _run_arguments(args, kwargs)
+        messages = call.get("messages")
+        if not isinstance(messages, list):
+            # No conversation to judge: the base run() the override calls opens the turn.
+            return await run(self, *args, **kwargs)
+
+        async def work(given: list[ChatMessage]) -> Any:
+            if "messages" in kwargs:
+                return await run(self, *args, **{**kwargs, "messages": given})
+            return await run(self, given, *args[1:], **kwargs)
+
+        return await self._run_turn(
+            work,
+            messages,
+            channel=call.get("channel", "run"),
+            user=call.get("user"),
+            thread_id=call.get("thread_id"),
+            oversight=call.get("oversight", Agent._UNSET),
+        )
+
+    _overseen.add(overseen)
+    return overseen
+
+
+def _run_arguments(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """A run() call's arguments by `Agent.run`'s names; by keyword alone when they do not bind."""
+    try:
+        return dict(_RUN_SIGNATURE.bind_partial(None, *args, **kwargs).arguments)
+    except TypeError:
+        found = dict(kwargs)
+        if args and "messages" not in found:
+            found["messages"] = args[0]
+        return found
 
 
 def _warmup_part(stage: str, detail: str) -> dict[str, Any]:
@@ -250,23 +326,11 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
     # Suggestion generator class for follow-up questions.
     suggestion_generator: type[SuggestionGenerator] | None = None
 
-    # Opt-in TypeSafe screener (Jev judgments on inbound/outbound turns).
-    # Wired onto Stream and webhook run_inbound when set.
-    typesafe_screener: type[TypeSafeScreener] | None = None
-
-    # Webhook channels post inbound/outbound score cards when this is true.
-    # False still runs the inbound screen (control hints) and skips the cards
-    # and the outbound screen. Web chat does not read this flag.
-    typesafe_publish: bool = True
-
-    # Per-request tool-selection hints from a screener payload's ``control``
-    # dict (``strip_tools``, ``skip_rag``, ``remove_tool_names``). Set by
-    # webhook run_inbound or the host before ``get_tools()``; clear after.
-    typesafe_control: dict[str, Any] | None = None
-
-    # The oversight policy this agent's turns are judged by, by name. None takes
-    # AI_SDK_OVERSIGHT["DEFAULT_POLICY"]; False opts out even of that.
-    oversight: str | bool | None = None
+    # The oversight policy every turn of this agent runs under, chat and run() alike:
+    # a Policy subclass, or a registered policy's name. None takes
+    # AI_SDK_OVERSIGHT["DEFAULT_POLICY"]; False opts out even of that. Anything else
+    # raises ImproperlyConfigured when the class is defined.
+    oversight: type[Policy] | str | Literal[False] | None = None
 
     # Generator factory from django_ai_sdk.generators, e.g. `openai_responses_chat`.
     # Assign the factory itself, never call it: get_llm() builds it with this
@@ -289,6 +353,12 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         llm = cls.__dict__.get("llm")
         if callable(llm) and not isinstance(llm, staticmethod):
             cls.llm = staticmethod(llm)  # ty: ignore[invalid-assignment]
+        if "oversight" in cls.__dict__:
+            _check_oversight(cls, cls.__dict__["oversight"])
+        # The policy wraps the outermost run(): an override is judged as a whole.
+        own_run = cls.__dict__.get("run")
+        if callable(own_run) and own_run not in _overseen:
+            cls.run = _overseen_run(own_run)  # ty: ignore[invalid-assignment]
         # Don't register the base Agent class itself, or classes that
         # manage their own registration (e.g. RuntimeAgent).
         if cls.__name__ != "Agent" and not getattr(cls, "_skip_auto_register", False):
@@ -514,15 +584,23 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         """
         return []
 
-    def get_oversight_policy(self) -> str | bool | None:
-        """The oversight policy name for this agent's turns; override to pick per instance."""
-        return self.oversight
+    async def get_oversight(
+        self,
+        *,
+        channel: str = "",
+        user: AbstractBaseUser | AnonymousUser | None = None,
+        **kwargs: Any,
+    ) -> type[Policy] | str | Literal[False] | None:
+        """The policy this turn runs under: `oversight`, unless overridden.
 
-    def get_typesafe_screener(self) -> TypeSafeScreener | None:
-        """Return an inbound TypeSafe screener, or None to skip."""
-        if not self.typesafe_screener:
-            return None
-        return self.typesafe_screener()
+        Override to choose per instance, per channel ("chat", "api", "run",
+        "webhook:<name>", "workflow:<workflow>:<step>") or per user; it may read
+        the database. Keep `**kwargs`: more about the turn may be passed later. A
+        console assignment for this agent wins over what this returns. One that
+        raises, or names a policy that cannot load, follows
+        AI_SDK_OVERSIGHT["FAIL_MODE"]["gate"].
+        """
+        return self.oversight
 
     async def get_tools(
         self,
@@ -559,11 +637,6 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         # info about uploaded files
         result.extend(self.get_attachment_tools(thread_id))
 
-        # Optional TypeSafe control hints (set by webhook / host before run).
-        from django_ai_sdk.typesafe.control import apply_tool_control
-
-        result = apply_tool_control(result, self.typesafe_control)
-
         # Tools the turn's oversight gate took away; [] takes them all.
         from django_ai_sdk.oversight.session import current_session
 
@@ -596,7 +669,7 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         from django_ai_sdk.agents.services import AgentService
         from django_ai_sdk.agents.subagent import (
             SubagentStreamFilter,
-            build_subagent,
+            build_subagent_with,
             subagent_response,
             subagent_tool_name,
         )
@@ -620,10 +693,11 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 )
                 continue
 
-            built = await build_subagent(subagent_cls, thread_id=thread_id, user=user)
+            built = await build_subagent_with(subagent_cls, thread_id=thread_id, user=user)
             if built is None:
                 continue
-            sub_agent, agent_id = built
+            sub_agent, subagent = built
+            agent_id = subagent.agent_id
 
             name = subagent_tool_name(subagent_cls)
             if name in used_names:
@@ -636,8 +710,15 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
 
             tools.append(
                 ComponentTool(
+                    # Each delegation runs under the subagent's own policy (a child
+                    # turn), or joins the coordinator's when that is the same.
                     component=SubagentStreamFilter(
-                        sub_agent, name=subagent_cls.name or name, agent_id=agent_id
+                        sub_agent,
+                        name=subagent_cls.name or name,
+                        agent_id=agent_id,
+                        subagent=subagent,
+                        thread_id=thread_id,
+                        user=user,
                     ),
                     name=name,
                     description=(
@@ -885,8 +966,11 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         thread_id: str | None = None,
         user: AbstractBaseUser | AnonymousUser | None = None,
         tools: bool = False,
+        *,
+        channel: str = "run",
+        oversight: type[Policy] | str | Literal[False] | None = _UNSET,
     ) -> T | str | None:
-        """Run LLM calls directly from adapter.
+        """Run the agent to completion, as one turn under its oversight policy.
 
         Args:
             messages: Conversation messages
@@ -904,15 +988,69 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 extraction, ...) does not pay that cost unless it explicitly asks
                 for it. Ignored when response_format is set — tools and structured
                 output together are not supported yet (see Run.run).
+            channel: What the turn is recorded as on, e.g. "api" or "webhook:slack".
+            oversight: A policy for this call instead of the agent's own (a Policy
+                subclass or a name); None for AI_SDK_OVERSIGHT["DEFAULT_POLICY"],
+                like `oversight = None` on the class; False to run unwatched. Left
+                out: the agent's own, the console's choice else `get_oversight()`.
+                For trusted code; the SDK's HTTP endpoints never pass it.
+
+        The policy's gate judges the history and the question first. The caller's
+        list is not rewritten: only its last user message is masked in place when a
+        rule says so, so what the caller stores afterwards is the masked copy. Tool
+        calls are watched; the answer is finished (masked or withheld) before it is
+        returned. A run inside another turn joins it when it resolves the same
+        policy, or none; under a policy of its own it opens a child turn. An
+        override of `run()` is the turn: the policy wraps it, and `super().run()`
+        inside it joins.
 
         Returns:
             Response string, or parsed Pydantic model if response_format is set
+
+        Raises:
+            Blocked: The policy refused the question or withheld the answer;
+                `Blocked.message` is the policy's text for the person asking.
         """
+
+        async def work(messages: list[ChatMessage]) -> T | str | None:
+            return await self._run(messages, system_prompt, response_format, thread_id, user, tools)
+
+        return await self._run_turn(
+            work, messages, channel=channel, user=user, thread_id=thread_id, oversight=oversight
+        )
+
+    async def _run_turn(
+        self,
+        work: Callable[[list[ChatMessage]], Awaitable[Any]],
+        messages: list[ChatMessage],
+        *,
+        channel: str,
+        user: AbstractBaseUser | AnonymousUser | None,
+        thread_id: str | None,
+        oversight: Any,
+    ) -> Any:
+        """`work(messages)` as one turn under the policy `run(oversight=...)` chose."""
+        from django_ai_sdk.oversight.headless import run_turn
         from django_ai_sdk.tracing import bind as bind_trace
 
+        if oversight is Agent._UNSET:
+            oversight = None
+        elif oversight is None:
+            from django_ai_sdk.oversight.conf import setting
+
+            # Like `oversight = None` on the class: the default policy, or none.
+            oversight = str(setting("DEFAULT_POLICY") or "")
         # Headless runs trace to their thread too, not to nothing.
         with bind_trace(thread_id=thread_id):
-            return await self._run(messages, system_prompt, response_format, thread_id, user, tools)
+            return await run_turn(
+                self,
+                work,
+                messages,
+                channel=channel,
+                user=user,
+                thread_id=thread_id,
+                oversight=oversight,
+            )
 
     async def _run(
         self,
@@ -972,7 +1110,7 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
         from django_ai_sdk.oversight.session import current_session
         from django_ai_sdk.oversight.stream import observe_replies
 
-        # Review judges what the loop did, not an empty exchange. The result starts
+        # Finish judges what the loop did, not an empty exchange. The result starts
         # with the system prompt and the messages it was given: only the rest is new.
         if (session := current_session()) is not None:
             given = sum(1 for m in haystack_messages if not m.is_from("system"))
@@ -1214,16 +1352,53 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
 
         # Get storage adapter for thread
         storage_adapter = await self.get_storage_adapter(thread_id)
-        # A stored thread is the history. What the client sends back is its own copy:
-        # unmasked where the gate masked, or made up. Only the new question is taken.
-        stored_history = bool(thread and storage_adapter)
-        if stored_history:
-            newest = messages[-1] if messages and messages[-1].role == "user" else None
-            messages = [
-                m for m in await storage_adapter.get_messages() if m.role in ("user", "assistant")
-            ]
-            if newest is not None:
-                messages.append(newest)
+
+        # Attachments are client-supplied: validated against the thread's files before
+        # the turn opens, so the gate judges what the model reads (their context too).
+        await self._resolve_attachments(messages, thread, user, inline_images=self.has_vision())
+
+        from django_ai_sdk.oversight.session import TurnSession
+
+        oversight = await TurnSession.start(
+            self, channel="chat", user=user, thread_id=thread_id, messages=messages
+        )
+        try:
+            return await self._chat_turn(
+                oversight, messages, thread, thread_id, storage_adapter, user
+            )
+        except BaseException as exc:
+            # Until the Stream owns the turn, a failure here must still close it.
+            await oversight.close(error=type(exc).__name__)
+            raise
+
+    async def _chat_turn(
+        self,
+        oversight: TurnSession,
+        messages: list[ChatMessage],
+        thread: ThreadInfo | None,
+        thread_id: str | None,
+        storage_adapter: BaseStorageAdapter | None,
+        user: AbstractBaseUser | AnonymousUser | None,
+    ) -> Any:
+        """The chat turn once it is open: history, gate, storage, then the stream."""
+        from django_ai_sdk.oversight.headless import thread_history
+
+        # A stored thread vouches for the history: under a policy that masks the
+        # question it is the history (what the client sends back is its own copy,
+        # unmasked where the gate masked, or made up); otherwise the client's copy
+        # stands when it is the thread as stored. Anything else is judged as it came.
+        vouched = None
+        if thread and storage_adapter and oversight.active:
+            vouched = await thread_history(oversight, storage_adapter, messages)
+        stored = vouched is not None
+        if vouched is not None and vouched is not messages:
+            messages = vouched
+            newest = bool(messages) and messages[-1].role == "user"
+            # The stored messages' own attachments, validated like the question's.
+            await self._resolve_attachments(
+                messages[:-1] if newest else messages, thread, user, inline_images=False
+            )
+            oversight.set_history(messages)
 
         # Apply max_history limiting if configured
         if self.max_history and len(messages) > self.max_history:
@@ -1232,33 +1407,12 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 f"Applied max_history={self.max_history}, kept {len(messages)} most recent messages"
             )
 
-        # Attachments are client-supplied: validate them against the thread's
-        # files before they are stored or reach the model.
-        if any(m.attachments for m in messages):
-            if thread:
-                from django_ai_sdk.memories.services import MemoryService
-
-                await MemoryService.resolve_attachments(
-                    str(thread.id),
-                    messages,
-                    user=user,
-                    agent=self,
-                    inline_images=self.has_vision(),
-                )
-            else:
-                for message in messages:
-                    message.attachments = []
-
-        # The oversight gate judges the question before the thread or the model sees it.
-        from django_ai_sdk.oversight.session import TurnSession
-
-        oversight = await TurnSession.start(
-            self, channel="chat", user=user, thread_id=thread_id, messages=messages
-        )
+        # The oversight gate judges the history and the question before the thread
+        # or the model sees them.
         if oversight.active:
-            if not stored_history:
-                await oversight.mask_history(messages)
-            gate = await oversight.gate()
+            # A stored thread was judged turn by turn: only the question's attachments are new.
+            checked = await oversight.check_history(messages, history=not stored)
+            gate = checked if checked and checked.blocked else await oversight.gate()
             if gate.blocked:
                 from django_ai_sdk.oversight.stream import RefusalStream
 
@@ -1266,7 +1420,7 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 return await stream_response(
                     RefusalStream(gate.message, gate.notice), messages, self.protocol_handler
                 )
-            if gate.redacted:
+            if gate.masked:
                 question = next((m for m in reversed(messages) if m.role == "user"), None)
                 if question is not None:
                     question.content = gate.input
@@ -1295,7 +1449,8 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
                 logger.debug("No user messages found to store")
 
         if self.title_generation and thread and not thread.title:
-            # A failed title must not fail the reply.
+            # A failed title must not fail the reply. It is made from the question as
+            # the gate left it, and judged on its own (unwatched).
             try:
                 title = await generate_thread_title(
                     agent=self, messages=messages, thread_id=thread.id, user=user
@@ -1307,37 +1462,51 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
 
         async def build_adapter() -> Streamable:
             # Built inside the stream, so a failure (e.g. RAG warmup) reaches the client.
-            adapter = await self.get_pipeline_adapter(thread_id=thread_id, user=user)
-            suggestion_generator = self.get_suggestion_generator()
-            if suggestion_generator:
-                adapter.suggestion_generator = suggestion_generator
-            if screener := self.get_typesafe_screener():
-                adapter.typesafe_screener = screener
-            if required_tools := self.get_run_required_tools(messages):
-                adapter.hook_context = {"required_tools": required_tools}
+            try:
+                adapter = await self.get_pipeline_adapter(thread_id=thread_id, user=user)
+                suggestion_generator = self.get_suggestion_generator()
+                if suggestion_generator:
+                    adapter.suggestion_generator = suggestion_generator
+                if required_tools := self.get_run_required_tools(messages):
+                    adapter.hook_context = {"required_tools": required_tools}
+                # Artifacts are stored on the thread: none without one.
+                if thread_id:
+                    adapter.thread_id = thread_id
+                    adapter.user = user
+                    # Shown after each mapped tool's result, for any tool of the run.
+                    adapter.tool_artifacts = self.tool_artifacts
+
+                    # Seed the citation registry with sources from current thread
+                    registry = getattr(adapter, "citation_registry", None)
+                    if registry is not None:
+                        await registry.seed_from_thread(thread_id)
+                        registry.seed(await self.get_citation_sources(thread_id, user))
+                        adapter.citation_agent = get_citation_agent(self)
+            except BaseException as exc:
+                await oversight.close(error=type(exc).__name__)
+                raise
             if oversight.active:
                 from django_ai_sdk.adapters.base import Stream
 
                 if isinstance(adapter, Stream):
+                    # The Stream owns the turn from here: it watches, finishes and closes it.
                     adapter.oversight = oversight
                 else:
                     # Only the SDK's Stream reports what happens next; record the gate.
                     await oversight.close()
-            # Artifacts are stored on the thread: none without one.
-            if thread_id:
-                adapter.thread_id = thread_id
-                adapter.user = user
-                # Shown after each mapped tool's result, for any tool of the run.
-                adapter.tool_artifacts = self.tool_artifacts
-
-                # Seed the citation registry with sources from current thread
-                registry = getattr(adapter, "citation_registry", None)
-                if registry is not None:
-                    await registry.seed_from_thread(thread_id)
-                    registry.seed(await self.get_citation_sources(thread_id, user))
-                    adapter.citation_agent = get_citation_agent(self)
             logger.debug(f"Pipeline adapter created: {type(adapter).__name__}")
             return adapter
+
+        async def warmup() -> AsyncGenerator[dict[str, Any], None]:
+            # A client gone (or a warmup failed) before the adapter is built: the turn
+            # closes here, since no Stream will.
+            try:
+                async for part in self.warmup_progress(thread_id, user):
+                    yield part
+            except BaseException as exc:
+                gone = isinstance(exc, GeneratorExit | asyncio.CancelledError)
+                await oversight.close(error="disconnected" if gone else type(exc).__name__)
+                raise
 
         logger.debug("Initiating stream response")
         return await stream_response(
@@ -1345,5 +1514,30 @@ class Agent(ABC, AgentInfoMixin, InlineFileCapability):
             messages,
             self.protocol_handler,
             storage_adapter=storage_adapter,
-            warmup=self.warmup_progress(thread_id, user),
+            warmup=warmup(),
         )
+
+    async def _resolve_attachments(
+        self,
+        messages: list[ChatMessage],
+        thread: ThreadInfo | None,
+        user: AbstractBaseUser | AnonymousUser | None,
+        *,
+        inline_images: bool,
+    ) -> None:
+        """Validate client-supplied attachments against the thread's files; none without one."""
+        if not any(m.attachments for m in messages):
+            return
+        if thread is None:
+            for message in messages:
+                message.attachments = []
+            return
+        from django_ai_sdk.memories.services import MemoryService
+
+        await MemoryService.resolve_attachments(
+            str(thread.id), messages, user=user, agent=self, inline_images=inline_images
+        )
+
+
+# How run() is called, for an override's turn (see _overseen_run).
+_RUN_SIGNATURE = inspect.signature(Agent.run)

@@ -1,9 +1,12 @@
 """Who may see what: pseudonyms, and the two views of a turn.
 
 A reviewer reads the turn itself: the question, the answer, the sources it drew
-on (where an indirect injection hides) and every verdict with its reason. An
-auditor reads the decisions and the chain, and no content at all. A person shows
-up as a stable pseudonym until someone records why they must know.
+on (where an indirect injection hides) and every verdict with its reason, from
+the evidence. An auditor reads the decisions, the chain and bare verdicts as the
+record keeps them: no question, answer, source, reason, `Text` answer, per-item
+score or note, and an `Entities` name its answerer gave in its own words only as
+"[found]". A person shows up as a stable pseudonym until someone records why
+they must know, and never by name in the audit view.
 """
 
 from __future__ import annotations
@@ -66,7 +69,7 @@ VIEWS: dict[Purpose, frozenset[str]] = {
             "history",
         }
     ),
-    # Verdicts without their reasons: a rationale can quote the content.
+    # Verdicts as the record keeps them: a reason can quote the content.
     Purpose.AUDIT: frozenset({"decisions", "chain", "observations"}),
 }
 

@@ -6,6 +6,7 @@ console's history is as tamper-evident as the turns it governs.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,7 @@ from django_ai_sdk.logger import get_logger
 from django_ai_sdk.oversight import budget
 from django_ai_sdk.oversight.privacy import staff_label
 from django_ai_sdk.oversight.schemas import (
+    MAX_LIMIT,
     AgentPolicyIn,
     AgentRow,
     AnswererIn,
@@ -41,6 +43,15 @@ if TYPE_CHECKING:
 
 class ConsoleMixin:
     """Policy, agent and answerer editing; mixed into OversightService, whose checks it uses."""
+
+    if TYPE_CHECKING:
+        # Provided by OversightService.
+
+        @classmethod
+        async def _check(cls, user: UserType, operation: Operation, **kwargs: Any) -> None: ...
+
+        @classmethod
+        async def get_policy(cls, name: str, *, user: UserType) -> dict[str, Any] | None: ...
 
     # Policies.
 
@@ -180,7 +191,7 @@ class ConsoleMixin:
         from django_ai_sdk.oversight.policy import aconsole
 
         console = (await aconsole(uncached=True))["agents"]
-        rows = await sync_to_async(_agents, thread_sensitive=True)()
+        rows = await _agents()
         recent = Turn.objects.filter(created_at__gte=timezone.now() - timedelta(days=30))
         stats = {
             row["agent_id"]: row
@@ -403,7 +414,8 @@ class ConsoleMixin:
         rows = PolicyOverride.objects.all()
         if policy:
             rows = rows.filter(policy=policy)
-        return [_override_out(o) async for o in rows.order_by("-changed_at")[: max(1, limit)]]
+        limit = max(1, min(limit, MAX_LIMIT))
+        return [_override_out(o) async for o in rows.order_by("-changed_at")[:limit]]
 
 
 def _console_config(config: Any, kinds: list[dict[str, Any]]) -> Any:
@@ -421,7 +433,7 @@ def _refuse_misplaced(lens: Any) -> None:
     if lens is not None and misplaced(lens):
         raise UserError(
             f"Lens {lens.name!r} reads the question, so it can run before the model or in "
-            "the background, not while the answer is written or reviewed."
+            "the background, not while the answer is written or finished."
         )
 
 
@@ -434,13 +446,12 @@ def _console_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise UserError(str(exc)) from exc
 
 
-SLUG = r"^[a-z][a-z0-9_-]{1,62}$"
+SLUG = re.compile(r"[a-z][a-z0-9_-]{1,62}")
 
 
 def _check_slug(value: str, what: str) -> None:
-    import re
-
-    if not re.match(SLUG, value or ""):
+    # fullmatch: "$" would let a trailing newline through.
+    if not SLUG.fullmatch(value or ""):
         raise UserError(
             f"A {what} name is lowercase letters, digits, - and _, starting with a letter."
         )
@@ -458,45 +469,63 @@ async def _console_policies() -> set[str]:
     }
 
 
-def _agents() -> list[dict[str, Any]]:
-    """Registered agent classes and runtime agents, with what their code asks for."""
-    from django_ai_sdk.agents.config import get_runtime_agent_class
-    from django_ai_sdk.agents.models import AgentSettings
-    from django_ai_sdk.agents.registry import registry
-    from django_ai_sdk.oversight.session import agent_key, code_policy
+async def _agents() -> list[dict[str, Any]]:
+    """Registered agent classes and runtime agents, with what their code asks for.
 
+    The code's choice is what `get_oversight()` returns outside any turn (no
+    channel, no user). One that raises shows as reason "error" instead of failing
+    the listing.
+    """
+    from django_ai_sdk.oversight.session import acode_policy
+
+    found = await sync_to_async(_agent_instances, thread_sensitive=True)()
     rows: list[dict[str, Any]] = []
-    for agent in registry.all().values():
-        policy, reason = code_policy(agent)
-        rows.append(
-            {
-                "id": agent_key(agent),
-                "name": getattr(agent, "name", "") or type(agent).__name__,
-                "kind": "code",
-                "description": _code_description(agent),
-                "code_policy": policy,
-                "code_reason": reason,
-            }
-        )
-    for config in AgentSettings.objects.filter(active=True).order_by("name"):
-        # The class the runtime builds for this row: only a listed base, else the first.
-        cls = get_runtime_agent_class(config.agent)
-        policy, reason = code_policy(_runtime_probe(cls, config))
-        rows.append(
-            {
-                "id": str(config.id),
-                "name": config.name,
-                "kind": "runtime",
-                "description": f"Configured agent · {config.slug} · {config.model}",
-                "code_policy": policy,
-                "code_reason": reason,
-            }
-        )
+    for row, agent in found:
+        try:
+            policy, reason = await acode_policy(agent)
+        except Exception:
+            logger.exception("Oversight could not ask {} for its policy", row["name"])
+            policy, reason = "", "error"
+        rows.append({**row, "code_policy": policy, "code_reason": reason})
     return rows
 
 
+def _agent_instances() -> list[tuple[dict[str, Any], Any]]:
+    """Registered agent classes and runtime agents: each row, and the agent to ask."""
+    from django_ai_sdk.agents.config import get_runtime_agent_class
+    from django_ai_sdk.agents.models import AgentSettings
+    from django_ai_sdk.agents.registry import registry
+    from django_ai_sdk.oversight.session import agent_key
+
+    found: list[tuple[dict[str, Any], Any]] = []
+    for agent in registry.all().values():
+        row = {
+            "id": agent_key(agent),
+            "name": getattr(agent, "name", "") or type(agent).__name__,
+            "kind": "code",
+            "description": str(getattr(agent, "description", "") or "").strip(),
+            "model": str(getattr(agent, "model", "") or ""),
+            "integrations": [str(i) for i in getattr(agent, "integrations", []) or []],
+        }
+        found.append((row, agent))
+    for config in AgentSettings.objects.filter(active=True).order_by("name"):
+        # The class the runtime builds for this row: only a listed base, else the first.
+        # Without a console assignment of its own, it runs under that class's policy.
+        cls = get_runtime_agent_class(config.agent)
+        row = {
+            "id": str(config.id),
+            "name": config.name,
+            "kind": "runtime",
+            "slug": config.slug,
+            "model": config.model,
+            "integrations": [str(i) for i in config.integrations or []],
+        }
+        found.append((row, _runtime_probe(cls, config)))
+    return found
+
+
 def _runtime_probe(cls: Any, config: Any) -> Any:
-    """The agent a row builds, so a per-instance get_oversight_policy() is asked; else its class."""
+    """The agent a row builds, so a per-instance get_oversight() is asked; else its class."""
     try:
         return cls(config)
     except Exception:
@@ -504,15 +533,6 @@ def _runtime_probe(cls: Any, config: Any) -> Any:
             "Could not build runtime agent {} to read its policy", config.slug
         )
         return type("Probe", (), {"oversight": getattr(cls, "oversight", None)})()
-
-
-def _code_description(agent: Any) -> str:
-    described = str(getattr(agent, "description", "") or "").strip()
-    integrations = ", ".join(getattr(agent, "integrations", []) or [])
-    parts = [described[:160]] if described else ["Code agent"]
-    if integrations:
-        parts.append(f"integrations: {integrations}")
-    return " · ".join(parts)
 
 
 def _override_out(o: Any) -> OverrideOut:

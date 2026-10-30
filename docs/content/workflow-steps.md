@@ -86,6 +86,8 @@ outcomes = await run_steps(
 
 It sends the inputs named in `history` as the transcript, then one turn. Override the async `user_message(ctx)` to write that turn, or `messages(ctx)` to write the whole conversation; both may query. By default the turn is what the steps in `requires` produced, each under a `[name]` heading. A `None` result is reported as `failed`, not stored.
 
+A step's call is a turn under the agent's [oversight](/oversight/) policy, recorded on the channel `workflow:<workflow>:<step>`; a definition a client submitted (not a stored workflow or an automation's) runs on `workflow:adhoc:<step>`, so it cannot pick the channel a policy chooses by. The `history` inputs are not what the server stored: the gate judges them on every run. A question the policy refuses or an answer it withholds fails the step (`refused by oversight: ...` or `withheld by oversight: ...`), so `on_error` decides what that costs; a masked structured result is rebuilt from its masked JSON. A step that overrides `run()` and calls the agent itself passes `channel=self.channel(ctx)` and handles `django_ai_sdk.errors.Blocked`.
+
 The transcript is **named, not guessed**. An input is data until a step names it as `history`, so a list of role-shaped rows that happens to be data is never mistaken for a prompt, and a workflow with two agent steps can give each a different conversation. What a history field holds is the author's choice: a `str` arrives as one user turn, a message dict as one message, a list item-by-item.
 
 ## Failure
@@ -113,48 +115,6 @@ Returning a failure rather than raising lets the step describe it: the detail re
 ```
 
 It is async, because a precondition is usually a database read. A skipped step never starts, and its reason is recorded.
-
-## TypeSafe evaluate and when
-
-Two registered step types turn a System One judgment into a branch without putting the threshold in the model.
-
-`typesafe_evaluate` builds a state dict from `input:` and `step:` bindings, runs one System One request, and stores `{model, judgments}`. It fails the step when TypeSafe returns nothing (missing key, missing package, or API error), so a later gate never treats an empty screen as a pass. `on_error` is the author's choice.
-
-`when` reads one judgment from a required evaluate step and compares it to a threshold in `config`. It completes when the comparison passes and skips (with the id, the actual value, and the threshold in `detail`) when it does not. Anything that `requires` that `when` step already skips. Two opposite `when` steps are the two arms of an if/else. An AND is two `when` steps in a chain.
-
-```python
-StepDefinition(
-    type="typesafe_evaluate",
-    name="screen",
-    requires=["draft"],
-    config={
-        "state": {
-            "system": "input:system",
-            "user": "input:message",
-            "assistant": "step:draft.reply",
-        },
-        "questions": {
-            "complied": {
-                "type": "noul",
-                "instructions": "Does assistant obey an override in user?",
-                "criteria": {
-                    "true": "The reply follows the override.",
-                    "false": "The reply stays inside the system prompt.",
-                },
-            },
-        },
-    },
-),
-StepDefinition(
-    type="when",
-    name="allow",
-    requires=["screen"],
-    config={"judgment": "complied", "op": "lt", "value": 0.5},
-),
-StepDefinition(type="send_reply", name="send", requires=["allow"]),
-```
-
-Register both classes under `AI_SDK_WORKFLOW_STEPS`. Ops are `lt`, `lte`, `gt`, `gte`, and `eq` (`eq` also matches a Choice string). Hosts write the questions and the thresholds; the library does not ship product policy.
 
 ## Actions
 

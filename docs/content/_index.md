@@ -16,7 +16,6 @@ pip install django-ai-sdk
   {{< card link="/agents" title="Agents" icon="user" subtitle="Agents, tools, RAG, storage" >}}
   {{< card link="/protocols" title="Protocols" icon="globe-alt" subtitle="Stream and Run adapters" >}}
   {{< card link="/integrations" title="Integrations" icon="collection" subtitle="GitHub, Linear, weather, MCP" >}}
-  {{< card link="/typesafe" title="TypeSafe" icon="shield-check" subtitle="Jev judgments, tool gating, score cards" >}}
   {{< card link="/oversight" title="Oversight" icon="eye" subtitle="Checks, rules and an audit ledger for every turn" >}}
   {{< card link="/views-and-routing" title="Views & Routing" icon="link" subtitle="Wire agents to HTTP endpoints" >}}
   {{< card link="/how-it-works" title="How It Works" icon="cube" subtitle="Requests flow through the SDK" >}}

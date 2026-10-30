@@ -7,11 +7,16 @@
 Both forms run through one evaluator, so a rule declared in code and a rule an
 operator tuned in the console behave identically. A lens with no usable answer
 makes every comparison on it false; `L(name).missing` tests for that.
+
+A lens that failed (its answerer broke or ran out of time, see `evaluate`'s
+`failed`) is unknown rather than false: a comparison on it is neither true nor
+false, so `~L("grounded").is_true` does not hold because "grounded" failed. Only
+`missing` and `present` read a failed lens as they read any other.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Set
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -33,6 +38,8 @@ OPS: dict[str, Any] = {
 }
 # Ops that read the answer itself, not its value.
 META_OPS = {"missing", "present", "confident", "unsure"}
+# Ops that say whether a lens answered: they read a failed lens like any other.
+PRESENCE_OPS = {"missing", "present"}
 
 
 def _num(value: Any) -> float | None:
@@ -44,7 +51,16 @@ def _num(value: Any) -> float | None:
 class Condition:
     """A test over a turn's answers, keyed by lens name."""
 
-    def evaluate(self, answers: Mapping[str, Answer]) -> bool:
+    def evaluate(self, answers: Mapping[str, Answer], failed: Set[str] = frozenset()) -> bool:
+        """Whether the condition holds: True only when it is known to.
+
+        `failed` names lenses that failed this turn: a comparison on one without a
+        usable answer is unknown, and an unknown condition does not hold.
+        """
+        return self.judge(answers, failed) is True
+
+    def judge(self, answers: Mapping[str, Answer], failed: Set[str]) -> bool | None:
+        """True, False, or None when a failed lens leaves it unknown."""
         raise NotImplementedError
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,7 +82,7 @@ class Condition:
         return f"<{type(self).__name__} {self.to_dict()}>"
 
 
-def _flatten(condition: Condition, kind: type) -> list[Condition]:
+def _flatten(condition: Condition, kind: type[All] | type[AnyOf]) -> list[Condition]:
     return list(condition.items) if isinstance(condition, kind) else [condition]
 
 
@@ -86,11 +102,14 @@ class Compare(Condition):
             raise ValueError(f"'in' needs a list of values, not {value!r}")
         self.lens = lens
         self.op = op
-        self.value = sorted(value) if isinstance(value, set | frozenset) else value
+        # Its type depends on `op`: a number, a list, a label, or None.
+        self.value: Any = sorted(value) if isinstance(value, set | frozenset) else value
 
-    def evaluate(self, answers: Mapping[str, Answer]) -> bool:
+    def judge(self, answers: Mapping[str, Answer], failed: Set[str]) -> bool | None:
         answer = answers.get(self.lens)
         usable = answer is not None and answer.ok
+        if not usable and self.lens in failed and self.op not in PRESENCE_OPS:
+            return None
         if self.op == "missing":
             return not usable
         if self.op == "present":
@@ -120,8 +139,11 @@ class All(Condition):
     def __init__(self, items: list[Condition]) -> None:
         self.items = items
 
-    def evaluate(self, answers: Mapping[str, Answer]) -> bool:
-        return all(item.evaluate(answers) for item in self.items)
+    def judge(self, answers: Mapping[str, Answer], failed: Set[str]) -> bool | None:
+        results = [item.judge(answers, failed) for item in self.items]
+        if False in results:
+            return False
+        return None if None in results else True
 
     def to_dict(self) -> dict[str, Any]:
         return {"all": [item.to_dict() for item in self.items]}
@@ -135,8 +157,11 @@ class AnyOf(Condition):
     def __init__(self, items: list[Condition]) -> None:
         self.items = items
 
-    def evaluate(self, answers: Mapping[str, Answer]) -> bool:
-        return any(item.evaluate(answers) for item in self.items)
+    def judge(self, answers: Mapping[str, Answer], failed: Set[str]) -> bool | None:
+        results = [item.judge(answers, failed) for item in self.items]
+        if True in results:
+            return True
+        return None if None in results else False
 
     def to_dict(self) -> dict[str, Any]:
         return {"any": [item.to_dict() for item in self.items]}
@@ -149,8 +174,9 @@ class Not(Condition):
     def __init__(self, item: Condition) -> None:
         self.item = item
 
-    def evaluate(self, answers: Mapping[str, Answer]) -> bool:
-        return not self.item.evaluate(answers)
+    def judge(self, answers: Mapping[str, Answer], failed: Set[str]) -> bool | None:
+        result = self.item.judge(answers, failed)
+        return None if result is None else not result
 
     def to_dict(self) -> dict[str, Any]:
         return {"not": self.item.to_dict()}
@@ -162,7 +188,7 @@ class Not(Condition):
 class Always(Condition):
     """Holds for every turn: a rule that always alerts, a lens's plain record."""
 
-    def evaluate(self, answers: Mapping[str, Answer]) -> bool:
+    def judge(self, answers: Mapping[str, Answer], failed: Set[str]) -> bool | None:
         return True
 
     def to_dict(self) -> dict[str, Any]:
@@ -202,10 +228,11 @@ class L:
         """An Entities lens found something."""
         return Compare(self.name, "any")
 
-    def __eq__(self, value: object) -> Compare:  # type: ignore[override]
+    # Builds a condition, not a bool: the point of L, so it can't match object's signature.
+    def __eq__(self, value: object) -> Compare:  # ty: ignore[invalid-method-override]
         return Compare(self.name, "eq", value)
 
-    def __ne__(self, value: object) -> Compare:  # type: ignore[override]
+    def __ne__(self, value: object) -> Compare:  # ty: ignore[invalid-method-override]
         return Compare(self.name, "ne", value)
 
     def __gt__(self, value: float) -> Compare:

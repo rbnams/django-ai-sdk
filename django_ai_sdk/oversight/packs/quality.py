@@ -1,20 +1,23 @@
 """The quality pack: was the answer any good, and was retrieval?
 
 The RAG triad (context relevance, groundedness, answer relevance) and helpfulness
-run in the background, so they cost the person nothing in latency. Jev scores the
-triad against the turn's sources and tool results, in one call of about 200 ms;
-a turn with nothing to check against is not scored for grounding. "Taken from"
-asks Jev about each source in turn, so it names the chunks the answer rests on,
-also those an earlier turn found; an answer that states facts with no source at
-all, and an empty answer, are taken from none. Helpfulness,
-the broadest judgment, asks the `judge` model where Jev is unsure. Jev also answers
-refusals and a reply in the wrong language at review. Empty retrieval and failed
-tools are facts about the turn, so code answers them.
+run in the background, so they cost the person nothing in latency. The `classifier`
+scores the triad against the turn's sources and tool results; a turn with nothing
+to check against is not scored for grounding. "Taken from" names the sources the
+answer rests on, also those an earlier turn found (a classifier that can rates each
+source in turn); an answer that states facts with no source at all, and an empty
+answer, are taken from none. Helpfulness, the broadest judgment, asks the
+`judge` model where the classifier is unsure. The classifier also answers refusals
+and a reply in the wrong language at finish. Empty retrieval and failed tools are
+facts about the turn, so code answers them.
+
+Every model answerer here is an optional alias: with none defined, those lenses are
+skipped and the pack still runs its code checks.
 """
 
 from __future__ import annotations
 
-from django_ai_sdk.oversight.answerers import EmptyRetrieval, ToolErrors, TypeSafeSources
+from django_ai_sdk.oversight.answerers import EmptyRetrieval, ToolErrors
 from django_ai_sdk.oversight.conditions import L
 from django_ai_sdk.oversight.lenses import Entities, Flag, Score
 from django_ai_sdk.oversight.policy import Policy
@@ -34,7 +37,7 @@ class ContextRelevance(Score):
     low, high = "unrelated", "exactly what is needed"
     subject = Subject.SOURCES
     stages = (Stage.REFLECT,)
-    answerers = ["jev?"]
+    answerers = ["classifier?"]
 
 
 class Groundedness(Score):
@@ -50,7 +53,7 @@ class Groundedness(Score):
     subject = Subject.OUTPUT
     stages = (Stage.REFLECT,)
     needs_evidence = True
-    answerers = ["jev?"]
+    answerers = ["classifier?"]
 
 
 class TakenFrom(Entities):
@@ -60,8 +63,10 @@ class TakenFrom(Entities):
     guidance = "Name each source a fact in the answer comes from; none when it rests on none."
     subject = Subject.OUTPUT
     stages = (Stage.REFLECT,)
+    # The labels are the turn's sources: a classifier that can rates each of them.
+    per_source = True
     # Asked of every answer: one without sources may be taken from none.
-    answerers = [TypeSafeSources()]
+    answerers = ["classifier?"]
 
 
 class AnswerRelevance(Score):
@@ -71,7 +76,7 @@ class AnswerRelevance(Score):
     low, high = "beside the point", "fully addresses it"
     subject = Subject.EXCHANGE
     stages = (Stage.REFLECT,)
-    answerers = ["jev?"]
+    answerers = ["classifier?"]
 
 
 class Helpfulness(Score):
@@ -82,7 +87,7 @@ class Helpfulness(Score):
     low, high = "useless", "excellent"
     subject = Subject.EXCHANGE
     stages = (Stage.REFLECT,)
-    answerers = ["jev?", "judge?"]
+    answerers = ["classifier?", "judge?"]
     sample = 0.25
 
 
@@ -93,8 +98,8 @@ class Refused(Flag):
     yes = "Declines, deflects or says it cannot help."
     no = "Answers, even partly."
     subject = Subject.OUTPUT
-    stages = (Stage.REVIEW,)
-    answerers = ["jev?"]
+    stages = (Stage.FINISH,)
+    answerers = ["classifier?"]
 
 
 class LanguageMismatch(Flag):
@@ -104,8 +109,8 @@ class LanguageMismatch(Flag):
     yes = "Answers in a different language than the question."
     no = "Same language."
     subject = Subject.EXCHANGE
-    stages = (Stage.REVIEW,)
-    answerers = ["jev?"]
+    stages = (Stage.FINISH,)
+    answerers = ["classifier?"]
 
 
 class NothingFound(Flag):
@@ -113,7 +118,7 @@ class NothingFound(Flag):
     label = "Nothing retrieved"
     question = "Did the assistant look things up and find nothing?"
     subject = Subject.SOURCES
-    stages = (Stage.REVIEW,)
+    stages = (Stage.FINISH,)
     answerers = [EmptyRetrieval()]
 
 
@@ -122,7 +127,7 @@ class FailedTools(Score):
     label = "Tool failures"
     question = "What share of the turn's tool calls failed?"
     subject = Subject.EXCHANGE
-    stages = (Stage.REVIEW,)
+    stages = (Stage.FINISH,)
     answerers = [ToolErrors()]
 
 
@@ -152,7 +157,7 @@ class QualityPack(Policy):
         ),
         Rule(
             "review_unsourced",
-            # Not gated on confidence: a source Jev can't settle is reason to look.
+            # Not gated on confidence: a source the classifier can't settle is reason to look.
             when=L("taken_from").present & ~L("taken_from").any,
             then=Queue("quality"),
             description="Answers taken from none of the sources, or no answer, go to a person.",

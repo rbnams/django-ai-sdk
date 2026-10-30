@@ -72,7 +72,7 @@ Settings are read via `getattr(settings, ...)` at call time (cached where noted)
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `AI_SDK_PERMISSIONS` | `{}` | Per-domain overrides: `{"memory": ["path.to.PermissionClass"], ...}`. Domains: `agent`, `thread`, `memory`, `integrations`, `workflow`. See [Permissions](/manual/permissions/). |
+| `AI_SDK_PERMISSIONS` | `{}` | Per-domain overrides: `{"memory": ["path.to.PermissionClass"], ...}`. Domains: `agent`, `thread`, `memory`, `integrations`, `automations`, `workflow`, `oversight`. See [Permissions](/manual/permissions/). |
 
 ## Workflows
 
@@ -103,6 +103,8 @@ One dict, `AI_SDK_OVERSIGHT`, every key optional. Its keys are listed in the [Ov
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `AI_SDK_MODEL_PRICES` | `{}` | Per-million-token prices by model or model prefix: `{"gpt-4.1-mini": {"input": 0.4, "output": 1.6}}`. Fills the cost of traces, turns and judges. |
+| `TYPESAFE_API_KEY` | unset | Key for oversight's optional `TypeSafe` answerer (a hosted commercial service; `django-ai-sdk[typesafe]`). Without it that answerer abstains. |
+| `TYPESAFE_MODEL` | unset | A TypeSafe model to pin; unset leaves the choice to `typesafe-sdk`. |
 
 ## Streaming and Titles
 

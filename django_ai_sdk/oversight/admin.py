@@ -1,4 +1,8 @@
-"""Read-only admin for the ledger: rows can be looked at here, never changed."""
+"""Read-only admin for the ledger: rows can be looked at here, never changed.
+
+Only the rows the chain records: no evidence, so no turn text, reason, `Text` answer
+or note, and not the sealed actor.
+"""
 
 from __future__ import annotations
 
@@ -22,14 +26,15 @@ class ReadOnly(admin.ModelAdmin):
 
 @admin.register(Turn)
 class TurnAdmin(ReadOnly):
-    list_display = ("created_at", "channel", "agent_name", "outcome", "shadow_outcome", "severity")
-    list_filter = ("outcome", "shadow_outcome", "severity", "channel", "policy")
+    list_display = ("created_at", "channel", "agent_name", "outcome", "report_outcome", "severity")
+    list_filter = ("outcome", "report_outcome", "severity", "channel", "policy")
     # The actor is sealed; content lives in evidence and is read through the service.
     exclude = ("actor_ref",)
 
 
 @admin.register(Observation)
 class ObservationAdmin(ReadOnly):
+    # Values as the record keeps them; reasons are in the evidence, read through the service.
     list_display = ("created_at", "lens", "stage", "answerer", "value", "confidence", "error")
     list_filter = ("lens", "stage", "answerer")
 
@@ -42,6 +47,7 @@ class DecisionAdmin(ReadOnly):
 
 @admin.register(ReviewItem)
 class ReviewItemAdmin(ReadOnly):
+    # The resolution holds who, the value and agreement; the note is in the evidence.
     list_display = ("created_at", "queue", "lens", "rule", "priority", "status")
     list_filter = ("queue", "status")
 

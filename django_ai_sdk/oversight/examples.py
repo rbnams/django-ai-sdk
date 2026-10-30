@@ -2,19 +2,24 @@
 
 Complete definitions in the JSON the overlay stores, so "start from an example"
 is a copy and nothing else. `why` says what an example does for you; `try` is a
-message it is about, so an admin sees it in use before picking it.
+message it is about, so an admin sees it in use before picking it. Messages a person
+sees are marked for translation (gettext_noop) and stored in English; the turn shows
+them in the active language.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-# Answerers name aliases optionally ("jev?", "judge?"), so an example
-# loads on any deployment; oversight.W006 says where none of them is defined.
-# Each example picks its own: Jev alone, or Jev with a judge where Jev may be unsure.
+from django.utils.translation import gettext_noop
 
-_JEV = ["jev?"]
-_JEV_THEN_JUDGE = ["jev?", "judge?"]
+# Answerers name aliases optionally ("classifier?", "judge?"), so an example
+# loads on any deployment; ai_sdk.oversight.W003 says where none of them is defined.
+# Each example picks its own: the classifier alone, or the classifier with a judge
+# where the classifier may be unsure.
+
+_CLASSIFIER = ["classifier?"]
+_CLASSIFIER_THEN_JUDGE = ["classifier?", "judge?"]
 
 LENS_EXAMPLES: list[dict[str, Any]] = [
     # Support
@@ -36,7 +41,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             },
             "subject": "input",
             "stages": ["gate"],
-            "answerers": _JEV,
+            "answerers": _CLASSIFIER,
         },
     },
     {
@@ -52,7 +57,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "high": "furious",
             "subject": "input",
             "stages": ["gate"],
-            "answerers": _JEV,
+            "answerers": _CLASSIFIER,
         },
     },
     {
@@ -67,8 +72,8 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "yes": "Promises or confirms money back, a discount or a free item.",
             "no": "Explains the policy or refers to a colleague.",
             "subject": "output",
-            "stages": ["review"],
-            "answerers": _JEV_THEN_JUDGE,
+            "stages": ["finish"],
+            "answerers": _CLASSIFIER_THEN_JUDGE,
         },
     },
     # Health
@@ -85,7 +90,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "no": "Past events, general health questions, or someone else's history.",
             "subject": "input",
             "stages": ["gate"],
-            "answerers": _JEV,
+            "answerers": _CLASSIFIER,
         },
     },
     {
@@ -100,8 +105,8 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "yes": "Names an amount, frequency or schedule for a medicine.",
             "no": "Mentions medicines without amounts, or refers to a doctor.",
             "subject": "output",
-            "stages": ["review"],
-            "answerers": _JEV_THEN_JUDGE,
+            "stages": ["finish"],
+            "answerers": _CLASSIFIER_THEN_JUDGE,
         },
     },
     # HR
@@ -119,7 +124,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "no": "Asks about the person's own situation, or about general policy.",
             "subject": "input",
             "stages": ["gate"],
-            "answerers": _JEV,
+            "answerers": _CLASSIFIER,
         },
     },
     {
@@ -134,7 +139,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "labels": ["leave", "payroll", "onboarding", "handbook", "other"],
             "subject": "input",
             "stages": ["gate"],
-            "answerers": _JEV,
+            "answerers": _CLASSIFIER,
         },
     },
     # Agents with tools
@@ -149,7 +154,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "question": "Would this tool call delete data or send something outside the app?",
             "subject": "tool_call",
             "stages": ["watch"],
-            "answerers": _JEV,
+            "answerers": _CLASSIFIER,
         },
     },
     # School
@@ -166,7 +171,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "subject": "exchange",
             "stages": ["reflect"],
             "sample": 0.2,
-            "answerers": _JEV_THEN_JUDGE,
+            "answerers": _CLASSIFIER_THEN_JUDGE,
         },
     },
     {
@@ -181,8 +186,8 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "low": "unsuitable",
             "high": "fully suitable",
             "subject": "output",
-            "stages": ["review"],
-            "answerers": _JEV_THEN_JUDGE,
+            "stages": ["finish"],
+            "answerers": _CLASSIFIER_THEN_JUDGE,
         },
     },
     # Sales
@@ -199,7 +204,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "default": "none",
             "subject": "input",
             "stages": ["reflect"],
-            "answerers": _JEV_THEN_JUDGE,
+            "answerers": _CLASSIFIER_THEN_JUDGE,
         },
     },
     {
@@ -270,7 +275,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "default": "neutral",
             "subject": "input",
             "stages": ["reflect"],
-            "answerers": _JEV_THEN_JUDGE,
+            "answerers": _CLASSIFIER_THEN_JUDGE,
         },
     },
     {
@@ -283,7 +288,7 @@ LENS_EXAMPLES: list[dict[str, Any]] = [
             "label": "Too long",
             "question": "Is the answer longer than 3000 characters?",
             "subject": "output",
-            "stages": ["review"],
+            "stages": ["finish"],
             "answerers": [{"class": "Length", "max_chars": 3000}],
         },
     },
@@ -328,7 +333,9 @@ RULE_EXAMPLES: list[dict[str, Any]] = [
             "then": [
                 {
                     "kind": "block",
-                    "message": "A colleague will get back to you about this within a day.",
+                    "message": gettext_noop(
+                        "A colleague will get back to you about this within a day."
+                    ),
                 }
             ],
             "description": "In live mode the promise is replaced when the answer ends; hold the "
@@ -346,7 +353,9 @@ RULE_EXAMPLES: list[dict[str, Any]] = [
             "then": [
                 {
                     "kind": "block",
-                    "message": "This sounds urgent. Call 112 or the GP emergency line now.",
+                    "message": gettext_noop(
+                        "This sounds urgent. Call 112 or the GP emergency line now."
+                    ),
                 },
                 {"kind": "notify", "severity": "critical"},
             ],
@@ -360,7 +369,9 @@ RULE_EXAMPLES: list[dict[str, Any]] = [
         "rule": {
             "name": "no_dosage",
             "when": {"lens": "gives_dosage", "op": "is_true"},
-            "then": [{"kind": "block", "message": "Please discuss this with your GP."}],
+            "then": [
+                {"kind": "block", "message": gettext_noop("Please discuss this with your GP.")}
+            ],
         },
     },
     {
@@ -376,7 +387,12 @@ RULE_EXAMPLES: list[dict[str, Any]] = [
                     {"lens": "about_a_colleague", "op": "confident", "value": 0.8},
                 ]
             },
-            "then": [{"kind": "block", "message": "I can only help with your own HR questions."}],
+            "then": [
+                {
+                    "kind": "block",
+                    "message": gettext_noop("I can only help with your own HR questions."),
+                }
+            ],
         },
     },
     {
@@ -388,7 +404,10 @@ RULE_EXAMPLES: list[dict[str, Any]] = [
             "name": "risky_tools_need_a_person",
             "when": {"lens": "risky_tool", "op": "is_true"},
             "then": [
-                {"kind": "block", "message": "That action needs approval. I've asked a colleague."},
+                {
+                    "kind": "block",
+                    "message": gettext_noop("That action needs approval. I've asked a colleague."),
+                },
                 {"kind": "queue", "queue": "approvals", "priority": 30},
             ],
         },
@@ -428,7 +447,9 @@ RULE_EXAMPLES: list[dict[str, Any]] = [
         "rule": {
             "name": "unsuitable_answer",
             "when": {"lens": "age_appropriate", "op": "lt", "value": 0.6},
-            "then": [{"kind": "block", "message": "Let's ask your teacher about this one."}],
+            "then": [
+                {"kind": "block", "message": gettext_noop("Let's ask your teacher about this one.")}
+            ],
         },
     },
     {
@@ -456,22 +477,6 @@ RULE_EXAMPLES: list[dict[str, Any]] = [
                 ]
             },
             "then": [{"kind": "block"}, {"kind": "alert", "severity": "high"}],
-        },
-    },
-    {
-        "group": "General",
-        "needs": ["prompt_injection"],
-        "why": "When unsure, a stronger model decides.",
-        "try": "A half-sure injection → a stronger model decides.",
-        "rule": {
-            "name": "double_check_injection",
-            "when": {
-                "all": [
-                    {"lens": "prompt_injection", "op": "is_true"},
-                    {"lens": "prompt_injection", "op": "unsure", "value": 0.75},
-                ]
-            },
-            "then": [{"kind": "escalate", "lens": "prompt_injection", "answerer": "strong"}],
         },
     },
 ]
@@ -523,7 +528,7 @@ POLICY_EXAMPLES: list[dict[str, Any]] = [
         "name": "sales",
         "label": "Sales site",
         "description": "Hot leads to the CRM, competitor mentions as a chart.",
-        "extends": ["security", "classify"],
+        "extends": ["security"],
         "lenses": ["buying_signal", "competitors"],
         "rules": ["hot_lead"],
     },
@@ -531,8 +536,8 @@ POLICY_EXAMPLES: list[dict[str, Any]] = [
         "name": "insights",
         "label": "Product insight",
         "description": "No rules at all: classify, summarise, and measure quality.",
-        "extends": ["classify", "quality"],
-        "capture": "redacted",
+        "extends": ["quality"],
+        "capture": "masked",
         "lenses": ["feature_request", "what_went_wrong", "tone"],
         "rules": [],
     },

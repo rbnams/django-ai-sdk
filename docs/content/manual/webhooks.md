@@ -42,6 +42,8 @@ The view verifies and queues; a `django_tasks` worker runs the agent and posts t
 5. **Queue and acknowledge.** The event goes to the worker, and the platform gets `ack(event)` (an empty 200 by default).
 6. **Run.** The worker loads the conversation's thread, runs the agent as `RUN_AS` with `AI_SDK_WEBHOOK_TIMEOUT`, persists the turn and calls `reply(event, text)`. A failing or slow run still replies, with an error or timeout message.
 
+The run is `agent.run(..., tools=True, channel="webhook:<integration>")`, so the agent's [oversight](/oversight/) policy applies as in chat. The history is the thread's own stored messages, so it is not judged again; the gate masks the question in place, so the thread stores the masked copy. A question the policy refuses gets the policy's message as the reply and is not stored; an answer it withholds is replaced by the message, which is posted and stored.
+
 While the agent runs, the event is available as `django_ai_sdk.integrations.webhooks.current_event` (a `ContextVar`), for a tool that answers in the channel itself, such as uploading a file to the same thread.
 
 ## Who the agent acts as
@@ -109,10 +111,6 @@ Signatures are Slack's v0 HMAC, refused when older than 300 seconds. Bot message
 Keys: `WEBHOOK_SECRET`, `TOKEN` (may comment on the repositories), `ALLOW_WORKSPACES` (**required**: `owner/repo` names, since one webhook can cover an organization), optionally `ACTIONS` and `BOT_USERNAME`.
 
 Add a repository or organization webhook for the `pull_request` event with a sha256 secret. The agent runs on a pull request that is opened, reopened, pushed to or marked ready for review (`ACTIONS` changes the list); drafts wait. The event text names the pull request; the agent's instructions say what a review is, and it needs the `github` integration to read the diff. The answer is posted as a PR comment, and a new push continues the same thread. A push by `BOT_USERNAME` is ignored.
-
-## TypeSafe screening
-
-When the agent resolved by `AGENT` has `typesafe_screener` set, `run_inbound` screens the inbound text before `agent.run()`, applies any `control` hints via `agent.typesafe_control`, then posts plain-text TypeSafe cards as separate channel replies (inbound card → answer → outbound card). Cards are not stored on the thread. Requires `django-ai-sdk[typesafe]` and `TYPESAFE_API_KEY`. See [TypeSafe](/typesafe/).
 
 ## Known limitations
 

@@ -97,8 +97,7 @@ These class attributes configure an agent's behavior:
 | `file_pipelines` | `[]` | Per-file-type processing pipelines |
 | `citation_formatter_class` | `DefaultCitationFormatter` | How RAG sources are rendered to the model |
 | `suggestion_generator` | `None` | Generates follow-up suggestions after a reply |
-| `typesafe_screener` | `None` | TypeSafe / Jev inbound+outbound screener class |
-| `typesafe_control` | `None` | Per-request tool-selection hints from a screener |
+| `oversight` | `None` | The [oversight](/oversight/) policy every turn runs under: a `Policy` subclass, a policy's name, `None` (the `DEFAULT_POLICY`) or `False` (none) |
 | `hidden` | `False` | Hide from registry listings |
 | `abstract` | `False` | Shared base, not registered |
 | `warmup_on_init` | `False` | Warm up RAG on agent initialization |
@@ -457,6 +456,37 @@ generic default.
 
 ---
 
+## Oversight
+
+With the [oversight](/oversight/) app installed, every turn an agent runs is checked and recorded under its policy: chat, `run()`, the HTTP run endpoints, webhooks and workflow steps alike.
+
+```python
+from django_ai_sdk.errors import Blocked
+
+
+class SupportAgent(Agent):
+    oversight = SupportPolicy          # a Policy subclass, or a registered policy's name
+
+    async def get_oversight(self, *, channel, user, **kwargs):
+        # Optional: choose per channel or per user. Returns `oversight` by default.
+        return PublicSupportPolicy if channel.startswith("webhook:") else self.oversight
+
+
+try:
+    answer = await agent.run(messages, user=request.user, channel="api")
+except Blocked as refused:
+    answer = refused.message           # the policy's text for the person asking
+```
+
+- `oversight`: a `Policy` subclass, a registered policy's name, `None` (the default: `AI_SDK_OVERSIGHT["DEFAULT_POLICY"]`) or `False` (no oversight). Anything else raises `ImproperlyConfigured` when the class is defined. A console assignment for the agent wins over both this and `get_oversight()`.
+- `async get_oversight(*, channel, user, **kwargs)`: the policy for one turn; it may read the database. Keep `**kwargs`: more about the turn may be passed later. Channels are `chat`, `run`, `api`, `webhook:<integration>`, `workflow:<workflow>:<step>` and `workflow:adhoc:<step>`. A policy only this returns is not seen by the console or the checks until a turn uses it: decorate it with `@register`.
+- `run(..., channel="run", oversight=...)`: `channel` is what the turn is recorded as on; `oversight` replaces the agent's policy for this call (`None` is `DEFAULT_POLICY`), or `False` runs it unwatched. Left out, the agent's own applies. Pass it only from code you trust; the SDK's HTTP endpoints never do.
+- `Blocked` (`django_ai_sdk.errors`) is raised by `run()` when the policy refuses the question or withholds the answer. It carries `message`, `stage` (`"gate"` or `"finish"`) and `turn_id`, and maps to HTTP 400. Chat streams the message instead, ending with finish reason `content-filter`.
+
+Under a policy, `run()` judges the history and the question, masks the last user message of your list in place when the gate masks the question (the rest of the list is left as it was), and returns the answer as finish lets it out. Each agent runs under its own policy: a run inside another turn joins it when it resolves the same policy (or none), and otherwise opens a child turn of its own; a subagent's delegation does the same. An override of `run()` is wrapped in the turn, so it cannot skip the policy, and the `super().run()` inside it joins.
+
+---
+
 ## Permissions
 
 Each agent declares `permissions`: classes that gate operations like `CHAT`, `VIEW_THREAD`, and `USE_INTEGRATION`. The demo shows per-domain overrides:
@@ -505,32 +535,13 @@ class MyAgent(Agent):
 
 ---
 
-## TypeSafe
-
-Set `typesafe_screener` to score the user message and the assistant reply with TypeSafe / Jev (optional extra `django-ai-sdk[typesafe]`). Screening fails open when the API key is unset. A screener may return `control` hints to strip or filter tools for that turn.
-
-```python
-from django_ai_sdk.typesafe import evaluate
-
-class MyScreener:
-    async def screen_input(self, text: str) -> dict | None: ...
-    async def screen_output(self, user_text: str, reply: str) -> dict | None: ...
-
-class MyAgent(Agent):
-    typesafe_screener = MyScreener
-```
-
-See [TypeSafe](/typesafe/) for a full example, tool control, and webhook cards.
-
----
-
 ## Reference Agents
 
 The demo project ships seven agents in `demos/studio/apps/agents/`, each showcasing a different pattern:
 
 | Agent | Pattern |
 | --- | --- |
-| `PirateBasicAgent` | Full-featured agent: RAG, tools, integrations, citations, suggestions, TypeSafe, files |
+| `PirateBasicAgent` | Full-featured agent: RAG, tools, integrations, citations, suggestions, files |
 | `PirateSwarmAgent` | Coordinator + hidden pirate subagents (`agents = [...]`) |
 | `DeepResearchAgent` | Coordinator + hidden web-research subagent |
 | `DefaultRuntimeAgent` | Base for DB-configured runtime agents |

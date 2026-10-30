@@ -7,13 +7,16 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+# The most rows one read returns, whatever `limit` asks for.
+MAX_LIMIT = 200
+
 
 class TurnFilter(BaseModel):
     """What the turns feed is narrowed to; a field left empty does not narrow it."""
 
     outcome: str = ""
-    # "Would have been": turns a shadow rule would have changed, and did not.
-    shadow_outcome: str = ""
+    # "Would have been": turns a rule in report mode would have changed, and did not.
+    report_outcome: str = ""
     agent_id: str = ""
     # A prefix: "telegram" matches every Telegram chat.
     channel: str = ""
@@ -23,7 +26,8 @@ class TurnFilter(BaseModel):
     label: str = ""
     value: str = ""
     rule: str = ""
-    # "open": waiting for a person; "reviewed": a person answered.
+    # "open": waiting for a person; "reviewed": a person answered or closed its
+    # review; "unreviewed": neither.
     review: str = ""
     thread_id: str = ""
     since: datetime | None = None
@@ -50,7 +54,7 @@ class TurnRow(BaseModel):
     # A pseudonym, unless this reader revealed who it is.
     actor: str
     outcome: str
-    shadow_outcome: str
+    report_outcome: str
     severity: str = ""
     labels: dict[str, Any] = Field(default_factory=dict)
     # The question's first words, in the review view.
@@ -69,6 +73,9 @@ class TurnRow(BaseModel):
 
 
 class ObservationOut(BaseModel):
+    """One answer. `rationale`, `items` and the words of a `Text` or `Entities` value come
+    from the evidence, in the review view only; audit sees the record's value."""
+
     id: str
     lens: str
     label: str = ""
@@ -102,6 +109,9 @@ class DecisionOut(BaseModel):
 
 
 class ReviewOut(BaseModel):
+    """A review item. `resolution` holds "by", "value" and "agree"; in the review view of a
+    turn that keeps its text, also "note", from the evidence."""
+
     id: str
     turn_id: str
     queue: str
@@ -109,7 +119,6 @@ class ReviewOut(BaseModel):
     rule: str = ""
     priority: int = 0
     status: str
-    assignee: str = ""
     created_at: datetime
     resolved_at: datetime | None = None
     resolution: dict[str, Any] | None = None
@@ -133,7 +142,8 @@ class ChainProof(BaseModel):
 class TurnDetail(TurnRow):
     purpose: str
     evidence: dict[str, Any] | None = None
-    # Why there is no evidence: "none", "metadata", "shredded", "expired", "withheld".
+    # Why there is no evidence: "none", "metadata", "shredded", "expired", "withheld",
+    # or "unreadable": sealed under another MASTER_KEY than this deployment's.
     evidence_state: str = ""
     observations: list[ObservationOut] = Field(default_factory=list)
     decisions: list[DecisionOut] = Field(default_factory=list)
@@ -141,8 +151,14 @@ class TurnDetail(TurnRow):
     chain: ChainProof = Field(default_factory=ChainProof)
     thread_id: str = ""
     message_id: str = ""
+    # What went wrong in the turn's own stages (a lens crash, a disconnect), never content.
+    error: str = ""
+    # The outer turn, when this one ran nested under another policy (a subagent).
+    parent_turn_id: str = ""
     agent_fingerprint: str = ""
     revealed: bool = False
+    # Revealed, but who asked was forgotten: `actor` stays the pseudonym.
+    actor_forgotten: bool = False
 
 
 class TurnPage(BaseModel):
@@ -158,6 +174,8 @@ class RevealOut(BaseModel):
     user_id: str = ""
     username: str = ""
     access_id: str
+    # Who asked was forgotten with the thread: `actor` is the pseudonym, and that is all.
+    forgotten: bool = False
 
 
 class VerdictIn(BaseModel):
@@ -193,6 +211,13 @@ class OverrideOut(BaseModel):
     changed_at: datetime
 
 
+class AgentRef(BaseModel):
+    id: str
+    name: str
+    # "code" for a registered class, "runtime" for one configured in the database.
+    kind: str
+
+
 class PolicySummary(BaseModel):
     name: str
     label: str
@@ -201,13 +226,40 @@ class PolicySummary(BaseModel):
     # "pack:<name>", "code", or "db" for a policy made in the console.
     origin: str = "code"
     extends: list[str] = Field(default_factory=list)
+    # The names of the agents it watches; `agent_refs` tells same-named ones apart.
     agents: list[str] = Field(default_factory=list)
+    agent_refs: list[AgentRef] = Field(default_factory=list)
     lenses: int = 0
     rules: int = 0
     enforced: int = 0
-    shadow: int = 0
+    report: int = 0
     # Why the policy does not resolve, when it does not.
     error: str = ""
+
+
+class PolicyOut(BaseModel):
+    """A policy as it runs: every lens and rule, and where each value comes from."""
+
+    name: str
+    label: str
+    description: str = ""
+    # "code", "pack:<name>", or "db" for a policy defined in the console.
+    origin: str = "code"
+    extends: list[str] = Field(default_factory=list)
+    capture: str
+    stream_mode: str
+    retention: dict[str, int] = Field(default_factory=dict)
+    # A lens's or rule's fields depend on its kind.
+    lenses: list[dict[str, Any]] = Field(default_factory=list)
+    rules: list[dict[str, Any]] = Field(default_factory=list)
+    # "policy.capture" -> "code" | "settings" | "db" | "pack:<name>" ...
+    sources: dict[str, str] = Field(default_factory=dict)
+    # Overlay entries that could not apply, each with its reason.
+    rejected: list[dict[str, Any]] = Field(default_factory=list)
+    # Each parent a lens or rule is inherited from -> its label.
+    parent_labels: dict[str, str] = Field(default_factory=dict)
+    aliases: list[str] = Field(default_factory=list)
+    agents: list[AgentRow] = Field(default_factory=list)
 
 
 class PolicyIn(BaseModel):
@@ -229,7 +281,12 @@ class AgentRow(BaseModel):
     name: str
     # "code" for a registered class, "runtime" for one configured in the database.
     kind: str
+    # The agent's own description, if it has one.
     description: str = ""
+    # A runtime agent's slug; the model, where the agent names one.
+    slug: str = ""
+    model: str = ""
+    integrations: list[str] = Field(default_factory=list)
     # What the agent's own code asks for, and why: "agent", "off" or "default".
     code_policy: str = ""
     code_reason: str = ""
@@ -293,6 +350,41 @@ class TryAnswererIn(BaseModel):
     )
 
 
+class AnswerOut(BaseModel):
+    """One dry-run answer, with every answerer asked on the way in `trail`."""
+
+    answerer: str = ""
+    model: str = ""
+    value: Any = None
+    confidence: float | None = None
+    rationale: str = ""
+    error: str = ""
+    queued: str = ""
+    latency_ms: float | None = None
+    cost: float | None = None
+    spans: list[dict[str, Any]] = Field(default_factory=list)
+    items: dict[str, float] = Field(default_factory=dict)
+    trail: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TryLensOut(AnswerOut):
+    lens: str
+    kind: str
+    stage: str
+
+
+class SimulateOut(BaseModel):
+    """What a policy would do with one exchange, stage by stage."""
+
+    policy: str
+    stages: list[dict[str, Any]] = Field(default_factory=list)
+    # The stage that stopped the turn, or "".
+    ended_at: str = ""
+    outcome: str
+    report_outcome: str
+    had_output: bool = False
+
+
 class CheckpointOut(BaseModel):
     id: str
     tree_size: int
@@ -330,7 +422,7 @@ class Overview(BaseModel):
     since: datetime
     turns: int
     by_outcome: dict[str, int]
-    by_shadow_outcome: dict[str, int]
+    by_report_outcome: dict[str, int]
     by_channel: dict[str, int]
     by_agent: dict[str, int]
     daily: list[dict[str, Any]]
@@ -343,12 +435,19 @@ class Overview(BaseModel):
     budget_per_day: float | None = None
     currency: str = "EUR"
     queues: dict[str, int] = Field(default_factory=dict)
+    # Labels, positive rates, the triad and agreement read the newest `sample_size`
+    # turns and answers; True when the window held more.
+    sampled: bool = False
+    sample_size: int = 0
 
 
 __all__ = [
+    "MAX_LIMIT",
     "AccessOut",
     "AgentPolicyIn",
+    "AgentRef",
     "AgentRow",
+    "AnswerOut",
     "AnswererIn",
     "ChainProof",
     "CheckpointOut",
@@ -358,13 +457,16 @@ __all__ = [
     "OverrideOut",
     "Overview",
     "PolicyIn",
+    "PolicyOut",
     "PolicySummary",
     "RevealOut",
     "ReviewOut",
     "RuleHit",
     "SimulateIn",
+    "SimulateOut",
     "TryAnswererIn",
     "TryLensIn",
+    "TryLensOut",
     "TurnDetail",
     "TurnFilter",
     "TurnPage",

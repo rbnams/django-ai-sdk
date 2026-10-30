@@ -1,42 +1,59 @@
-"""Oversight: audit every turn's question and answer, judge it any way you like.
+"""Oversight: check and record every turn an agent runs, whichever way it runs.
 
-Add "django_ai_sdk.oversight" to INSTALLED_APPS, give an agent a policy, and
-every turn it runs, on any channel, lands on a hash-chained ledger with the
-answers of the policy's lenses and the decisions of its rules::
+Add "django_ai_sdk.oversight" to INSTALLED_APPS and give an agent a policy. Every
+turn it runs (chat, Agent.run(), the HTTP run endpoints, webhooks, workflow steps)
+is judged by the policy's lenses, acted on by its rules, and lands on a
+hash-chained ledger::
 
-    # myapp/oversight.py
-    from django_ai_sdk.oversight import L, Choice, Policy, Queue, Rule, register
+    from django_ai_sdk import Agent
+    from django_ai_sdk.errors import Blocked
+    from django_ai_sdk.oversight import (
+        PII, Entities, L, Mask, Mode, Policy, Queue, Rule, Stage, Subject, pick,
+    )
+    from django_ai_sdk.oversight.packs import SecurityPack
 
-    @register
-    class Support(Policy):
+    class SupportPolicy(Policy):
         name = "support"
-        extends = ["security", "quality"]
-        lenses = [Choice(name="topic", question="What is this about?",
-                         labels=["billing", "hr", "other"], answerers=["jev?"])]
-        rules = [Rule("hr_goes_to_people", when=L("topic") == "hr", then=Queue("hr"))]
+        stream_mode = "hold"  # the answer is shown once finish has masked it
+        lenses = [
+            *pick(SecurityPack.lenses, "prompt_injection"),
+            Entities(name="pii", question="Which kinds of personal data does the answer contain?",
+                     subject=Subject.OUTPUT, stages=(Stage.FINISH,), answerers=[PII()]),
+        ]
+        rules = [
+            *pick(SecurityPack.rules, "block_injection", mode=Mode.ENFORCE),
+            Rule("mask_pii", when=L("pii").any, then=Mask(), mode=Mode.ENFORCE),
+            Rule("iban_to_people", when=L("pii").contains("iban"), then=Queue("privacy")),
+        ]
 
     class SupportAgent(Agent):
-        oversight = "support"
+        oversight = SupportPolicy  # registered with the agent; or a registered name
 
-Lenses observe, rules act; rules start in test mode (shadow). See docs/oversight.md.
+    try:
+        answer = await SupportAgent().run(messages, user=user)
+    except Blocked as refused:
+        answer = refused.message
 
-Only the declaration API is re-exported here. Specialised detectors and
-classifiers live in `django_ai_sdk.oversight.answerers`; models, services and
-tasks in their own modules, so importing this package needs no app registry.
+Lenses observe, rules act; a rule starts in report mode, recording what it would
+have done. Use `@register` for a policy no agent class names. See
+docs/content/oversight.md.
+
+Only the declaration API is re-exported here. Specialised detectors and vendor
+answerers (TypeSafe) live in `django_ai_sdk.oversight.answerers`, the built-in
+packs in `django_ai_sdk.oversight.packs`; models, services and tasks in their own
+modules, so importing this package needs no app registry.
 """
 
 from __future__ import annotations
 
 from django_ai_sdk.oversight.answerers import (
     PII,
-    AgentJudge,
     Function,
     Human,
     Keywords,
     LLMJudge,
     Patterns,
     Secrets,
-    TypeSafe,
 )
 from django_ai_sdk.oversight.conditions import L
 from django_ai_sdk.oversight.lenses import Choice, Entities, Flag, Lens, Score, Text
@@ -44,12 +61,10 @@ from django_ai_sdk.oversight.policy import Policy, pick
 from django_ai_sdk.oversight.registry import register
 from django_ai_sdk.oversight.rules import (
     Alert,
-    Allow,
     Block,
-    Escalate,
+    Mask,
     Notify,
     Queue,
-    Redact,
     RestrictTools,
     Rule,
 )
@@ -58,6 +73,7 @@ from django_ai_sdk.oversight.types import (
     Capture,
     Mode,
     Purpose,
+    Severity,
     Stage,
     Subject,
     TurnView,
@@ -65,15 +81,12 @@ from django_ai_sdk.oversight.types import (
 
 __all__ = [
     "PII",
-    "AgentJudge",
     "Alert",
-    "Allow",
     "Answer",
     "Block",
     "Capture",
     "Choice",
     "Entities",
-    "Escalate",
     "Flag",
     "Function",
     "Human",
@@ -81,22 +94,22 @@ __all__ = [
     "L",
     "LLMJudge",
     "Lens",
+    "Mask",
     "Mode",
     "Notify",
     "Patterns",
     "Policy",
     "Purpose",
     "Queue",
-    "Redact",
     "RestrictTools",
     "Rule",
     "Score",
     "Secrets",
+    "Severity",
     "Stage",
     "Subject",
     "Text",
     "TurnView",
-    "TypeSafe",
     "pick",
     "register",
 ]

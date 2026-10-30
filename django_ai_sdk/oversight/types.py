@@ -22,22 +22,20 @@ class Subject(StrEnum):
 
 
 class Stage(StrEnum):
-    """When a lens runs. Only gate, watch and review can still change the turn."""
+    """When a lens runs. Only gate, watch and finish can still change the turn."""
 
     # Before the question is stored or reaches the model.
     GATE = "gate"
     # While the answer streams, and before each tool call.
     WATCH = "watch"
     # Once the answer is complete, before it is stored.
-    REVIEW = "review"
+    FINISH = "finish"
     # In the background, after the turn is on the ledger.
     REFLECT = "reflect"
-    # Replaying stored turns against a changed agent.
-    RETRO = "retro"
 
 
 # Stages that run while the person waits, in order.
-INLINE_STAGES = (Stage.GATE, Stage.WATCH, Stage.REVIEW)
+INLINE_STAGES = (Stage.GATE, Stage.WATCH, Stage.FINISH)
 
 
 class Mode(StrEnum):
@@ -45,7 +43,7 @@ class Mode(StrEnum):
 
     OFF = "off"
     # Recorded as what it would have done; the turn is untouched.
-    SHADOW = "shadow"
+    REPORT = "report"
     ENFORCE = "enforce"
 
 
@@ -54,10 +52,10 @@ class Capture(StrEnum):
 
     # Hashes and decisions only.
     NONE = "none"
-    # Lengths, labels, sources' titles and urls, tool names; no text.
+    # Lengths, labels, sources' kinds, tool names; no text, not even a title or a url.
     METADATA = "metadata"
-    # Text, with every redaction a rule found applied.
-    REDACTED = "redacted"
+    # Text, with every mask a rule found applied.
+    MASKED = "masked"
     FULL = "full"
 
 
@@ -94,7 +92,7 @@ class Outcome(StrEnum):
 
     BLOCKED = "blocked"
     RESTRICTED = "restricted"
-    REDACTED = "redacted"
+    MASKED = "masked"
     FLAGGED = "flagged"
     ALLOWED = "allowed"
 
@@ -129,7 +127,7 @@ class Answer(BaseModel):
     rationale: str = ""
     spans: list[TextSpan] = Field(default_factory=list)
     # What an answerer judging item by item weighed: each item's probability, by key
-    # (TypeSafeSources: each source's, by source key).
+    # (a lens with `per_source`: each source's, by source key).
     items: dict[str, float] = Field(default_factory=dict)
 
     answerer: str = ""
@@ -180,6 +178,10 @@ class HistoryItem(BaseModel):
     content: str
 
 
+# How much of a source's text a tool result must repeat to count as that source.
+SOURCE_HEAD_CHARS = 120
+
+
 class TurnView(BaseModel):
     """Everything a lens may look at, at the moment it runs."""
 
@@ -223,7 +225,7 @@ class TurnView(BaseModel):
         the sources earlier turns found, last: a follow-up may answer from them.
         """
         sources = self.fresh_sources()
-        heads = [s.content.strip()[:120] for s in sources if s.content.strip()]
+        heads = [s.content.strip()[:SOURCE_HEAD_CHARS] for s in sources if s.content.strip()]
         results = [
             Source(title=f"{call.name} result", content=_compact(call.result), kind="tool")
             for call in self.tool_calls

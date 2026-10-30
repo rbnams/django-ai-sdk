@@ -3,7 +3,7 @@
 The chain proves order; a checkpoint makes it cheap to prove to an outsider.
 Publish a checkpoint (an exporter can post it anywhere you don't control) and
 the deployment can no longer rewrite history before it without the published
-root disagreeing. Trees are RFC 6962; the note is a C2SP signed note, so
+root disagreeing, for anyone who compares the two. Trees are RFC 6962; the note is a C2SP signed note, so
 standard tlog tooling reads it.
 """
 
@@ -17,6 +17,8 @@ from django.core.exceptions import ImproperlyConfigured
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from django_ai_sdk.oversight.models import Checkpoint
 
 
 def leaf_hash(data: bytes) -> bytes:
@@ -147,16 +149,21 @@ def verify_consistency(
 ED25519_ALG = b"\x01"
 
 
-def _private_key(raw_b64: str) -> Any:
+def private_key(raw_b64: str) -> Any:
+    """The Ed25519 key in `raw_b64`. ImproperlyConfigured when it is unusable."""
+    try:
+        raw = base64.b64decode((raw_b64 or "").strip(), validate=True)
+    except ValueError:
+        raw = b""
+    if len(raw) != 32:
+        raise ImproperlyConfigured("AI_SDK_OVERSIGHT['SIGNING_KEY'] must be base64 of 32 bytes.")
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    except ImportError as exc:  # pragma: no cover - needs the extra
+    except ImportError as exc:
         raise ImproperlyConfigured(
-            "Signing checkpoints needs cryptography: pip install django-ai-sdk[oversight]"
+            "AI_SDK_OVERSIGHT['SIGNING_KEY'] is set, but the cryptography package is not "
+            "installed: no checkpoint can be signed."
         ) from exc
-    raw = base64.b64decode(raw_b64)
-    if len(raw) != 32:
-        raise ImproperlyConfigured("AI_SDK_OVERSIGHT['SIGNING_KEY'] must be 32 bytes, base64")
     return Ed25519PrivateKey.from_private_bytes(raw)
 
 
@@ -170,9 +177,9 @@ def checkpoint_body(origin: str, size: int, root: bytes) -> str:
 
 def sign_note(body: str, *, name: str, private_key_b64: str) -> str:
     """`body` followed by one Ed25519 signature line."""
+    key = private_key(private_key_b64)
     from cryptography.hazmat.primitives import serialization
 
-    key = _private_key(private_key_b64)
     public = key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
     )
@@ -183,12 +190,11 @@ def sign_note(body: str, *, name: str, private_key_b64: str) -> str:
 
 def verifier_key(name: str, private_key_b64: str) -> str:
     """The public verifier key string, `name+keyhash+base64(alg||pub)`, to publish."""
+    key = private_key(private_key_b64)
     from cryptography.hazmat.primitives import serialization
 
-    public = (
-        _private_key(private_key_b64)
-        .public_key()
-        .public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    public = key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
     )
     return f"{name}+{key_id(name, public).hex()}+{base64.b64encode(ED25519_ALG + public).decode()}"
 
@@ -208,7 +214,10 @@ def verify_note(note: str, verifier: str) -> bool:
     for line in signatures.splitlines():
         if not line.startswith(f"— {name} "):
             continue
-        blob = base64.b64decode(line.rsplit(" ", 1)[1])
+        try:
+            blob = base64.b64decode(line.rsplit(" ", 1)[1])
+        except ValueError:
+            continue
         if blob[:4] != key_id(name, public):
             continue
         try:
@@ -226,15 +235,78 @@ def generate_signing_key() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
+# Checkpoints of this deployment's ledger.
+
+
+def ledger_root(size: int) -> bytes | None:
+    """The Merkle root over the first `size` ledger entries; None when there are fewer."""
+    from django_ai_sdk.oversight.models import LedgerEntry
+
+    hashes = LedgerEntry.objects.order_by("seq").values_list("entry_hash", flat=True)[:size]
+    leaves = [bytes.fromhex(h) for h in hashes]
+    return merkle_root(leaves) if len(leaves) == size else None
+
+
+def matches(checkpoint: Checkpoint) -> bool:
+    """Whether the ledger's first `tree_size` entries still give the checkpoint's root."""
+    root = ledger_root(checkpoint.tree_size)
+    return root is not None and root.hex() == checkpoint.root_hash
+
+
+def signed_by(checkpoint: Checkpoint, verifier: str) -> bool:
+    """Whether `verifier` signed the checkpoint's note, and the note states its size and root.
+
+    The row's tree_size and root_hash are plain columns: only the note is signed.
+    """
+    try:
+        _origin, size, root = checkpoint.note.split("\n")[:3]
+        stated = int(size) == checkpoint.tree_size and (
+            base64.b64decode(root).hex() == checkpoint.root_hash
+        )
+    except ValueError:
+        return False
+    return stated and verify_note(checkpoint.note, verifier)
+
+
+def write_checkpoint(
+    *, origin: str, name: str = "", key: str = ""
+) -> tuple[Checkpoint, bool] | None:
+    """Checkpoint the ledger as it stands, signed with `key` when given. Synchronous.
+
+    Returns (checkpoint, created), or None when nothing was added since the last.
+    One checkpoint per tree size: a second sealer at the same moment gets the
+    first one's back with created False, never an error.
+    """
+    from django_ai_sdk.oversight.models import Checkpoint, LedgerEntry
+
+    last = Checkpoint.objects.order_by("-tree_size").first()
+    size = LedgerEntry.objects.count()
+    if size == 0 or (last is not None and last.tree_size >= size):
+        return None
+    root = ledger_root(size)
+    if root is None:
+        return None
+    body = checkpoint_body(origin, size, root)
+    note = sign_note(body, name=name or origin, private_key_b64=key) if key else body
+    return Checkpoint.objects.get_or_create(
+        tree_size=size, defaults={"root_hash": root.hex(), "note": note, "signed": bool(key)}
+    )
+
+
 __all__ = [
     "checkpoint_body",
     "consistency_proof",
     "generate_signing_key",
     "inclusion_proof",
+    "ledger_root",
+    "matches",
     "merkle_root",
+    "private_key",
     "sign_note",
+    "signed_by",
     "verifier_key",
     "verify_consistency",
     "verify_inclusion",
     "verify_note",
+    "write_checkpoint",
 ]

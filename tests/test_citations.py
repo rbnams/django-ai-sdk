@@ -648,3 +648,19 @@ class TestCitationAgent:
         settings.AI_SDK_TASK_MODEL = "openai/gpt-oss-120b"
         settings.AI_SDK_CITATION_AGENT = "tests.unit.test_workflow_steps.StubAgent"
         assert type(get_citation_agent(object())).__name__ == "StubAgent"
+
+
+async def test_citing_is_not_a_turn_of_its_own():
+    """A side task over an answer oversight judges in its own turn: the policy does not run again."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from django_ai_sdk.adapters.citations.grounding import cite
+    from django_ai_sdk.agents.base import Agent
+
+    registry = SourceRegistry()
+    registry.add([from_document(CHUNK)])
+    agent = MagicMock(spec=Agent, run=AsyncMock(return_value="[]"))
+
+    await cite(ANSWER, registry, agent)
+
+    assert agent.run.call_args.kwargs["oversight"] is False

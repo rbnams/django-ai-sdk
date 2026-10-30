@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import json
 import uuid
 from typing import TYPE_CHECKING, Any, cast, overload
 
+from django.utils.translation import gettext_lazy
 from haystack import Pipeline
 from haystack.components.agents import Agent
 from haystack.dataclasses import ChatMessage as HaystackChatMessage
@@ -14,12 +16,14 @@ from haystack.dataclasses import (
     ReasoningContent,
     StreamingChunk,
     ToolCall,
+    ToolCallResult,
 )
 
 from django_ai_sdk.adapters.citations.grounding import Grounder, rebase, uncited
 from django_ai_sdk.adapters.citations.registry import current_registry
 from django_ai_sdk.adapters.utils import merge_messages
 from django_ai_sdk.agents.subagent import SUBAGENT_META_KEY, SubagentStreamFilter
+from django_ai_sdk.artifacts.schemas import turn_artifacts
 from django_ai_sdk.artifacts.tool_artifacts import build_artifact
 from django_ai_sdk.common import (
     ChatMessage,
@@ -28,7 +32,6 @@ from django_ai_sdk.common import (
 )
 from django_ai_sdk.errors import ErrorInfo, describe_error
 from django_ai_sdk.events import (
-    DataEvent,
     ErrorEvent,
     MessageEndEvent,
     MessageStartEvent,
@@ -45,6 +48,7 @@ from django_ai_sdk.events import (
 )
 from django_ai_sdk.generators import schema_kwargs
 from django_ai_sdk.logger import get_logger
+from django_ai_sdk.oversight.hooks import masked_result
 from django_ai_sdk.oversight.session import active as oversee
 from django_ai_sdk.oversight.stream import (
     CONTENT_FILTER,
@@ -59,15 +63,12 @@ from django_ai_sdk.utils import resolve_setting
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
-    from haystack.dataclasses import ToolCallResult
-
     from django_ai_sdk.adapters.citations import SourceRegistry
     from django_ai_sdk.adapters.interfaces import T
     from django_ai_sdk.adapters.suggestions import SuggestionGenerator
     from django_ai_sdk.artifacts.tool_artifacts import ToolArtifact
-    from django_ai_sdk.oversight.session import ReviewResult, TurnSession
+    from django_ai_sdk.oversight.session import FinishResult, TurnSession
     from django_ai_sdk.storage.base import BaseStorageAdapter
-    from django_ai_sdk.typesafe import TypeSafeScreener
 
 
 logger = get_logger(__name__)
@@ -181,28 +182,30 @@ def get_error_chunk(e: Exception, info: ErrorInfo) -> MessageChunk:
     )
 
 
-# What a held answer's tool cards show before review: that a tool ran, not what it
-# was given or found. Review then sends the real input and output, or WITHHELD.
-HELD_OUTPUT = {"result": {"held": "Shown once the answer is checked."}}
-WITHHELD_OUTPUT = {"result": {"withheld": "Not shown: oversight withheld this answer."}}
+# What a held answer's tool cards show before finish: that a tool ran, not what it
+# was given or found. Finish then sends the real input and output, or WITHHELD.
+# Translated when sent, as {"result": {"held": ...}} and {"result": {"withheld": ...}}.
+HELD_OUTPUT = gettext_lazy("Shown once the answer is checked.")
+WITHHELD_OUTPUT = gettext_lazy("Not shown: oversight withheld this answer.")
 
 
 def held_progress(event: StreamEvent) -> StreamEvent | None:
-    """A held tool event as it may show before review: its name and progress, no content."""
+    """A held tool event as it may show before finish: its name and progress, no content."""
     if isinstance(event, ToolCallStartEvent):
         return event
     if isinstance(event, ToolInputCompleteEvent):
         return event.model_copy(update={"tool_input": {}})
     if isinstance(event, ToolOutputEvent):
-        return event.model_copy(update={"tool_output": HELD_OUTPUT})
+        return event.model_copy(update={"tool_output": {"result": {"held": str(HELD_OUTPUT)}}})
     return None
 
 
 def released(held: list[StreamEvent], *, withheld: bool) -> list[StreamEvent]:
-    """What follows a held answer's review: the real tool input, output and data, or WITHHELD."""
+    """What follows a held answer's finish: the real tool input, output and data, or WITHHELD."""
     if withheld:
+        output = {"result": {"withheld": str(WITHHELD_OUTPUT)}}
         return [
-            event.model_copy(update={"tool_output": WITHHELD_OUTPUT})
+            event.model_copy(update={"tool_output": output})
             for event in held
             if isinstance(event, ToolOutputEvent)
         ]
@@ -210,8 +213,8 @@ def released(held: list[StreamEvent], *, withheld: bool) -> list[StreamEvent]:
     return [e for e in held if not isinstance(e, ToolCallStartEvent | ToolInputChunkEvent)]
 
 
-def _store_unreviewed(writer: StreamWriter) -> None:
-    """Store none of an answer oversight did not get to review: unchecked, it could hold anything."""
+def _store_unchecked(writer: StreamWriter) -> None:
+    """Store none of an answer oversight did not finish checking: it could hold anything."""
     writer.replace_text("")
     writer.drop_reasoning()
     writer.drop_tool_details()
@@ -306,6 +309,7 @@ class Run:
                 generation_kwargs=schema_kwargs(self.generator, response_format),
             )
             reply = response["replies"][0]
+            _report_usage(reply)
             if not reply.text:
                 # no answer to validate
                 logger.warning(
@@ -317,7 +321,22 @@ class Run:
             return response_format.model_validate_json(reply.text)
 
         response = await self.generator.run_async(messages=user_messages)
-        return response["replies"][0].text
+        reply = response["replies"][0]
+        _report_usage(reply)
+        return reply.text
+
+
+def _report_usage(reply: HaystackChatMessage) -> None:
+    """Tell the turn this reply ran in what it cost, as the tool loop does."""
+    from django_ai_sdk.oversight.session import current_session
+    from django_ai_sdk.pricing import usage_from_meta
+
+    if (session := current_session()) is None:
+        return
+    meta = getattr(reply, "meta", None) or {}
+    prompt, completion = usage_from_meta(meta)
+    if prompt is not None or completion is not None:
+        session.add_usage(meta.get("model"), prompt, completion)
 
 
 class Stream:
@@ -341,7 +360,6 @@ class Stream:
     _grounder: Grounder | None = None
     # the citations tool call shown while the answer streams
     _citations_call_id: str | None = None
-    typesafe_screener: TypeSafeScreener | None = None
     # The turn's oversight session; set per run by Agent.as_view when a policy applies.
     oversight: TurnSession | None = None
 
@@ -356,7 +374,6 @@ class Stream:
         storage_adapter: BaseStorageAdapter | None = None,
         citation_registry: SourceRegistry | None = None,
         suggestion_generator: SuggestionGenerator | None = None,
-        typesafe_screener: TypeSafeScreener | None = None,
     ) -> None:
         self.pipeline = pipeline
         if not isinstance(pipeline, Pipeline):
@@ -369,9 +386,13 @@ class Stream:
         self.storage_adapter = storage_adapter
         self.citation_registry = citation_registry
         self.suggestion_generator = suggestion_generator
-        self.typesafe_screener = typesafe_screener
         self._persisted_tool_ids: set[str] = set()
         self._persisted_tool_output_ids: set[str] = set()
+        # Artifacts stored during this answer: a withheld answer takes them along.
+        # Artifact tools (ArtifactSchema.as_tool) add theirs here too, via turn_artifacts.
+        self._artifact_ids: list[str] = []
+        # Sources' text as oversight masked it, by key: masked once per text.
+        self._masked_sources: dict[str, str] = {}
         self.message_result: ChatMessage | None = None
         self.first_component = list(pipeline.graph.nodes())[0] if pipeline.graph.nodes() else None
 
@@ -463,6 +484,37 @@ class Stream:
             return {"handoff": handoff}
         return {}
 
+    def _session(self) -> TurnSession | None:
+        return self.oversight if self.oversight is not None and self.oversight.active else None
+
+    async def _drop_artifacts(self) -> None:
+        """A withheld answer's artifacts go with it: they hold what its tools found."""
+        if not self._artifact_ids:
+            return
+        from django_ai_sdk.artifacts.models import Artifact
+
+        await Artifact.objects.filter(id__in=self._artifact_ids).adelete()
+        self._artifact_ids.clear()
+
+    async def _mask_sources(self, session: TurnSession) -> None:
+        """Mask the sources' text in the registry, the way tool results are masked.
+
+        The citations card, the stored citations artifact (and so the thread's
+        sources endpoint) and the lenses all read the registry: none sees what a
+        search found before the policy masked it. Each text is masked once.
+        """
+        registry = self.citation_registry
+        if registry is None:
+            return
+        for source in registry.all:
+            text = source.content or ""
+            if not text or self._masked_sources.get(source.key) == text:
+                continue
+            digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+            masked = await session.mask_result(f"source:{source.key}:{digest}", text)
+            source.content = masked
+            self._masked_sources[source.key] = masked
+
     def get_text_chunk(self, content: str) -> MessageChunk:
         """Create a text MessageChunk."""
         return MessageChunk(type="text", content=content)
@@ -539,6 +591,7 @@ class Stream:
         if built is None:
             return
         data, payload = built
+        self._artifact_ids.append(str(payload["artifact_id"]))
         name = spec.artifact.tool_name()
         tool_call_id = f"{name}-{payload['artifact_id']}"
         self._persist_tool(
@@ -578,7 +631,7 @@ class Stream:
                 async for _ in grounder.wait(answer, timeout):
                     for event in self._partial_citations(grounder):
                         yield event
-                # Review may have masked the answer: quotes must still be in it.
+                # Finish may have masked the answer: quotes must still be in it.
                 data = rebase(grounder.citations(), answer)
         except Exception:
             logger.exception("Placing citations failed; the answer has none")
@@ -787,9 +840,18 @@ class Stream:
                         result.origin.arguments,
                     )
                 if result.error:
-                    logger.error(
-                        f"Tool call failed: tool={result.origin.tool_name}, result={result.result}"
-                    )
+                    # A result may quote what the tool read; it is only logged at debug.
+                    logger.warning(f"Tool call failed: tool={result.origin.tool_name}")
+                    logger.debug(f"Tool call result: {result.result}")
+                if (session := self._session()) is not None:
+                    # Shown and stored as the model reads it: masked once, before either.
+                    masked = await masked_result(session, result.origin.id or "", result.result)
+                    if masked is not result.result:
+                        result = ToolCallResult(
+                            result=masked, origin=result.origin, error=result.error
+                        )
+                    # What the tool found for citations, before any card shows it.
+                    await self._mask_sources(session)
                 tool_output = parse_tool_output(result.to_dict())
                 self._persist_tool(
                     stream_writer,
@@ -891,59 +953,6 @@ class Stream:
             logger.opt(exception=e).error("Error generating suggestions: {}", e)
         return None
 
-    async def get_typesafe_input_screen(self, messages: list[ChatMessage]) -> DataEvent | None:
-        """Score the latest user message; fail-open when screening is unavailable.
-
-        When the payload includes ``control`` hints, apply them to this stream's
-        Haystack agent tools before generation starts.
-        """
-        if not self.typesafe_screener:
-            return None
-        text = ""
-        for message in reversed(messages):
-            if message.role == "user" and message.content:
-                text = message.content
-                break
-        if not text:
-            return None
-        try:
-            payload = await self.typesafe_screener.screen_input(text)
-        except Exception:
-            logger.exception("TypeSafe inbound screen failed; continuing without scores")
-            return None
-        if not payload:
-            return None
-        from django_ai_sdk.typesafe.control import (
-            apply_control_to_agent_component,
-            enrich_payload_acted,
-        )
-
-        control = payload.get("control") if isinstance(payload, dict) else None
-        if isinstance(control, dict):
-            apply_control_to_agent_component(self.agent_component, control)
-            payload = enrich_payload_acted(payload)
-        return DataEvent(data_type="typesafe", data=payload)
-
-    async def get_typesafe_output_screen(self, messages: list[ChatMessage]) -> DataEvent | None:
-        """Score the finished assistant reply; fail-open when screening is unavailable."""
-        if not self.typesafe_screener or not self.message_result or not self.message_result.content:
-            return None
-        user_text = ""
-        for message in reversed(messages):
-            if message.role == "user" and message.content:
-                user_text = message.content
-                break
-        try:
-            payload = await self.typesafe_screener.screen_output(
-                user_text, self.message_result.content
-            )
-        except Exception:
-            logger.exception("TypeSafe outbound screen failed; continuing without scores")
-            return None
-        if not payload:
-            return None
-        return DataEvent(data_type="typesafe", data=payload)
-
     async def stream(
         self,
         messages: list[ChatMessage],
@@ -966,11 +975,9 @@ class Stream:
         async def streaming_callback(chunk: StreamingChunk) -> None:
             await queue.put(chunk)
             if chunk.tool_call_result and chunk.tool_call_result.error:
-                logger.error(
-                    f"Tool call failed: "
-                    f"tool={chunk.tool_call_result.origin.tool_name}, "
-                    f"result={chunk.tool_call_result.result}"
-                )
+                # A result may quote what the tool read; it is only logged at debug.
+                logger.warning(f"Tool call failed: tool={chunk.tool_call_result.origin.tool_name}")
+                logger.debug(f"Tool call result: {chunk.tool_call_result.result}")
 
         self.generator.streaming_callback = streaming_callback
 
@@ -979,7 +986,7 @@ class Stream:
 
         pipeline_task: asyncio.Task[Any] | None = None
 
-        session = self.oversight if self.oversight is not None and self.oversight.active else None
+        session = self._session()
         if session is not None:
             session.message_id = message_id
 
@@ -993,8 +1000,8 @@ class Stream:
                     )
 
             session.on_tool_results = refused_results
-        stopped: ReviewResult | None = None
-        session_reviewed = False
+        stopped: FinishResult | None = None
+        session_finished = False
 
         try:
             yield MessageStartEvent(message_id=message_id)
@@ -1007,13 +1014,14 @@ class Stream:
                     yield notice_event(notice)
                 session.notices.clear()
 
-            # Inbound TypeSafe card before the LLM starts; may apply control hints.
-            if screen := await self.get_typesafe_input_screen(messages):
-                yield screen
-
+            if session is not None:
+                # Sources carried over from earlier turns or seeded by the agent.
+                await self._mask_sources(session)
             # take snapshots of current contextvars
-            # The task copies the context: tools register sources in this turn's registry.
+            # The task copies the context: tools register sources in this turn's registry,
+            # and artifact tools the rows they write with this answer.
             registry_token = current_registry.set(self.citation_registry)
+            artifacts_token = turn_artifacts.set(self._artifact_ids)
             try:
                 with (
                     bind_trace(
@@ -1027,6 +1035,7 @@ class Stream:
                     pipeline_task = self.get_task(haystack_messages, streaming_callback)
             finally:
                 current_registry.reset(registry_token)
+                turn_artifacts.reset(artifacts_token)
             pipeline_task.add_done_callback(lambda _: queue.put_nowait(_SENTINEL))
 
             hold = (
@@ -1043,7 +1052,7 @@ class Stream:
                     on_block=None if hold else lambda: queue.put_nowait(_CITED),
                 )
 
-            # A held answer's tool calls and results are shown with it, after review.
+            # A held answer's tool calls and results are shown with it, after finish.
             held: list[StreamEvent] = []
             async for event in self.get_events(queue, stream_writer):
                 if session is not None:
@@ -1056,7 +1065,7 @@ class Stream:
                         if hold:
                             continue
                     elif isinstance(event, ReasoningChunkEvent):
-                        # Stored all the same; shown only with the answer it led to.
+                        # Held: never shown, and dropped at finish (no lens judges it).
                         if hold:
                             continue
                     else:
@@ -1070,8 +1079,9 @@ class Stream:
 
             if stopped is not None:
                 # The answer is withdrawn mid-stream: stop the model, store the message.
-                session.add_usage(*self.get_pipeline_usage(pipeline_task))
+                # Its usage is lost with the task: a cancelled run reports none.
                 pipeline_task.cancel()
+                await self._drop_artifacts()
                 for event in self._withdraw_citations():
                     yield event
                 for event in released(held, withheld=True):
@@ -1107,7 +1117,7 @@ class Stream:
                 if stream_writer:
                     stream_writer.add_chunk(get_error_chunk(pipeline_error, info))
                     if session is not None:
-                        _store_unreviewed(stream_writer)
+                        _store_unchecked(stream_writer)
                     self.message_result = await stream_writer.finalize("error")
                     _finalize_called = True
                 yield get_error_event(info)
@@ -1116,31 +1126,39 @@ class Stream:
 
             finish_reason = None
             withheld = False
+            # Masked or withheld: no follow-ups are suggested from it.
+            changed = False
             if session is not None:
                 session.add_usage(*self.get_pipeline_usage(pipeline_task))
                 if self.citation_registry is not None:
+                    await self._mask_sources(session)
                     session.set_sources(
                         self.citation_registry.all, seeded=self.citation_registry.seeded
                     )
                 text = stream_writer.text if stream_writer else session.view.output
-                reviewed = await session.review(text)
-                session_reviewed = True
-                withheld = reviewed.blocked
-                if reviewed.replaced and stream_writer:
-                    stream_writer.replace_text(reviewed.output)
-                    # Reasoning can say what the answer was masked or withheld for.
+                finished = await session.finish(text)
+                session_finished = True
+                withheld = finished.blocked
+                changed = finished.replaced
+                if finished.replaced and stream_writer:
+                    stream_writer.replace_text(finished.output)
+                if (finished.replaced or hold) and stream_writer:
+                    # Reasoning can say what the answer was masked or withheld for; held,
+                    # it was never shown nor judged, so it is not stored either.
                     stream_writer.drop_reasoning()
-                if withheld and stream_writer:
-                    stream_writer.drop_tool_details()
-                if reviewed.notice:
-                    sent.append(reviewed.notice)
-                    yield notice_event(reviewed.notice)
+                if withheld:
+                    await self._drop_artifacts()
+                    if stream_writer:
+                        stream_writer.drop_tool_details()
+                if finished.notice:
+                    sent.append(finished.notice)
+                    yield notice_event(finished.notice)
                 if sent and stream_writer:
                     stream_writer.message.metadata["oversight"] = stored_notices(sent)
                 for event in released(held, withheld=withheld):
                     yield event
                 if hold:
-                    yield TextChunkEvent(content=reviewed.output)
+                    yield TextChunkEvent(content=finished.output)
                 if withheld:
                     finish_reason = CONTENT_FILTER
 
@@ -1155,13 +1173,9 @@ class Stream:
             await self.get_final_message(stream_writer, finish_reason or "stop")
             _finalize_called = True
 
-            # Outbound TypeSafe card before message_end so it lands on this assistant turn.
-            if screen := await self.get_typesafe_output_screen(messages):
-                yield screen
-
             yield MessageEndEvent(finish_reason=finish_reason)
 
-            if suggestion := await self.get_suggestions(messages):
+            if not (withheld or changed) and (suggestion := await self.get_suggestions(messages)):
                 yield suggestion
 
         except Exception as critical_error:
@@ -1178,8 +1192,8 @@ class Stream:
             )
             if stream_writer and not _finalize_called:
                 stream_writer.add_chunk(get_error_chunk(critical_error, info))
-                if session is not None and not session_reviewed:
-                    _store_unreviewed(stream_writer)
+                if session is not None and not session_finished:
+                    _store_unchecked(stream_writer)
                 self.message_result = await stream_writer.finalize("error")
                 _finalize_called = True
             yield get_error_event(info)
@@ -1196,8 +1210,8 @@ class Stream:
                 except (TimeoutError, asyncio.CancelledError, Exception):
                     pass
             if stream_writer and not _finalize_called:
-                if session is not None and not session_reviewed:
-                    _store_unreviewed(stream_writer)
+                if session is not None and not session_finished:
+                    _store_unchecked(stream_writer)
                 self.message_result = await stream_writer.finalize("cancelled")
             if session is not None:
                 await session.close()

@@ -2,17 +2,17 @@
 
 Chat, webhooks, workflow steps and your own code all open a session, report what
 happens (sources found, tools called, text produced) and ask it at three points
-whether to go on: the gate, while watching, and at review. Closing it writes the
-turn to the ledger and hands it to the background stages.
+whether to go on: the gate, while watching, and at finish. Closing it writes the
+turn to the ledger (see `record`) and hands it to the background stages.
 
     session = await TurnSession.start(agent, channel="api", user=user, input=text)
     gate = await session.gate()
     if gate.blocked:
         return gate.message
     answer = await run_my_agent(gate.input)
-    review = await session.review(answer)
+    finished = await session.finish(answer)
     await session.close()
-    return review.output
+    return finished.output
 
 A session for an agent without a policy, or with oversight off, is inert: every
 call returns at once and allows everything.
@@ -24,48 +24,43 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
-import re
-import secrets
+import inspect
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from asgiref.sync import sync_to_async
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 
 from django_ai_sdk.logger import get_logger
 from django_ai_sdk.oversight import budget as budgets
-from django_ai_sdk.oversight.answerers.pii import redact_all
+from django_ai_sdk.oversight.answerers.pii import mask_all
 from django_ai_sdk.oversight.conf import is_enabled, setting
-from django_ai_sdk.oversight.rules import Block, Redact
+from django_ai_sdk.oversight.record import _persist, _source
+from django_ai_sdk.oversight.rules import Block, Mask, Notify, RestrictTools
 from django_ai_sdk.oversight.stages import (
-    STAGE_ORDER,
     Matched,
     Observed,
-    asks_again,
     evaluate_rules,
     run_lenses,
 )
 from django_ai_sdk.oversight.types import (
-    Answer,
     Capture,
     HistoryItem,
     Mode,
     Outcome,
-    Severity,
-    Source,
     Stage,
     Subject,
     TextSpan,
     ToolCall,
     TurnView,
-    most_severe,
     worst,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Generator, Iterable
+    from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping
 
     from django.contrib.auth.base_user import AbstractBaseUser
     from django.contrib.auth.models import AnonymousUser
@@ -73,11 +68,26 @@ if TYPE_CHECKING:
     from django_ai_sdk.agents.base import Agent
     from django_ai_sdk.common import ChatMessage
     from django_ai_sdk.oversight.lenses import Lens
-    from django_ai_sdk.oversight.policy import ResolvedPolicy
+    from django_ai_sdk.oversight.policy import Policy, ResolvedPolicy
+    from django_ai_sdk.oversight.rules import Action
 
 logger = get_logger(__name__)
 
-TOO_LONG = "This message is too long to check. Shorten it and try again."
+TOO_LONG = _("This message is too long to check. Shorten it and try again.")
+# What the model reads instead of a tool result (or an earlier message) that could
+# not be checked for what the policy masks.
+UNCHECKED = _("[withheld: could not be checked]")
+# A refused call to a tool the policy took away this turn.
+TOOL_UNAVAILABLE = _("This tool is not available for this request.")
+# Earlier messages the lenses see with a question.
+HISTORY_TURNS = 12
+# Characters of answer text a watch check reads again before the new text, so what
+# straddles two checks is still read whole.
+WATCH_OVERLAP_CHARS = 200
+# The most of a turn's errors the ledger keeps.
+ERROR_CHARS = 500
+# Hex characters of an agent's fingerprint: enough to tell its versions apart.
+FINGERPRINT_CHARS = 16
 
 _unobserved: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "django_ai_sdk_oversight_unobserved", default=False
@@ -89,7 +99,7 @@ _current: contextvars.ContextVar[TurnSession | None] = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def unobserved() -> Generator[None]:
-    """Run code that must not open turns of its own: judges, titles, replays."""
+    """Run code that must not open turns of its own: judges, titles."""
     token = _unobserved.set(True)
     try:
         yield
@@ -108,7 +118,13 @@ def active(session: TurnSession | None) -> Generator[None]:
 
 
 def current_session() -> TurnSession | None:
-    return _current.get()
+    """The turn this code runs in: None outside one, and once that turn is closed.
+
+    A task started inside a turn copies it, and may outlive it: a closed turn is
+    never joined.
+    """
+    session = _current.get()
+    return session if session is not None and not session._closed else None
 
 
 @dataclass
@@ -117,9 +133,9 @@ class GateResult:
 
     blocked: bool = False
     message: str = ""
-    # The question as the model should see it: redacted when a rule said so.
+    # The question as the model should see it: masked when a rule said so.
     input: str = ""
-    redacted: bool = False
+    masked: bool = False
     # Tool names taken away; None leaves every tool, [] takes all of them.
     restrict: list[str] | None = None
     # For the client: a `data-oversight` payload, when there is anything to say.
@@ -127,8 +143,8 @@ class GateResult:
 
 
 @dataclass
-class ReviewResult:
-    """What review decided about the answer."""
+class FinishResult:
+    """What finish (or a watch check) decided about the answer."""
 
     blocked: bool = False
     message: str = ""
@@ -172,13 +188,20 @@ class TurnSession:
     restrict: list[str] | None = None
     usage: _Usage = field(default_factory=_Usage)
     created_at: Any = None
+    # What went wrong in the turn, "; " between: recorded on the turn.
     error: str = ""
     # Refused at the gate unread, for being longer than MAX_INPUT_CHARS.
     too_long: bool = False
+    # A stage refused the turn because it failed closed (FAIL_MODE), its policy could
+    # not be loaded, or the caller refused it (`refuse`): the turn is blocked.
+    refused: bool = False
     original_input: str = ""
     original_output: str = ""
     # data-oversight payloads waiting for the stream to send them.
     notices: list[dict[str, Any]] = field(default_factory=list)
+    # The turn this one runs inside, when it runs under a policy of its own: a
+    # subagent's delegation, a nested run().
+    parent_turn_id: str = ""
     # Set by a streaming adapter: refused tool calls' stub results, so the chat
     # shows them refused at once instead of still running.
     on_tool_results: Callable[[list[Any]], Awaitable[None]] | None = None
@@ -188,6 +211,13 @@ class TurnSession:
     # Whether the person chatting may see oversight detail (CLIENT_DETAIL "staff").
     _staff_view: bool = False
     _closed: bool = False
+    # Tool results being masked, by call id and text: the stream and the tool hook share one.
+    _masking_results: dict[str, asyncio.Future[str]] = field(default_factory=dict)
+    # Whether each lens's latest answer this turn failed: a lens that failed at one
+    # stage stays failed at the next, until it answers again.
+    _lens_failed: dict[str, bool] = field(default_factory=dict)
+    # No policy could be chosen or loaded and the gate fails closed: every stage refuses.
+    _unloaded: bool = False
 
     # Opening.
 
@@ -201,41 +231,80 @@ class TurnSession:
         thread_id: str | None = None,
         messages: list[ChatMessage] | None = None,
         input: str | None = None,
-        policy: str | None = None,
+        oversight: type[Policy] | str | Literal[False] | None = None,
     ) -> TurnSession:
-        """A session for one turn of `agent`; inert unless a policy applies."""
-        if _unobserved.get() or not is_enabled():
+        """A session for one turn of `agent`; inert unless a policy applies.
+
+        `oversight` replaces the agent's own for this turn: a Policy subclass or a
+        name. False opens no turn. None takes the agent's own: the console's choice,
+        else what its code asks for (`acode_policy`).
+
+        A policy that cannot be chosen (the agent's `get_oversight` raised) or loaded
+        (unknown, broken, its definition unreadable) follows FAIL_MODE["gate"]: open,
+        the turn runs unwatched and the failure is logged; closed, the session is
+        active only to refuse: every stage refuses with Block.DEFAULT_MESSAGE, and
+        the turn is recorded blocked with the error.
+        """
+        if oversight is False or _unobserved.get() or not is_enabled():
             return cls()
         from django_ai_sdk.oversight.policy import aassigned_policy, aget_policy
+        from django_ai_sdk.oversight.registry import policy_name
 
+        opening = {
+            "agent": agent,
+            "channel": channel,
+            "user": user,
+            "thread_id": thread_id,
+            "messages": messages,
+            "input": input,
+        }
+        name = ""
         try:
-            name = policy
+            name = policy_name(oversight) if oversight else ""
             if not name:
                 # The console's choice for this agent wins over what its code says.
                 assigned = await aassigned_policy(agent_key(agent))
-                name = code_policy(agent)[0] if assigned is None else assigned
-            resolved = await aget_policy(name) if name else None
-            budget = await budgets.aload() if resolved is not None else None
-            staff_view = resolved is not None and await _staff_view(user)
+                if assigned is None:
+                    name = (await acode_policy(agent, channel=channel, user=user))[0]
+                else:
+                    name = assigned
         except Exception:
-            # Oversight must never take chat down: a broken policy leaves the turn unwatched.
-            logger.exception("Oversight could not open a turn for {!r}", agent_key(agent))
+            logger.exception("Oversight could not choose a policy for {!r}", agent_key(agent))
+            return cls._unloadable(name="", error="policy could not be chosen", **opening)
+        if not name:
             return cls()
+        try:
+            resolved = await aget_policy(name)
+        except Exception:
+            logger.exception("Oversight policy {!r} could not be loaded", name)
+            resolved = None
         if resolved is None:
-            return cls()
+            return cls._unloadable(name=name, error="policy could not be loaded", **opening)
+        session = cls._opened(resolved, **opening)
+        session._budget = await _budget()
+        session._staff_view = await _staff_view(user)
+        return session
+
+    @classmethod
+    def _opened(
+        cls,
+        policy: ResolvedPolicy,
+        *,
+        agent: Any,
+        channel: str,
+        user: Any,
+        thread_id: str | None,
+        messages: list[ChatMessage] | None,
+        input: str | None,
+    ) -> TurnSession:
         from django_ai_sdk.oversight.privacy import pseudonym
 
         messages = messages or []
         if input is None:
             input = next((m.content for m in reversed(messages) if m.role == "user"), "") or ""
-        history = [
-            HistoryItem(role=m.role, content=m.content or "")
-            for m in messages[:-1]
-            if m.role in {"user", "assistant"} and m.content
-        ][-12:]
         session = cls(
             active=True,
-            policy=resolved,
+            policy=policy,
             channel=channel,
             thread_id=str(thread_id or ""),
             actor=pseudonym(user),
@@ -249,14 +318,64 @@ class TurnSession:
             agent_id=agent_key(agent),
             agent_name=str(getattr(agent, "name", "") or type(agent).__name__),
             input=input,
-            history=history,
         )
+        session.set_history(messages)
         session.agent_fingerprint = fingerprint(agent)
-        session._budget = budget
-        session._staff_view = staff_view
+        return session
+
+    @classmethod
+    def _unloadable(cls, *, name: str, error: str, **opening: Any) -> TurnSession:
+        """The session for a turn whose policy could not be chosen or loaded: FAIL_MODE["gate"].
+
+        Open: inert, the turn runs unwatched. Closed: active only to refuse, under an
+        empty stand-in for the policy, so the refusal and its error are recorded.
+        """
+        if not _fail_closed(Stage.GATE):
+            logger.error(
+                "Oversight runs a turn of {!r} unwatched: its {} (FAIL_MODE gate is open)",
+                agent_key(opening["agent"]),
+                error,
+            )
+            return cls()
+        try:
+            session = cls._opened(_stand_in(name), **opening)
+        except Exception:
+            # Not even a refusal can be recorded: refuse without a record.
+            logger.exception("Oversight could not open a refusing turn")
+            session = cls(active=True, policy=_stand_in(name), _closed=True)
+        session._unloaded = True
+        session.refused = True
+        session.note_error(error)
+        logger.error(
+            "Oversight refuses a turn of {!r}: its {} (FAIL_MODE gate is closed)",
+            agent_key(opening["agent"]),
+            error,
+        )
         return session
 
     # Reporting.
+
+    def note_error(self, error: str) -> None:
+        """Add `error` to what went wrong in this turn: recorded on the turn, no content."""
+        if error and error not in self.error.split("; "):
+            self.error = f"{self.error}; {error}" if self.error else error
+
+    def refuse(self, error: str = "") -> None:
+        """Record the turn as refused by its caller: a result oversight let through
+        that the caller still cannot pass on (a masked result that no longer fits its
+        schema). The turn is recorded blocked, with `error`."""
+        if not self.active:
+            return
+        self.refused = True
+        self.note_error(error)
+
+    def set_history(self, messages: list[ChatMessage]) -> None:
+        """The conversation before the question, as the lenses see it: the latest turns."""
+        self.view.history = [
+            HistoryItem(role=m.role, content=m.content or "")
+            for m in messages[:-1]
+            if m.role in {"user", "assistant"} and m.content
+        ][-HISTORY_TURNS:]
 
     def set_sources(self, sources: Iterable[Any], *, seeded: Iterable[Any] = ()) -> None:
         """What retrieval found, as NumberedSource, Source or dicts.
@@ -296,13 +415,17 @@ class TurnSession:
             return False
         self.view.output += chunk
         due = len(self.view.output) - self._watched_chars >= int(setting("WATCH_EVERY_CHARS"))
-        return due and self.policy is not None and bool(self.policy.active_lenses(Stage.WATCH))
+        return due and self._watches_text()
 
     def unwatched(self) -> bool:
         """Whether answer text arrived since the last watch check, with lenses to judge it."""
-        if not self.active or self.policy is None or len(self.view.output) <= self._watched_chars:
+        if not self.active or len(self.view.output) <= self._watched_chars:
             return False
-        return any(
+        return self._watches_text()
+
+    def _watches_text(self) -> bool:
+        """Whether a watch lens reads the answer; one on tool calls only never does."""
+        return self.policy is not None and any(
             lens.subject in {Subject.OUTPUT, Subject.EXCHANGE}
             for lens in self.policy.active_lenses(Stage.WATCH)
         )
@@ -314,182 +437,335 @@ class TurnSession:
         result = GateResult(input=self.view.input)
         if not self.active:
             return result
+        # An active session always has its policy.
+        assert self.policy is not None
+        if self._unloaded:
+            return self._refuse_gate(result, str(Block.DEFAULT_MESSAGE))
         limit = setting("MAX_INPUT_CHARS")
-        if limit and len(self.view.input) > limit and self.policy.active_lenses(Stage.GATE):
+        if limit and len(self.view.input) > limit:
+            # Whatever the policy reads later (the question beside the answer, in
+            # reflect), past the limit it would read only part of it.
             self.too_long = True
-            result.blocked = True
-            result.message = TOO_LONG
-            result.notice = {
-                "turn_id": self.id,
-                "stage": str(Stage.GATE),
-                "outcome": str(Outcome.BLOCKED),
-                "rules": [],
-                "message": TOO_LONG,
-            }
-            return result
+            return self._refuse_gate(result, str(TOO_LONG))
         try:
             return await self._gate(result)
         except Exception:
-            # Like watch and review: a broken lens or rule follows the gate's fail mode.
+            # Like watch and finish: a broken lens or rule follows the gate's fail mode.
             logger.exception("Oversight gate failed for turn {}", self.id)
-            self.error = "gate failed"
+            self.note_error("gate failed")
             if _fail_closed(Stage.GATE):
-                result.blocked = True
-                result.message = Block.DEFAULT_MESSAGE
+                self.refused = True
+                return self._refuse_gate(result, str(Block.DEFAULT_MESSAGE))
             return result
+
+    def _refuse_gate(self, result: GateResult, message: str) -> GateResult:
+        result.blocked = True
+        result.message = message
+        result.notice = {
+            "turn_id": self.id,
+            "stage": str(Stage.GATE),
+            "outcome": str(Outcome.BLOCKED),
+            "message": message,
+        }
+        return result
 
     async def _gate(self, result: GateResult) -> GateResult:
         matched = await self._stage(
             Stage.GATE, subjects={Subject.INPUT}, deadline=setting("GATE_DEADLINE_MS")
         )
         self.matched.extend(matched)
-        redactions: list[tuple[list[TextSpan], str]] = []
+        masks = self._masks(Stage.GATE, matched, Subject.INPUT)
+        # What earlier messages took away (check_history) stays away.
+        result.restrict = self.restrict
         for match in matched:
             for action in match.acted:
-                if action.kind == "block" and not result.blocked:
+                if isinstance(action, Block) and not result.blocked:
                     result.blocked = True
-                    result.message = match.rule.message or action.message
-                elif action.kind == "restrict_tools":
-                    names = action.names
-                    if result.restrict is None:
-                        result.restrict = list(names)
-                    elif names and result.restrict:
-                        result.restrict = sorted({*result.restrict, *names})
-                    else:
-                        result.restrict = []
-                elif action.kind == "redact":
-                    spans = self._spans_for(action, match, Subject.INPUT)
-                    if spans:
-                        redactions.append((spans, action.template))
-        if redactions:
-            self.view.input = redact_all(self.view.input, redactions)
-            result.redacted = True
+                    result.message = str(match.rule.message or action.message)
+                elif isinstance(action, RestrictTools):
+                    result.restrict = _taken(result.restrict, action.names)
+        if masks:
+            masked = mask_all(self.view.input, masks)
+            # "Masked" only when the question changed.
+            result.masked = masked != self.view.input
+            self.view.input = masked
         result.input = self.view.input
         self.restrict = result.restrict
         result.notice = self._notice(Stage.GATE, matched, result.blocked, result.message)
         return result
 
-    async def mask_history(self, messages: list[ChatMessage]) -> None:
-        """Mask earlier messages the way the gate masks the question, in place.
+    def _masks(
+        self, stage: Stage, matched: list[Matched], subject: Subject
+    ) -> list[tuple[list[TextSpan], str]]:
+        """What the matches' Mask actions mask in `subject`, as (spans, template) groups.
 
-        For history the server did not store itself: what a client sends back can
-        carry what the gate masked on an earlier turn. Each message is judged on its
-        own by the lenses enforced redact rules read; nothing is recorded.
+        A mask that cannot point at what it should mask (a lens it reads failed while
+        the stage fails closed, found something without saying where, or pointed
+        outside the text) blocks instead: its action becomes a Block. One that would
+        change nothing is dropped from what the match did, so the turn never reads
+        "masked" when nothing was.
         """
-        lenses = self._redacting_lenses()
-        if not lenses or len(messages) < 2:
-            return
-        earlier = messages[:-1]
+        closed = _fail_closed(stage)
+        texts = self._texts()
+        text = texts[subject]
+        masks: list[tuple[list[TextSpan], str]] = []
+        for match in matched:
+            acted: list[Action] = []
+            for action in match.acted:
+                if not isinstance(action, Mask):
+                    acted.append(action)
+                    continue
+                names = set(action.lenses) or match.rule.lenses()
+                if _unpointed(self.observed, names, closed=closed, subject=subject, texts=texts):
+                    acted.append(Block(match.rule.message))
+                    continue
+                spans = spans_for(self.observed, names, subject, self.view.input)
+                group = (spans, action.template)
+                if spans and mask_all(text, [group]) != text:
+                    masks.append(group)
+                    acted.append(action)
+            match.acted = acted
+        return masks
+
+    def _texts(self) -> dict[Subject, str]:
+        """The text each subject's lenses read, as they read it now."""
+        return {
+            Subject.INPUT: self.view.input,
+            Subject.OUTPUT: self.view.output,
+            Subject.EXCHANGE: f"{self.view.input}\n\n{self.view.output}",
+            Subject.SOURCES: "",
+            Subject.TOOL_CALL: "",
+        }
+
+    async def check_history(
+        self, messages: list[ChatMessage], *, history: bool = True
+    ) -> GateResult:
+        """Judge what comes with the question: earlier messages and attachments' context.
+
+        Call it before `gate()` on what the server did not store itself (a stateless
+        run, a chat without a thread, a workflow's `history` input). Each earlier
+        user and assistant message, and the context of every message's attachments
+        (file names, summaries, captions: what the model reads of them, the
+        question's own too), is judged on its own by the gate's lenses on the
+        question, and masked in place as the gate masks the question; text a mask
+        cannot point into is withheld whole. With `history=False` only the
+        attachments of the last message are judged: a stored thread was judged turn
+        by turn.
+
+        The result is blocked when an enforced rule that blocks, or takes every tool
+        away, holds on any of them (a failed lens counts as holding where the gate
+        fails closed); tools a rule takes away stay away for the turn. What was
+        found is recorded beside the turn, once per lens and rule: never what a mask
+        of the question points with, nor what the gate's rules judge the question by.
+        Rules that only alert, queue or notify are not raised by history: a client
+        sends it back on every turn.
+        """
+        result = GateResult(input=self.view.input)
+        if not self.active or self.policy is None:
+            return result
+        if self._unloaded:
+            return self._refuse_gate(result, str(Block.DEFAULT_MESSAGE))
+        lenses = self.policy.active_lenses(Stage.GATE, Subject.INPUT)
+        items = _history_items(messages, history=history) if lenses else []
+        if not items:
+            self.set_history(messages)
+            return result
         token = budgets.activate(self._budget)
         try:
-            masked = await asyncio.gather(*(self._masked(lenses, m.content or "") for m in earlier))
+            judged = await asyncio.gather(
+                *(self._judged(lenses, get(), Stage.GATE, blocks=True) for get, _ in items)
+            )
+        except Exception:
+            logger.exception("Oversight could not check the history of turn {}", self.id)
+            self.note_error("history check failed")
+            if _fail_closed(Stage.GATE):
+                self.refused = True
+                return self._refuse_gate(result, str(Block.DEFAULT_MESSAGE))
+            return result
         finally:
             budgets.deactivate(token)
-        for message, text in zip(earlier, masked, strict=True):
-            message.content = text
-        self.view.history = [
-            HistoryItem(role=m.role, content=m.content or "")
-            for m in earlier
-            if m.role in {"user", "assistant"} and m.content
-        ][-12:]
+        found: list[Matched] = []
+        for (_read, put), one in zip(items, judged, strict=True):
+            put(one.text)
+            found.extend(one.matched)
+            if one.block is not None and not result.blocked:
+                result.blocked = True
+                result.message = one.block
+            if one.restrict is not None:
+                self.restrict = _taken(self.restrict, one.restrict)
+        recorded = self._record_aside(
+            Stage.GATE, [o for one in judged for o in one.observed], found
+        )
+        if result.blocked:
+            result.restrict = self.restrict
+            result.notice = self._notice(Stage.GATE, recorded, True, result.message)
+        self.set_history(messages)
+        return result
 
     async def mask_text(self, text: str) -> str:
         """`text` masked the way the gate masks the question: for what tools hand the model.
 
         What it masks is recorded at watch, where it happens: each lens's answer, without
         its spans (they point into the tool's result, not the question), and the rule.
+        A result that cannot be checked follows the watch fail mode: closed withholds
+        all of it, open passes it as it is and records the failure. Never raises.
         """
-        lenses = self._redacting_lenses()
-        if not lenses:
-            return text
-        token = budgets.activate(self._budget)
         try:
-            masked, observed, matched = await self._masking(lenses, text)
-        finally:
-            budgets.deactivate(token)
-        if masked != text:
-            self._record_masked_result(observed, matched)
-        return masked
+            lenses = self._masking_lenses()
+            if not lenses or not text:
+                return text
+            token = budgets.activate(self._budget)
+            try:
+                judged = await self._judged(lenses, text, Stage.WATCH)
+            finally:
+                budgets.deactivate(token)
+            if judged.text != text or any(o.errored for o in judged.observed):
+                self._record_aside(Stage.WATCH, judged.observed, judged.matched)
+            return judged.text
+        except Exception:
+            logger.exception("Oversight could not mask a tool result for turn {}", self.id)
+            self.note_error("tool result masking failed")
+            return str(UNCHECKED) if _fail_closed(Stage.WATCH) else text
 
-    def _record_masked_result(self, observed: list[Observed], matched: list[Matched]) -> None:
-        """A tool result's masking, once per lens and rule however many results it masked."""
-        seen = {(o.lens.name, o.stage) for o in self.observed}
-        self.observed.extend(
-            Observed(o.lens, Stage.WATCH, o.answer.model_copy(update={"spans": []}))
-            for o in observed
-            if o.answer.ok and o.answer.value and (o.lens.name, Stage.WATCH) not in seen
-        )
-        recorded = {(m.rule.name, m.stage) for m in self.matched}
-        self.matched.extend(
-            Matched(m.rule, Stage.WATCH, m.acted)
-            for m in matched
-            if (m.rule.name, Stage.WATCH) not in recorded
-        )
+    async def mask_result(self, call_id: str, text: str) -> str:
+        """A tool result masked like `mask_text`, judged once per call and text however often asked.
 
-    def _redacting_lenses(self) -> list[Lens]:
-        """The gate's lenses that an enforced redact rule reads."""
+        The stream shows a result before the tool hook hands it to the model: both
+        ask here, and both get the same masked text. Another text under the same call
+        (a result cut to fit the model's limit) is masked on its own.
+        """
+        if not call_id:
+            return await self.mask_text(text)
+        key = f"{call_id}:{hashlib.sha256(text.encode()).hexdigest()[:FINGERPRINT_CHARS]}"
+        pending = self._masking_results.get(key)
+        if pending is None:
+            pending = self._masking_results[key] = asyncio.ensure_future(self.mask_text(text))
+        return await asyncio.shield(pending)
+
+    def _record_aside(
+        self, stage: Stage, observed: list[Observed], matched: list[Matched]
+    ) -> list[Matched]:
+        """What lenses found beside the turn's own text, once per lens and rule however often.
+
+        Answers without their spans (they point into another text), marked aside: a
+        mask of the question or the answer never points with them, and the rules
+        still judge the turn itself. A lens that failed is recorded too. Returns the
+        matches recorded now.
+        """
+        seen = {(o.lens.name, o.stage) for o in self.observed if o.aside}
+        for o in observed:
+            if ((o.answer.ok and o.answer.value) or o.errored) and (o.lens.name, stage) not in seen:
+                seen.add((o.lens.name, stage))
+                answer = o.answer.model_copy(update={"spans": []})
+                self.observed.append(Observed(o.lens, stage, answer, o.failed, aside=True))
+        recorded = {(m.rule.name, m.stage) for m in self.matched if m.aside}
+        added: list[Matched] = []
+        for m in matched:
+            if (m.rule.name, stage) not in recorded:
+                recorded.add((m.rule.name, stage))
+                added.append(Matched(m.rule, stage, m.acted, aside=True))
+        self.matched.extend(added)
+        return added
+
+    def _masking_lenses(self) -> list[Lens]:
+        """The gate's lenses that an enforced mask rule reads."""
         if not self.active or self.policy is None:
             return []
-        redacting = [
+        masking = [
             rule
             for rule in self.policy.rules.values()
-            if rule.mode is Mode.ENFORCE and any(a.kind == "redact" for a in rule.then)
+            if rule.mode is Mode.ENFORCE and any(a.kind == "mask" for a in rule.then)
         ]
-        names = {name for rule in redacting for name in rule.lenses()}
+        names = {name for rule in masking for name in rule.lenses()}
         return [
             lens
             for lens in self.policy.active_lenses(Stage.GATE, Subject.INPUT)
             if lens.kind == "entities" and lens.name in names
         ]
 
-    async def _masked(self, lenses: list[Lens], text: str) -> str:
-        """`text` with what the enforced redact rules mask at the gate masked."""
-        return (await self._masking(lenses, text))[0]
+    async def _judged(
+        self, lenses: list[Lens], text: str, stage: Stage, *, blocks: bool = False
+    ) -> _Judged:
+        """`text` judged by `lenses` as the gate judges the question, and masked.
 
-    async def _masking(
-        self, lenses: list[Lens], text: str
-    ) -> tuple[str, list[Observed], list[Matched]]:
-        """`text` masked, with the answers and the rules' masking that did it (none if nothing)."""
+        `stage` names the fail mode that applies. Text a mask cannot point into (a lens
+        failed while that stage fails closed, found something without saying where,
+        or pointed outside it) is withheld whole: UNCHECKED. With `blocks`, what
+        enforced rules that block or take tools away say is kept too; only the rules'
+        protective actions are, so nothing beside the turn alerts or notifies.
+        """
         assert self.policy is not None
+        judged = _Judged(text=text)
         if not text:
-            return text, [], []
+            return judged
         view = self.view.model_copy(update={"input": text, "answers": {}})
-        observed = await run_lenses(
+        judged.observed = await run_lenses(
             lenses, view, Stage.GATE, deadline_ms=setting("GATE_DEADLINE_MS")
         )
-        answers = {o.lens.name: o.answer for o in observed}
-        redactions = []
-        masking: list[Matched] = []
-        for match in evaluate_rules(self.policy, answers, Stage.GATE, done=set()):
-            masked = []
+        answers = {o.lens.name: o.answer for o in judged.observed}
+        closed = _fail_closed(stage)
+        texts = {Subject.INPUT: text}
+        masks = []
+        withheld = False
+        for match in evaluate_rules(
+            self.policy,
+            answers,
+            Stage.GATE,
+            done=set(),
+            errored=_errored(judged.observed),
+            fail_closed=closed,
+        ):
+            acting: list[Action] = []
             for action in match.acted:
-                if action.kind != "redact":
-                    continue
-                names = set(action.lenses) or match.rule.lenses()
-                if spans := spans_for(observed, names, Subject.INPUT, text):
-                    redactions.append((spans, action.template))
-                    masked.append(action)
-            if masked:
-                masking.append(Matched(match.rule, match.stage, masked))
-        if not redactions:
-            return text, [], []
-        return redact_all(text, redactions), observed, masking
+                if isinstance(action, Mask):
+                    names = set(action.lenses) or match.rule.lenses()
+                    if _unpointed(
+                        judged.observed, names, closed=closed, subject=Subject.INPUT, texts=texts
+                    ):
+                        withheld = True
+                        acting.append(action)
+                    elif spans := spans_for(judged.observed, names, Subject.INPUT, text):
+                        if mask_all(text, [(spans, action.template)]) != text:
+                            masks.append((spans, action.template))
+                            acting.append(action)
+                elif blocks and isinstance(action, Block):
+                    judged.block = judged.block or str(match.rule.message or action.message)
+                    acting.append(action)
+                elif blocks and isinstance(action, RestrictTools):
+                    if not action.names:
+                        judged.block = judged.block or str(match.rule.message or TOOL_UNAVAILABLE)
+                    judged.restrict = _taken(judged.restrict, action.names)
+                    acting.append(action)
+            if acting:
+                judged.matched.append(Matched(match.rule, match.stage, acting))
+        if withheld:
+            judged.text = str(UNCHECKED)
+        elif masks:
+            judged.text = mask_all(text, masks)
+        return judged
 
-    async def watch(self) -> ReviewResult:
+    async def watch(self) -> FinishResult:
         """Judge the answer so far, while it streams. Watch can only stop it.
 
-        A match that blocks, or of a rule pinned to watch, is kept. Every other one
-        is left for review, which judges the whole answer with fresh spans.
+        Each check reads only the text that arrived since the last one, and a little
+        of what came before (WATCH_OVERLAP_CHARS), so a long answer costs no more
+        per check than a short one. A match that blocks, or of a rule pinned to
+        watch, is kept. Every other one is left for finish, which judges the whole
+        answer with fresh spans.
         """
-        result = ReviewResult(output=self.view.output)
+        result = FinishResult(output=self.view.output)
         if not self.active:
             return result
+        if self._unloaded:
+            return self._refuse_output(result)
+        start = max(0, self._watched_chars - WATCH_OVERLAP_CHARS)
         self._watched_chars = len(self.view.output)
         try:
             matched = await self._stage(
                 Stage.WATCH,
                 subjects={Subject.OUTPUT, Subject.EXCHANGE},
                 deadline=setting("WATCH_DEADLINE_MS"),
+                offset=start,
             )
             kept = [
                 m
@@ -505,17 +781,22 @@ class TurnSession:
         """Judge one tool call before it runs; the refusal's reason when it may not."""
         if not self.active or self.policy is None:
             return None
+        if self._unloaded:
+            return str(Block.DEFAULT_MESSAGE)
         try:
             return await self._check_tool(call)
         except Exception:
             logger.exception("Oversight tool check failed for turn {}", self.id)
-            self.error = "tool check failed"
-            return Block.DEFAULT_MESSAGE if _fail_closed(Stage.WATCH) else None
+            self.note_error("tool check failed")
+            return str(Block.DEFAULT_MESSAGE) if _fail_closed(Stage.WATCH) else None
+
+    def _taken_away(self, name: str) -> bool:
+        return self.restrict is not None and (not self.restrict or name in self.restrict)
 
     async def _check_tool(self, call: ToolCall) -> str | None:
         assert self.policy is not None
-        if self.restrict is not None and (not self.restrict or call.name in self.restrict):
-            return "This tool is not available for this request."
+        if self._taken_away(call.name):
+            return str(TOOL_UNAVAILABLE)
         lenses = self.policy.active_lenses(Stage.WATCH, Subject.TOOL_CALL)
         if not lenses:
             return None
@@ -527,10 +808,12 @@ class TurnSession:
             )
         finally:
             budgets.deactivate(token)
-        self.observed.extend(observed)
+        self._observe(Stage.WATCH, observed)
         # This call's answers stay out of view.answers: the next call is judged on its own.
         answers = {o.lens.name: o.answer for o in observed}
         tool_lenses = {lens.name for lens in lenses}
+        # Other lenses that failed this turn still count; a tool lens only for this call.
+        errored = {name for name in self._failed_lenses() if name not in tool_lenses}
         # Every call is judged, not just the first: a refused call stays refused on retry.
         matched = [
             m
@@ -539,26 +822,31 @@ class TurnSession:
                 {**self.view.answers, **answers},
                 Stage.WATCH,
                 done=set(),
-                errored=_errored(observed),
+                errored=errored | _errored(observed),
                 fail_closed=_fail_closed(Stage.WATCH),
             )
             if m.rule.lenses() & tool_lenses
         ]
         # One ledger decision per rule, however many calls it refused.
-        recorded = {m.rule.name for m in self.matched}
+        recorded = {m.rule.name for m in self.matched if not m.aside}
         self.matched.extend(m for m in matched if m.rule.name not in recorded)
+        # Tools taken away stay away: later calls are refused, get_tools() leaves them out.
         for match in matched:
-            refusing = [a for a in match.acted if a.kind in {"block", "restrict_tools"}]
-            if refusing:
-                block = next((a for a in refusing if a.kind == "block"), None)
-                return (
-                    match.rule.message
-                    or (block.message if block is not None else "")
-                    or f"Blocked by policy ({match.rule.name})."
-                )
+            for action in match.acted:
+                if isinstance(action, RestrictTools):
+                    self.restrict = _taken(self.restrict, action.names)
+        for match in matched:
+            block = next((a for a in match.acted if isinstance(a, Block)), None)
+            if block is not None:
+                return str(match.rule.message or block.message)
+        if self._taken_away(call.name):
+            restricting = next(
+                (m for m in matched if any(a.kind == "restrict_tools" for a in m.acted)), None
+            )
+            return str((restricting and restricting.rule.message) or TOOL_UNAVAILABLE)
         return None
 
-    async def review(self, output: str | None = None) -> ReviewResult:
+    async def finish(self, output: str | None = None) -> FinishResult:
         """Judge the finished answer before it is stored."""
         if output is not None:
             self.view.output = output
@@ -568,48 +856,52 @@ class TurnSession:
             if watched.blocked:
                 return watched
         self.original_output = self.original_output or self.view.output
-        result = ReviewResult(output=self.view.output)
+        result = FinishResult(output=self.view.output)
         if not self.active:
             return result
+        if self._unloaded:
+            return self._refuse_output(result)
         try:
             matched = await self._stage(
-                Stage.REVIEW,
+                Stage.FINISH,
                 subjects={Subject.OUTPUT, Subject.EXCHANGE, Subject.SOURCES},
-                deadline=setting("REVIEW_DEADLINE_MS"),
+                deadline=setting("FINISH_DEADLINE_MS"),
             )
             self.matched.extend(matched)
-            return self._apply_output_actions(Stage.REVIEW, matched, result)
+            return self._apply_output_actions(Stage.FINISH, matched, result)
         except Exception:
-            return self._failed(Stage.REVIEW, result)
+            return self._failed(Stage.FINISH, result)
 
-    def _failed(self, stage: Stage, result: ReviewResult) -> ReviewResult:
+    def _failed(self, stage: Stage, result: FinishResult) -> FinishResult:
         """A stage that broke leaves the answer as it is, unless the stage fails closed."""
         logger.exception("Oversight {} failed for turn {}", stage, self.id)
-        self.error = f"{stage} failed"
+        self.note_error(f"{stage} failed")
         if _fail_closed(stage):
-            result.blocked = result.replaced = True
-            result.message = result.output = self.view.output = Block.DEFAULT_MESSAGE
+            self.refused = True
+            return self._refuse_output(result)
+        return result
+
+    def _refuse_output(self, result: FinishResult) -> FinishResult:
+        result.blocked = result.replaced = True
+        result.message = result.output = self.view.output = str(Block.DEFAULT_MESSAGE)
         return result
 
     def _apply_output_actions(
-        self, stage: Stage, matched: list[Matched], result: ReviewResult
-    ) -> ReviewResult:
-        redactions: list[tuple[list[TextSpan], str]] = []
+        self, stage: Stage, matched: list[Matched], result: FinishResult
+    ) -> FinishResult:
+        masks = self._masks(stage, matched, Subject.OUTPUT)
         for match in matched:
             for action in match.acted:
-                if action.kind == "block" and not result.blocked:
+                if isinstance(action, Block) and not result.blocked:
                     result.blocked = True
-                    result.message = match.rule.message or action.message
-                elif action.kind == "redact":
-                    spans = self._spans_for(action, match, Subject.OUTPUT)
-                    if spans:
-                        redactions.append((spans, action.template))
+                    result.message = str(match.rule.message or action.message)
         if result.blocked:
             result.output = result.message
             result.replaced = True
-        elif redactions:
-            result.output = redact_all(result.output, redactions)
-            result.replaced = True
+        elif masks:
+            masked = mask_all(result.output, masks)
+            result.replaced = masked != result.output
+            result.output = masked
         if result.replaced:
             self.original_output = self.original_output or self.view.output
             self.view.output = result.output
@@ -617,31 +909,76 @@ class TurnSession:
         return result
 
     async def _stage(
-        self, stage: Stage, *, subjects: set[Subject], deadline: float | None
+        self,
+        stage: Stage,
+        *,
+        subjects: set[Subject],
+        deadline: float | None,
+        offset: int = 0,
     ) -> list[Matched]:
+        """Ask the stage's lenses on `subjects` and return the rules that now hold.
+
+        `offset`: the lenses read the answer from there on (a watch check); their
+        spans are moved to index the whole answer.
+        """
         assert self.policy is not None
         lenses = [lens for lens in self.policy.active_lenses(stage) if lens.subject in subjects]
+        view = self.view
+        if offset:
+            view = self.view.model_copy(update={"output": self.view.output[offset:]})
         token = budgets.activate(self._budget)
         try:
-            observed = await run_lenses(lenses, self.view, stage, deadline_ms=deadline)
+            observed = await run_lenses(lenses, view, stage, deadline_ms=deadline)
         finally:
             budgets.deactivate(token)
-        self.observed.extend(observed)
-        for o in observed:
-            self.view.answers[o.lens.name] = o.answer
+        if offset:
+            observed = [_moved(o, offset, len(self.view.input)) for o in observed]
+        self._observe(stage, observed)
         return evaluate_rules(
             self.policy,
             self.view.answers,
             stage,
-            done={m.rule.name for m in self.matched},
-            errored=_errored(observed),
+            done={m.rule.name for m in self.matched if not m.aside},
+            errored=self._failed_lenses(),
             fail_closed=_fail_closed(stage),
         )
 
-    def _spans_for(self, action: Redact, match: Matched, subject: Subject) -> list[TextSpan]:
-        """The spans a Redact action masks: from the lenses it names, on this subject."""
-        names = set(action.lenses) or match.rule.lenses()
-        return spans_for(self.observed, names, subject, self.view.input)
+    def _observe(self, stage: Stage, observed: list[Observed]) -> None:
+        """Keep the stage's answers: in the record, and in what rules judge.
+
+        Watch asks the same lenses again and again: per lens it keeps one answer,
+        the latest, unless an earlier one found something and the latest did not.
+        Every stage keeps each lens's latest failure state.
+        """
+        for o in observed:
+            if o.lens.subject is not Subject.TOOL_CALL:
+                # A tool call's lens judges that call alone: its failure is the call's.
+                self._lens_failed[o.lens.name] = o.errored
+            kept = o
+            if stage is Stage.WATCH:
+                index = next(
+                    (
+                        i
+                        for i, e in enumerate(self.observed)
+                        if e.stage is stage and not e.aside and e.lens.name == o.lens.name
+                    ),
+                    None,
+                )
+                if index is not None:
+                    earlier = self.observed[index]
+                    if _found(earlier) and not _found(o) and not o.errored:
+                        kept = earlier
+                    self.observed[index] = kept
+                else:
+                    self.observed.append(o)
+            else:
+                self.observed.append(o)
+            if o.lens.subject is not Subject.TOOL_CALL:
+                self.view.answers[o.lens.name] = kept.answer
+
+    def _failed_lenses(self) -> set[str]:
+        """Lenses whose latest answer this turn failed."""
+        return {name for name, failed in self._lens_failed.items() if failed}
 
     def _notice(
         self,
@@ -649,7 +986,7 @@ class TurnSession:
         matched: list[Matched],
         blocked: bool,
         message: str,
-        review: ReviewResult | None = None,
+        finished: FinishResult | None = None,
     ) -> dict[str, Any] | None:
         acted = [m for m in matched if m.acted]
         level = setting("CLIENT_DETAIL")
@@ -660,36 +997,44 @@ class TurnSession:
             "turn_id": self.id,
             "stage": str(stage),
             "outcome": str(worst(*(m.outcome() for m in acted))),
-            "rules": [m.rule.name for m in acted],
         }
         if blocked:
             notice["message"] = message
-        if review is not None and review.replaced:
-            notice["replace"] = review.output
-        if stage is Stage.GATE and any(a.kind == "redact" for m in acted for a in m.acted):
+        if finished is not None and finished.replaced:
+            notice["replace"] = finished.output
+        # A refused question is not echoed, masked or not: part of it may not be.
+        masked = any(a.kind == "mask" for m in acted for a in m.acted)
+        if stage is Stage.GATE and masked and not blocked:
             notice["input"] = self.view.input
         if detail:
+            # Rule names say what the policy tests: only for a developer view.
+            notice["rules"] = [m.rule.name for m in acted]
             notice["detail"] = self._detail(stage, matched)
         return notice
 
     def _detail(self, stage: Stage, matched: list[Matched]) -> dict[str, Any]:
-        """Every answer and match of `stage`, for a developer view in the client."""
-        from django_ai_sdk.utils import serialize
+        """Every answer and match of `stage`, for a developer view in the client.
+
+        Each value as the record keeps it (`record.stored_value`): no `Text` answer,
+        and a name an `Entities` answerer gave in its own words only as "[found]",
+        so the client never reads what a mask took out of the question or answer.
+        """
+        from django_ai_sdk.oversight.record import stored_value
 
         assert self.policy is not None
         matches = [*matched, *self._tool_matches(stage, matched)]
         return {
             "policy": self.policy.name,
-            "shadow_outcome": str(worst(*(m.outcome(shadow=True) for m in matches))),
+            "report_outcome": str(worst(*(m.outcome(report=True) for m in matches))),
             "pending": sorted(lens.name for lens in self.policy.active_lenses(Stage.REFLECT))
-            if stage is Stage.REVIEW
+            if stage is Stage.FINISH
             else [],
             "observations": [
                 {
                     "lens": o.lens.name,
                     "label": o.lens.label or o.lens.name.replace("_", " "),
                     "kind": o.lens.kind,
-                    "value": serialize(o.answer.value),
+                    "value": stored_value(o.lens, o.answer),
                     "confidence": o.answer.confidence if o.answer.ok else None,
                     "answerer": o.answer.answerer,
                     "model": o.answer.model,
@@ -712,7 +1057,7 @@ class TurnSession:
 
     def _tool_matches(self, stage: Stage, matched: list[Matched]) -> list[Matched]:
         """The answer's notice also carries what tool calls matched: no notice of their own says so."""
-        if stage is not Stage.REVIEW:
+        if stage is not Stage.FINISH:
             return []
         return [m for m in self.matched if m.stage is Stage.WATCH and m not in matched]
 
@@ -720,27 +1065,38 @@ class TurnSession:
 
     @property
     def outcome(self) -> Outcome:
-        refused = [Outcome.BLOCKED] if self.too_long else []
+        refused = [Outcome.BLOCKED] if self.too_long or self.refused else []
         return worst(*refused, *(m.outcome() for m in self.matched if m.acted))
 
     @property
-    def shadow_outcome(self) -> Outcome:
-        refused = [Outcome.BLOCKED] if self.too_long else []
-        return worst(*refused, *(m.outcome(shadow=True) for m in self.matched))
+    def report_outcome(self) -> Outcome:
+        refused = [Outcome.BLOCKED] if self.too_long or self.refused else []
+        return worst(*refused, *(m.outcome(report=True) for m in self.matched))
 
     async def close(self, *, error: str = "") -> str | None:
         """Write the turn to the ledger and queue the background stages. Never raises.
 
-        Returns the turn's id once written, None for an inert session or a failure.
+        Tool results still being masked are cancelled first: nothing is added to a
+        closed turn. `error` is what went wrong in the run (the caller's exception,
+        a disconnect), recorded with the errors oversight noted itself. Returns the
+        turn's id once written, None for an inert session or a failure.
         """
         if not self.active or self._closed:
             return None
         self._closed = True
-        self.error = error or self.error
+        await self._cancel_masking()
+        self.note_error(error)
         try:
             turn_id = await sync_to_async(_persist, thread_sensitive=True)(self)
         except Exception:
-            logger.exception("Oversight could not record turn {}", self.id)
+            # No content: what the ledger lost, so an operator can tell.
+            logger.exception(
+                "Oversight could not record turn {}: outcome {}, acted {}, errors {}",
+                self.id,
+                self.outcome,
+                sorted({m.rule.name for m in self.matched if m.acted}),
+                self.error or "none",
+            )
             return None
         if self._budget is not None:
             try:
@@ -748,6 +1104,13 @@ class TurnSession:
             except Exception:
                 logger.exception("Oversight could not record spend for turn {}", self.id)
         return turn_id
+
+    async def _cancel_masking(self) -> None:
+        pending = [f for f in self._masking_results.values() if not f.done()]
+        for future in pending:
+            future.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def notifications(self) -> list[tuple[dict[str, Any], list[str]]]:
         """What the turn's enforced Notify actions send: (event, exporter names)."""
@@ -767,13 +1130,137 @@ class TurnSession:
             )
             for match in self.matched
             for action in match.acted
-            if action.kind == "notify"
+            if isinstance(action, Notify)
         ]
 
 
 def _errored(observed: list[Observed]) -> set[str]:
     """Lenses whose answer failed; one waiting for a person has not failed."""
-    return {o.lens.name for o in observed if o.answer.error and not o.answer.queued}
+    return {o.lens.name for o in observed if o.errored}
+
+
+def _taken(restrict: list[str] | None, names: list[str]) -> list[str]:
+    """The tools taken away once `names` go too: None none, [] all of them."""
+    if not names or restrict == []:
+        return []
+    return sorted({*(restrict or []), *names})
+
+
+def _unpointed(
+    observed: Iterable[Observed],
+    names: set[str],
+    *,
+    closed: bool,
+    subject: Subject,
+    texts: Mapping[Subject, str],
+) -> bool:
+    """Whether a mask over lenses `names` cannot point at all it should mask in `subject`.
+
+    The latest answer of one of them on that text failed while the stage fails
+    closed, found something without saying where, or pointed outside the text it
+    read (`texts`): masking around it would pass what it found.
+    """
+    latest: dict[str, Observed] = {
+        o.lens.name: o
+        for o in observed
+        if o.lens.name in names and not o.aside and o.lens.subject in {subject, Subject.EXCHANGE}
+    }
+    for o in latest.values():
+        if closed and o.errored:
+            return True
+        if o.answer.ok and o.answer.value:
+            size = len(texts.get(o.lens.subject, ""))
+            if not o.answer.spans or not all(0 <= s.start < s.end <= size for s in o.answer.spans):
+                return True
+    return False
+
+
+def _found(o: Observed) -> bool:
+    return o.answer.ok and bool(o.answer.value)
+
+
+def _moved(o: Observed, offset: int, input_chars: int) -> Observed:
+    """`o` from lenses that read the answer from `offset` on, its spans indexing all of it."""
+    if not o.answer.spans or o.lens.subject not in {Subject.OUTPUT, Subject.EXCHANGE}:
+        return o
+    # An EXCHANGE lens read the question, a blank line, then the answer.
+    after = input_chars + 2 if o.lens.subject is Subject.EXCHANGE else 0
+    spans = [
+        s.model_copy(update={"start": s.start + offset, "end": s.end + offset})
+        if s.start >= after
+        else s
+        for s in o.answer.spans
+    ]
+    return Observed(o.lens, o.stage, o.answer.model_copy(update={"spans": spans}), o.failed)
+
+
+@dataclass
+class _Judged:
+    """Text beside the turn's own, judged: as it may be passed on, and what was found."""
+
+    text: str
+    observed: list[Observed] = field(default_factory=list)
+    matched: list[Matched] = field(default_factory=list)
+    # Why an enforced rule refuses the turn for it, if one does.
+    block: str | None = None
+    # Tools an enforced rule takes away for it: None none, [] all.
+    restrict: list[str] | None = None
+
+
+def _history_items(
+    messages: list[ChatMessage], *, history: bool
+) -> list[tuple[Callable[[], str], Callable[[str], None]]]:
+    """What check_history judges, each as (read it, write it back).
+
+    Each earlier user and assistant message's text (with `history`), and the
+    context of every message's attachments, the question's own included.
+    """
+    items: list[tuple[Callable[[], str], Callable[[str], None]]] = []
+    for index, message in enumerate(messages):
+        earlier = index < len(messages) - 1
+        if history and earlier and message.role in {"user", "assistant"} and message.content:
+            items.append(
+                (
+                    lambda m=message: m.content,
+                    lambda text, m=message: setattr(m, "content", text),
+                )
+            )
+        if not history and earlier:
+            continue
+        for attachment in message.attachments:
+            if attachment.context:
+                items.append(
+                    (
+                        lambda a=attachment: a.context,
+                        lambda text, a=attachment: setattr(a, "context", text),
+                    )
+                )
+    return items
+
+
+def _stand_in(name: str) -> ResolvedPolicy:
+    """An empty policy under `name`, for a turn whose own could not be loaded: it only refuses."""
+    from django_ai_sdk.oversight.policy import ResolvedPolicy
+
+    retention = dict(setting("RETENTION") or {})
+    return ResolvedPolicy(
+        name=name,
+        capture=Capture(setting("CAPTURE")),
+        retention={
+            "content": int(retention.get("content", 90)),
+            "metadata": int(retention.get("metadata", 730)),
+        },
+        origin="unloaded",
+    )
+
+
+async def _budget() -> budgets.Budget:
+    """Today's model budget; spent when it cannot be read, so metered answerers refuse."""
+    try:
+        return await budgets.aload()
+    except Exception:
+        logger.exception("Oversight could not read today's spend: model answerers refuse")
+        return budgets.Budget(0.0)
 
 
 def _fail_closed(stage: Stage) -> bool:
@@ -786,11 +1273,12 @@ def spans_for(
     """The spans lenses `names` found in `subject`, from each lens's latest answer.
 
     An EXCHANGE lens reads the input, a blank line and the output, so its spans are
-    moved onto the part asked for and those in the other part dropped.
+    moved onto the part asked for and those in the other part dropped. Answers about
+    text beside the turn's own (`aside`) never point into it.
     """
     latest: dict[str, Observed] = {}
     for o in observed:
-        if o.lens.name in names:
+        if o.lens.name in names and not o.aside:
             latest[o.lens.name] = o
     offset = len(input_text) + 2
     spans: list[TextSpan] = []
@@ -809,22 +1297,24 @@ def spans_for(
 
 
 async def _staff_view(user: Any) -> bool:
-    """Whether `user` may read oversight, asked only when CLIENT_DETAIL is "staff"."""
+    """Whether `user` may read oversight, asked only when CLIENT_DETAIL is "staff".
+
+    Not staff when the permission cannot be read: the view shows less, never more.
+    """
     if setting("CLIENT_DETAIL") != "staff" or getattr(user, "pk", None) is None:
         return False
-    from django_ai_sdk.permissions import (
-        Operation,
-        PermissionDomain,
-        get_domain_permissions,
-        has_perms,
-    )
+    from django_ai_sdk import permissions
 
-    return await has_perms(
-        user,
-        Operation.VIEW_OVERSIGHT,
-        permissions=get_domain_permissions(PermissionDomain.OVERSIGHT),
-        raise_on_deny=False,
-    )
+    try:
+        return await permissions.has_perms(
+            user,
+            permissions.Operation.VIEW_OVERSIGHT,
+            permissions=permissions.get_domain_permissions(permissions.PermissionDomain.OVERSIGHT),
+            raise_on_deny=False,
+        )
+    except Exception:
+        logger.exception("Oversight could not read whether a user is staff: not staff")
+        return False
 
 
 def agent_key(agent: Agent) -> str:
@@ -836,15 +1326,39 @@ def agent_key(agent: Agent) -> str:
     return str(getattr(agent, "agent_id", "") or "")
 
 
-def code_policy(agent: Agent) -> tuple[str, str]:
-    """The policy the agent's code asks for, and why: "agent", "off" or "default"."""
-    getter = getattr(agent, "get_oversight_policy", None)
-    name = getter() if callable(getter) else getattr(agent, "oversight", None)
-    if name is False:
+async def acode_policy(agent: Agent, *, channel: str = "", user: Any = None) -> tuple[str, str]:
+    """The policy the agent's code asks for this turn, and why: "agent", "off" or "default".
+
+    Awaits the agent's `get_oversight(channel=, user=)`; an object without one is
+    read by its `oversight` attribute. Raises what the hook raises, and TypeError
+    for what names no policy: the caller decides what a failure means.
+    """
+    getter = getattr(agent, "get_oversight", None)
+    if callable(getter):
+        chosen = getter(channel=channel, user=user)
+        if inspect.isawaitable(chosen):
+            chosen = await chosen
+    else:
+        chosen = getattr(agent, "oversight", None)
+    return _code_choice(chosen)
+
+
+def code_policy(agent: Any) -> tuple[str, str]:
+    """What the agent's class says, without asking its `get_oversight()`: for checks.
+
+    The policy's name and why: "agent", "off" or "default".
+    """
+    return _code_choice(getattr(agent, "oversight", None))
+
+
+def _code_choice(chosen: Any) -> tuple[str, str]:
+    from django_ai_sdk.oversight.registry import policy_name
+
+    if chosen is False:
         return "", "off"
-    if isinstance(name, str) and name:
-        return name, "agent"
-    return str(setting("DEFAULT_POLICY") or ""), "default"
+    if chosen is None or chosen == "":
+        return str(setting("DEFAULT_POLICY") or ""), "default"
+    return policy_name(chosen), "agent"
 
 
 def fingerprint(agent: Agent) -> str:
@@ -859,332 +1373,14 @@ def fingerprint(agent: Agent) -> str:
     tools = getattr(type(agent), "tools", []) or []
     parts.append(",".join(sorted(getattr(t, "__name__", str(t)) for t in tools)))
     parts.append(",".join(sorted(getattr(agent, "integrations", []) or [])))
-    return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:16]
-
-
-def _source(item: Any) -> Source:
-    if isinstance(item, Source):
-        return item
-    if isinstance(item, dict):
-        return Source.model_validate({k: v for k, v in item.items() if k in Source.model_fields})
-    return Source(
-        key=str(getattr(item, "key", "") or ""),
-        title=str(getattr(item, "title", "") or ""),
-        url=str(getattr(item, "url", "") or ""),
-        content=str(getattr(item, "content", "") or ""),
-        kind=str(getattr(item, "kind", "") or ""),
-        doc_id=str(getattr(item, "doc_id", "") or ""),
-        chunk_id=str(getattr(item, "chunk_id", "") or ""),
-        memory_id=str(getattr(item, "memory_id", "") or ""),
-    )
-
-
-def evidence_content(session: TurnSession, capture: Capture) -> dict[str, Any] | None:
-    """What of the turn is kept, at `capture`. Salted, so its hash says nothing."""
-    view = session.view
-    if capture is Capture.NONE:
-        return None
-    base: dict[str, Any] = {
-        "salt": secrets.token_hex(16),
-        "agent": {"id": view.agent_id, "name": view.agent_name},
-    }
-    if capture is Capture.METADATA:
-        return {
-            **base,
-            "input_chars": len(session.original_input or view.input),
-            "output_chars": len(session.original_output or view.output),
-            "sources": [
-                {"title": s.title, "url": s.url, "kind": s.kind, "seeded": s.seeded}
-                for s in view.sources
-            ],
-            "tool_calls": [{"name": c.name, "error": c.error} for c in view.tool_calls],
-        }
-    full = capture is Capture.FULL
-    if full:
-        input_text = session.original_input
-        output_text = session.original_output or view.output
-    else:
-        input_text = _redact_subject(session, Subject.INPUT)
-        output_text = _redact_subject(session, Subject.OUTPUT)
-    return {
-        **base,
-        "input": input_text,
-        "output": output_text,
-        # What was actually shown or stored, when it differs from what was said.
-        "shown_input": view.input if full and view.input != session.original_input else None,
-        "shown_output": view.output
-        if full and session.original_output and view.output != session.original_output
-        else None,
-        "history": [h.model_dump() for h in view.history],
-        "sources": [s.model_dump() for s in view.sources],
-        "tool_calls": [c.model_dump(mode="json") for c in view.tool_calls],
-    }
-
-
-def _redact_subject(session: TurnSession, subject: Subject) -> str:
-    """`subject` as passed on, with what any Entities lens found there masked.
-
-    For REDACTED capture. A lens that ran before a rule masked or replaced the text
-    read it as said, so its offsets don't fit what was passed on: what it found is
-    masked wherever it still shows there.
-    """
-    view = session.view
-    if subject is Subject.INPUT:
-        said, shown, masked_at = session.original_input or view.input, view.input, Stage.GATE
-    else:
-        said, shown, masked_at = session.original_output or view.output, view.output, Stage.REVIEW
-    spans: list[TextSpan] = []
-    for o in session.observed:
-        if o.lens.kind != "entities" or o.lens.subject is not subject:
-            continue
-        if said == shown or STAGE_ORDER.index(o.stage) > STAGE_ORDER.index(masked_at):
-            spans.extend(o.answer.spans)
-            continue
-        for span in o.answer.spans:
-            found = said[span.start : span.end]
-            if found:
-                spans.extend(
-                    TextSpan(start=m.start(), end=m.end(), label=span.label)
-                    for m in re.finditer(re.escape(found), shown)
-                )
-    return redact_all(shown, [(spans, "[{label}]")]) if spans else shown
-
-
-def _persist(session: TurnSession) -> str:
-    """Write evidence, turn, observations and decisions, chained, in one transaction."""
-    from datetime import timedelta
-
-    from django.db import transaction
-
-    from django_ai_sdk.oversight import ledger, vault
-    from django_ai_sdk.oversight.models import Evidence, Turn
-
-    assert session.policy is not None
-    policy = session.policy
-    now = timezone.now()
-    created = session.created_at or now
-    content = evidence_content(session, policy.capture)
-    scope = f"thread:{session.thread_id}" if session.thread_id else f"turn:{session.id}"
-
-    # What judges said can quote the turn: kept only where the turn's text is.
-    reasons = policy.capture not in {Capture.NONE, Capture.METADATA}
-    texts = text_values(session.observed) if reasons else {}
-
-    with transaction.atomic():
-        evidence = None
-        evidence_hash = ""
-        if content is not None:
-            evidence_hash = ledger.sha256(ledger.canonical(content))
-            stored = {**content, "texts": texts} if texts else content
-            sealed = vault.encrypt_json(scope, stored)
-            evidence = Evidence.objects.create(
-                digest=evidence_hash,
-                scope=scope,
-                key=sealed[0] if sealed else None,
-                ciphertext=sealed[1] if sealed else None,
-                content=None if sealed else stored,
-                capture=str(policy.capture),
-                expires_at=now + timedelta(days=policy.retention["content"]),
-            )
-        turn = Turn.objects.create(
-            id=session.id,
-            created_at=created,
-            expires_at=created + timedelta(days=policy.retention["metadata"]),
-            completed_at=now,
-            channel=session.channel[:100],
-            agent_id=session.view.agent_id[:64],
-            agent_name=session.view.agent_name[:255],
-            agent_fingerprint=session.agent_fingerprint,
-            policy=policy.name,
-            thread_id=session.thread_id,
-            user_message_id=session.user_message_id,
-            message_id=session.message_id,
-            actor_pseudonym=session.actor,
-            actor_ref=vault.seal_text(f"actor:{session.actor}", session.actor_pk)
-            if session.actor_pk
-            else "",
-            model=session.usage.model[:255],
-            prompt_tokens=session.usage.prompt_tokens,
-            completion_tokens=session.usage.completion_tokens,
-            cost=_cost(session),
-            latency_ms=round((time.perf_counter() - session._started) * 1000, 1),
-            outcome=str(session.outcome),
-            shadow_outcome=str(session.shadow_outcome),
-            evidence=evidence,
-            evidence_hash=evidence_hash,
-        )
-        labels, severity, chained = record_judgments(
-            turn, session.observed, session.matched, reasons=reasons
-        )
-        if session.outcome is Outcome.BLOCKED:
-            severity = most_severe(severity, Severity.HIGH)
-        Turn.objects.filter(pk=turn.pk).update(labels=labels, severity=severity)
-        ledger.append_many([("turn", turn), *chained])
-        if _needs_reflect(session):
-            transaction.on_commit(lambda: _enqueue_reflect(turn.id))
-        if events := session.notifications():
-            transaction.on_commit(lambda: _enqueue_export(events))
-    return str(turn.id)
-
-
-def record_judgments(
-    turn: Any,
-    observed: list[Observed],
-    matched: list[Matched],
-    *,
-    reasons: bool,
-    reviewer: str = "",
-) -> tuple[dict[str, Any], str, list[tuple[str, Any]]]:
-    """Write the observations, decisions and review items of `turn`. Sync, in a transaction.
-
-    Returns the labels the answers set, the severity the enforced alerts and
-    notifications ask for, and the rows to chain, in order, for `ledger.append_many`.
-    """
-    from django_ai_sdk.oversight.models import Decision, Observation, ReviewItem
-
-    observations = Observation.objects.bulk_create(
-        Observation(
-            turn=turn,
-            reviewer=reviewer,
-            **observation_fields(
-                o.lens.name, o.stage, o.answer, text=o.lens.kind == "text", reasons=reasons
-            ),
-        )
-        for o in observed
-    )
-    decisions = Decision.objects.bulk_create(
-        Decision(
-            turn=turn,
-            rule=match.rule.name,
-            stage=str(match.stage),
-            mode=str(match.rule.mode),
-            actions=[a.to_dict() for a in match.rule.then],
-            acted=bool(match.acted),
-            condition=match.rule.when.to_dict(),
-        )
-        for match in matched
-    )
-    acted = [(match, action) for match in matched for action in match.acted]
-    reviews = {(o.answer.queued, o.lens.name, "") for o in observed if o.answer.queued}
-    reviews |= {(a.queue, "", m.rule.name) for m, a in acted if a.kind == "queue"}
-    priority = {a.queue: a.priority for m, a in reversed(acted) if a.kind == "queue"}
-    # A retried reflect or a second verdict may ask for a review that is already open.
-    ReviewItem.objects.bulk_create(
-        [
-            ReviewItem(
-                turn=turn, queue=queue, lens=lens, rule=rule, priority=priority.get(queue, 0)
-            )
-            for queue, lens, rule in sorted(reviews)
-        ],
-        ignore_conflicts=True,
-    )
-    labels = {
-        obs.lens: obs.value
-        for o, obs in zip(observed, observations, strict=True)
-        if o.answer.ok and o.lens.kind in {"choice", "flag", "entities", "score"}
-    }
-    severity = most_severe(*(a.severity for m, a in acted if a.kind in {"alert", "notify"}))
-    chained = [("observation", o) for o in observations] + [("decision", d) for d in decisions]
-    return labels, severity, chained
-
-
-def observation_fields(
-    lens: str, stage: Stage | str, answer: Answer, *, text: bool = False, reasons: bool = True
-) -> dict[str, Any]:
-    """An Observation's columns. Decided here, once: `value` is hashed into the ledger.
-
-    A Text lens's value is prose about the turn, so it lives with the evidence
-    (`text_values`) and is shredded with it; `reasons=False` drops the rationale.
-    """
-    from django_ai_sdk.utils import serialize
-
-    return {
-        "lens": lens,
-        "stage": str(stage),
-        "answerer": answer.answerer[:200],
-        "model": answer.model[:255],
-        "value": None if text else serialize(answer.value),
-        "confidence": answer.confidence if answer.ok else None,
-        "rationale": answer.rationale if reasons else "",
-        "spans": [s.model_dump() for s in answer.spans],
-        "items": answer.items if reasons else {},
-        "trail": [_trail(a, text=text) for a in answer.trail],
-        "error": answer.error[:200],
-        "queued": answer.queued[:100],
-        "cost": answer.cost,
-        "tokens": answer.tokens,
-        "latency_ms": answer.latency_ms,
-    }
-
-
-def text_values(observed: Iterable[Observed]) -> dict[str, Any]:
-    """Text lens answers by lens, for the evidence's `texts`: outside the hashed content."""
-    from django_ai_sdk.utils import serialize
-
-    return {
-        o.lens.name: serialize(o.answer.value)
-        for o in observed
-        if o.lens.kind == "text" and o.answer.ok and o.answer.value is not None
-    }
-
-
-def _trail(answer: Answer, *, text: bool = False) -> dict[str, Any]:
-    from django_ai_sdk.utils import serialize
-
-    return {
-        "answerer": answer.answerer,
-        "model": answer.model,
-        "value": None if text else serialize(answer.value),
-        "confidence": answer.confidence,
-        "error": answer.error,
-        "cost": answer.cost,
-        "latency_ms": answer.latency_ms,
-    }
-
-
-def _cost(session: TurnSession) -> float | None:
-    from django_ai_sdk.pricing import cost_for
-
-    return cost_for(
-        session.usage.model, session.usage.prompt_tokens, session.usage.completion_tokens
-    )
-
-
-def _needs_reflect(session: TurnSession) -> bool:
-    assert session.policy is not None
-    escalations = any(a.kind == "escalate" for m in session.matched for a in m.acted)
-    unfinished = any(
-        asks_again(o.answer.error, o.answer.trail[-1].error if o.answer.trail else "")
-        for o in session.observed
-    )
-    return escalations or unfinished or session.policy.has_stage(Stage.REFLECT)
-
-
-def _enqueue_export(events: list[tuple[dict[str, Any], list[str]]]) -> None:
-    """Hand notifications to the worker: a slow exporter must not hold the stream open."""
-    try:
-        from django_ai_sdk.oversight.tasks import export_events
-
-        export_events.enqueue([[event, names] for event, names in events])
-    except Exception:
-        logger.exception("Could not queue oversight notifications; is a task backend configured?")
-
-
-def _enqueue_reflect(turn_id: Any) -> None:
-    try:
-        from django_ai_sdk.oversight.tasks import reflect_turn
-
-        reflect_turn.enqueue(str(turn_id))
-    except Exception:
-        logger.exception(
-            "Could not queue reflection for turn {}; is a task backend configured?", turn_id
-        )
+    return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:FINGERPRINT_CHARS]
 
 
 __all__ = [
+    "FinishResult",
     "GateResult",
-    "ReviewResult",
     "TurnSession",
+    "acode_policy",
     "active",
     "agent_key",
     "code_policy",

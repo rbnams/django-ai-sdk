@@ -11,7 +11,12 @@ Needs ``pip install django-ai-sdk[ninja]``. Mount what you need::
     api.add_router("/", ai_sdk_routers.get_workflows_router())
     api.add_router("/memories", ai_sdk_routers.get_memories_router())
     api.add_router("/integrations", ai_sdk_routers.get_integrations_router())
-    api.add_router("/", ai_sdk_routers.get_oversight_router(), auth=staff_auth)
+    api.add_router("/", ai_sdk_routers.get_oversight_router())
+
+The oversight router brings no auth of its own: it runs under the API's, and its
+service checks the ``oversight`` permission domain for ``request.user`` on every
+call (by default staff read, review and audit; superusers reveal who asked and
+change policy). It needs ``django_ai_sdk.oversight`` in INSTALLED_APPS.
 
 Each ``get_*_router()`` returns a new Router, so you can drop endpoints with
 ``exclude={"delete_all_threads"}`` and add your own on the result.

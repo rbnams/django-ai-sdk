@@ -1,6 +1,6 @@
 """A daily spend cap for model answerers, so oversight can never outspend the product.
 
-Unmetered answerers (local detectors, Jev, people) are never counted. When the cap
+Unmetered answerers (local detectors, TypeSafe, people) are never counted. When the cap
 is reached, metered answerers abstain with error "budget" and the lens keeps the
 answers it has.
 """
@@ -18,7 +18,7 @@ from django.db.models import F, Sum
 from django_ai_sdk.logger import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
 logger = get_logger(__name__)
 
@@ -90,7 +90,7 @@ async def aload(cap: float | None = None) -> Budget:
 
 
 @contextlib.asynccontextmanager
-async def charged() -> AsyncIterator[Budget]:
+async def charged() -> AsyncGenerator[Budget]:
     """Today's budget, active for the block and recorded after: for console dry runs."""
     budget = await aload()
     token = activate(budget)

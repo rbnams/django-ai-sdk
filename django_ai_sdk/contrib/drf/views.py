@@ -21,7 +21,7 @@ from django_ai_sdk.agents.config import get_runtime_agent_bases, get_tool_regist
 from django_ai_sdk.agents.services import AgentCreateData, AgentService, AgentUpdateData
 from django_ai_sdk.contrib.drf import serializers as s
 from django_ai_sdk.contrib.drf.base import ApiViewSet
-from django_ai_sdk.errors import NotFound
+from django_ai_sdk.errors import Blocked, NotFound
 from django_ai_sdk.integrations import services as integration_services
 from django_ai_sdk.logger import get_logger
 from django_ai_sdk.memories import services as memory_services
@@ -142,8 +142,13 @@ class ThreadViewSet(ApiViewSet):
         agent = get_thread_agent(thread_id, user=request.user)
         check_agent_perms(request.user, Operation.CHAT, agent=agent)
         messages = chat_messages(agent, serializer.validated_data)
-        result = async_to_sync(agent.run)(messages, thread_id=thread_id, user=request.user)
-        return Response({"result": result, "thread_id": thread_id})
+        try:
+            result = async_to_sync(agent.run)(
+                messages, thread_id=thread_id, user=request.user, channel="api"
+            )
+        except Blocked as blocked:
+            return Response({"result": blocked.message, "thread_id": thread_id, "blocked": True})
+        return Response({"result": result, "thread_id": thread_id, "blocked": False})
 
     @action(detail=True, methods=["get"])
     def sources(self, request: Request, thread_id: str) -> Response:
@@ -347,7 +352,11 @@ class AgentViewSet(ApiViewSet):
         agent = get_agent(agent_id)
         check_agent_perms(request.user, Operation.CHAT, agent=agent)
         messages = chat_messages(agent, serializer.validated_data)
-        return Response({"result": async_to_sync(agent.run)(messages, user=request.user)})
+        try:
+            result = async_to_sync(agent.run)(messages, user=request.user, channel="api")
+        except Blocked as blocked:
+            return Response({"result": blocked.message, "thread_id": "", "blocked": True})
+        return Response({"result": result, "thread_id": "", "blocked": False})
 
     @action(detail=True, methods=["post"])
     def reindex(self, request: Request, agent_id: str) -> Response:

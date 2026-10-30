@@ -1,17 +1,15 @@
-"""Everything that can answer a lens, from a regex to a person."""
+"""Everything that can answer a lens, from a regex to a person.
+
+Vendor answerers (TypeSafe) are exported here only, not from `oversight` itself.
+Helpers such as `base.resolve` and `pii.mask` live in their modules.
+"""
 
 from __future__ import annotations
 
-from django_ai_sdk.oversight.answerers.base import (
-    Answerer,
-    Function,
-    ask,
-    resolve,
-)
-from django_ai_sdk.oversight.answerers.classifiers import HFClassifier, Moderation, Presidio
+from django_ai_sdk.oversight.answerers.base import Answerer, Function
 from django_ai_sdk.oversight.answerers.human import Human
-from django_ai_sdk.oversight.answerers.llm import AgentJudge, LLMJudge
-from django_ai_sdk.oversight.answerers.pii import PII, Secrets, redact
+from django_ai_sdk.oversight.answerers.llm import LLMJudge
+from django_ai_sdk.oversight.answerers.pii import PII, Secrets
 from django_ai_sdk.oversight.answerers.rules import (
     Detector,
     EmptyRetrieval,
@@ -23,31 +21,23 @@ from django_ai_sdk.oversight.answerers.rules import (
     Refusal,
     ToolErrors,
 )
-from django_ai_sdk.oversight.answerers.typesafe import TypeSafe, TypeSafeSources
+from django_ai_sdk.oversight.answerers.typesafe import TypeSafe
 
 __all__ = [
     "PII",
-    "AgentJudge",
     "Answerer",
     "Detector",
     "EmptyRetrieval",
     "Function",
-    "HFClassifier",
     "Human",
     "Keywords",
     "LLMJudge",
     "Language",
     "Length",
     "LexicalSupport",
-    "Moderation",
     "Patterns",
-    "Presidio",
     "Refusal",
     "Secrets",
     "ToolErrors",
     "TypeSafe",
-    "TypeSafeSources",
-    "ask",
-    "redact",
-    "resolve",
 ]

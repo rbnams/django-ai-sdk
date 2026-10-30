@@ -10,7 +10,6 @@ if TYPE_CHECKING:
     from django_ai_sdk.adapters.suggestions import SuggestionGenerator
     from django_ai_sdk.common import ChatMessage
     from django_ai_sdk.events import StreamEvent
-    from django_ai_sdk.typesafe import TypeSafeScreener
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -35,7 +34,6 @@ class Streamable(Protocol):
     model: str | None = None
     instructions: str | None = None
     suggestion_generator: SuggestionGenerator | None = None
-    typesafe_screener: TypeSafeScreener | None = None
 
     async def stream(
         self,

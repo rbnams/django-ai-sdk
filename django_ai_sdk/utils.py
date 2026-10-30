@@ -35,7 +35,9 @@ async def aget_active_user(identifier: str) -> AbstractBaseUser | None:
     if not identifier:
         return None
     user_model = get_user_model()
-    field = user_model.USERNAME_FIELD  # ty: ignore[unresolved-attribute]
+    # Django requires every user model to set USERNAME_FIELD, a str; AbstractBaseUser
+    # itself has none, so the stubs fall back to the metaclass's `objects` lookup.
+    field: str = user_model.USERNAME_FIELD  # ty: ignore[invalid-attribute-access, invalid-assignment]
     try:
         return await user_model._default_manager.aget(**{field: identifier, "is_active": True})
     except (user_model.DoesNotExist, user_model.MultipleObjectsReturned):

@@ -181,7 +181,9 @@ class OpenAIProtocolHandler(BaseProtocolHandler):
 
                         final_chunk = state._create_chunk(
                             delta=delta,
-                            finish_reason=end_event.finish_reason or "stop",
+                            # Events say "content-filter" as the Vercel protocol does;
+                            # OpenAI clients expect "content_filter".
+                            finish_reason=(end_event.finish_reason or "stop").replace("-", "_"),
                         )
                         yield format_sse(final_chunk.model_dump())
 

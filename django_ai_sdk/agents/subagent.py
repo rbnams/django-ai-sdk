@@ -7,6 +7,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from django.utils.text import slugify
+from django.utils.translation import gettext_lazy
 from haystack import component
 from haystack.dataclasses import (
     ChatMessage,
@@ -32,8 +33,15 @@ if TYPE_CHECKING:
     from haystack.components.agents import Agent as HaystackAgent
 
     from django_ai_sdk.agents.base import Agent
+    from django_ai_sdk.oversight.session import TurnSession
 
 logger = get_logger(__name__)
+
+# What the coordinator is told about a delegation that would need a turn of its own
+# (the subagent's policy) while it runs synchronously, where no turn can open.
+UNWATCHABLE = gettext_lazy(
+    "This task cannot be delegated here: it could not be checked. Answer without it."
+)
 
 # meta key naming the subagent
 SUBAGENT_META_KEY = "django_ai_sdk.subagent"
@@ -140,6 +148,12 @@ def subagent_response(messages: list[ChatMessage] | None) -> str:
     )
 
 
+def _answered(text: str) -> dict[str, Any]:
+    """A delegation's result that is only `text`: what the coordinator reads instead."""
+    reply = ChatMessage.from_assistant(text)
+    return {"messages": [reply], "last_message": reply}
+
+
 def _tag_subagent(chunk: StreamingChunk, name: str) -> StreamingChunk:
     """Return a copy of ``chunk`` stamped with the subagent it came from."""
     return dataclasses.replace(chunk, meta={**chunk.meta, SUBAGENT_META_KEY: name})
@@ -208,12 +222,31 @@ def _unstreamed_results(result: dict[str, Any], seen: set[str]) -> list[Streamin
 
 @component
 class SubagentStreamFilter:
-    """Wrap a subagent Agent so only its tool calls and results reach the stream."""
+    """Wrap a subagent Agent so only its tool calls and results reach the stream.
 
-    def __init__(self, agent: Any, name: str = "", agent_id: str = "") -> None:
+    With `subagent` (the SDK agent it was built from), each delegation runs under
+    that agent's own policy: it joins the coordinator's turn when the policy is the
+    same, or none; otherwise it is a child turn, its task gated, its tools watched,
+    its response finished before the coordinator reads it. A refusal is what the
+    coordinator reads: the policy's message.
+    """
+
+    def __init__(
+        self,
+        agent: Any,
+        name: str = "",
+        agent_id: str = "",
+        *,
+        subagent: Agent | None = None,
+        thread_id: str = "",
+        user: AbstractBaseUser | AnonymousUser | None = None,
+    ) -> None:
         self._agent = agent
         self.name = name
         self.agent_id = agent_id
+        self._subagent = subagent
+        self._thread_id = thread_id
+        self._user = user
 
     def _span(self) -> Any:
         """Open a named span so the subagent's own loop is a readable subtree."""
@@ -246,6 +279,8 @@ class SubagentStreamFilter:
         task: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        if self._needs_own_turn():
+            return _answered(str(UNWATCHABLE))
         seen: set[str] = set()
         with self._span():
             result = self._agent.run(
@@ -289,6 +324,75 @@ class SubagentStreamFilter:
         messages: list[ChatMessage],
         streaming_callback: StreamingCallbackT | None = None,
         task: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        child = await self._child_turn(task or "")
+        if child is None:
+            return await self._delegate(messages, streaming_callback, task, **kwargs)
+        from django_ai_sdk.oversight.session import active
+
+        error = ""
+        try:
+            gate = await child.gate()
+            if gate.blocked:
+                return _answered(gate.message)
+            with active(child):
+                result = await self._delegate(
+                    messages, streaming_callback, gate.input if gate.masked else task, **kwargs
+                )
+            finished = await child.finish(subagent_response(result.get("messages")))
+            if finished.blocked or finished.replaced:
+                return _answered(finished.output)
+            return result
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            await child.close(error=error)
+
+    async def _child_turn(self, task: str) -> TurnSession | None:
+        """The turn this delegation opens under the subagent's policy; None when it joins."""
+        if self._subagent is None:
+            return None
+        from django_ai_sdk.oversight.headless import open_turn
+        from django_ai_sdk.oversight.session import current_session
+
+        outer = current_session()
+        return await open_turn(
+            self._subagent,
+            channel=outer.channel if outer is not None else "subagent",
+            user=self._user,
+            thread_id=self._thread_id or None,
+            input=task,
+        )
+
+    def _needs_own_turn(self) -> bool:
+        """Whether a synchronous delegation would need a turn of its own, which it cannot open.
+
+        Only the subagent's class is read here: the console and `get_oversight()`
+        are asked in async runs alone.
+        """
+        if self._subagent is None:
+            return False
+        from django_ai_sdk.oversight.conf import is_enabled
+
+        if not is_enabled():
+            return False
+        from django_ai_sdk.oversight.session import code_policy, current_session
+
+        try:
+            own = code_policy(self._subagent)[0]
+        except Exception:
+            return True
+        outer = current_session()
+        joins = outer is not None and outer.policy is not None and outer.policy.name == own
+        return bool(own) and not joins
+
+    async def _delegate(
+        self,
+        messages: list[ChatMessage],
+        streaming_callback: StreamingCallbackT | None,
+        task: str | None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         seen: set[str] = set()
@@ -335,6 +439,16 @@ async def build_subagent(
     user: AbstractBaseUser | AnonymousUser | None = None,
 ) -> tuple[HaystackAgent, str] | None:
     """Build a bare Haystack Agent from an SDK Agent subclass."""
+    built = await build_subagent_with(subagent_cls, thread_id=thread_id, user=user)
+    return None if built is None else (built[0], built[1].agent_id)
+
+
+async def build_subagent_with(
+    subagent_cls: type[Agent],
+    thread_id: str = "",
+    user: AbstractBaseUser | AnonymousUser | None = None,
+) -> tuple[HaystackAgent, Agent] | None:
+    """Like `build_subagent`, with the SDK agent built: its policy watches the delegation."""
     path = f"{subagent_cls.__module__}.{subagent_cls.__qualname__}"
     chain = _build_chain.get()
     if path in chain:
@@ -364,6 +478,6 @@ async def build_subagent(
             hooks=default_hooks(subagent),
             stream_subagent_tools=True,
         )
-        return agent, subagent.agent_id
+        return agent, subagent
     finally:
         _build_chain.reset(token)

@@ -2,16 +2,23 @@
 
 AI_SDK_OVERSIGHT = {
     "DEFAULT_POLICY": "default",
+    # Named answerers. The built-in packs name "classifier?" and "judge?": optional,
+    # so a lens whose aliases are all undefined is skipped, never an error.
     "ANSWERERS": {
-        # Yes/no, label and score lenses.
-        "jev": {"class": "django_ai_sdk.oversight.answerers.TypeSafe"},
-        # A chat model for text lenses and second opinions, and one for escalations.
-        "judge": {"class": "django_ai_sdk.oversight.answerers.LLMJudge",
-                  "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"},
-        "strong": {"class": "django_ai_sdk.oversight.answerers.LLMJudge",
-                   "model": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"},
+        # Yes/no, label and score lenses: a small model, or a hosted classifier such
+        # as {"class": "TypeSafe"} (django-ai-sdk[typesafe] and a TYPESAFE_API_KEY).
+        "classifier": {"class": "LLMJudge", "model": "gpt-4.1-mini"},
+        # A chat model for text lenses and second opinions, and a stronger one.
+        "judge": {"class": "LLMJudge", "model": "gpt-4.1-mini"},
+        "strong": {"class": "LLMJudge", "model": "gpt-4.1"},
     },
     "BUDGET_PER_DAY": 5.0,
+    "CURRENCY": "USD",
+}
+# A budget counts what it can price: per million tokens, in CURRENCY.
+AI_SDK_MODEL_PRICES = {
+    "gpt-4.1-mini": {"input": 0.4, "output": 1.6},
+    "gpt-4.1": {"input": 2.0, "output": 8.0},
 }
 """
 
@@ -32,22 +39,25 @@ DEFAULTS: dict[str, Any] = {
     "ENABLED": True,
     # The policy an agent without `oversight` gets. Empty: such agents are unwatched.
     "DEFAULT_POLICY": "",
-    # The most content the ledger keeps; a policy may keep less, never more.
-    "CAPTURE": Capture.FULL,
-    # "live" streams the answer as it comes; "hold" shows it once review passed.
+    # The most content the ledger keeps; a policy may keep less, never more. "masked"
+    # keeps text with every mask a rule found applied; "full" keeps it as it was.
+    "CAPTURE": Capture.MASKED,
+    # "live" streams the answer as it comes; "hold" shows it once finish passed it.
     "STREAM_MODE": "live",
     # Per policy, the same tuning the console's overlay allows, kept in settings:
-    # {"support": {"rules": {"block_injection": {"mode": "enforce"}}, "capture": "redacted"}}
+    # {"support": {"rules": {"block_injection": {"mode": "enforce"}}, "capture": "masked"}}
     "POLICIES": {},
     # Named answerers, so a lens says "judge" and settings say which model that is.
     "ANSWERERS": {},
     # Spend cap for model answerers across the deployment, per UTC day. None: no cap.
     "BUDGET_PER_DAY": None,
-    "CURRENCY": "EUR",
+    # The currency AI_SDK_MODEL_PRICES and BUDGET_PER_DAY are in: a label, never converted.
+    "CURRENCY": "USD",
     # Milliseconds the gate may add to a reply. Answerers still running are abandoned.
-    # Room for Jev (~0.3 s plus network) and code, not for a model judge.
+    # Room for code and a fast classifier; a model judge usually needs longer.
     "GATE_DEADLINE_MS": 1000,
-    "REVIEW_DEADLINE_MS": 2_000,
+    # Milliseconds finish may add once the answer is complete.
+    "FINISH_DEADLINE_MS": 2_000,
     # A question longer than this is refused at the gate, unread: past it, what the
     # lenses read is only part of it. None: no limit.
     "MAX_INPUT_CHARS": 100_000,
@@ -61,17 +71,17 @@ DEFAULTS: dict[str, Any] = {
     # "deadline" and are asked again in reflect.
     "WATCH_DEADLINE_MS": 300,
     # What an answerer that fails or times out means at each stage. "open" lets the
-    # turn through; "closed" treats an enforced rule that blocks, redacts or takes
+    # turn through; "closed" treats an enforced rule that blocks, masks or takes
     # tools away as matched when a lens it reads failed. Rules that only alert,
-    # queue or notify never fire on a failure, nor do shadow rules.
-    "FAIL_MODE": {"gate": "open", "watch": "open", "review": "open"},
+    # queue or notify never fire on a failure, nor do rules in report mode.
+    "FAIL_MODE": {"gate": "open", "watch": "open", "finish": "open"},
     # Days a turn's content (evidence) and its metadata (the turn row, its answers
     # and decisions) are kept. A policy may set either for its own turns.
     "RETENTION": {"content": 90, "metadata": 730},
     # HMAC secret for actor pseudonyms. Defaults to one derived from SECRET_KEY.
     "PSEUDONYM_SECRET": "",
     # base64 32-byte key that wraps per-thread content keys. Empty stores content
-    # in the clear (the oversight.W004 check says so).
+    # in the clear (the ai_sdk.oversight.W001 deploy check says so).
     "MASTER_KEY": "",
     # base64 Ed25519 private key (32 bytes) for signed checkpoints, and the key's
     # name in the signature. Usually left unset: the name is then the log origin.

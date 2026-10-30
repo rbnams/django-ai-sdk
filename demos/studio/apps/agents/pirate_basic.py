@@ -31,7 +31,6 @@ from .extraction import PirateExtractionAgent
 from .tools import get_memory_file, get_memory_files, get_today
 from .tools.memories import FileLookupMixin
 from .transforms import DocumentExtractionTransform
-from .typesafe import DemoTypeSafeScreener
 
 if TYPE_CHECKING:
     from django.contrib.auth.base_user import AbstractBaseUser
@@ -117,7 +116,6 @@ class PirateBasicAgent(FileLookupMixin, Agent):
     integrations: list[str] = ["linear", "weather"]
 
     suggestion_generator = DefaultSuggestionGenerator
-    typesafe_screener = DemoTypeSafeScreener
 
     async def get_rag_queryset(self, memory_id: str | None = None) -> QuerySet[Entry]:
         """Return queryset of documents for RAG."""
@@ -227,5 +225,4 @@ class PirateBasicAgent(FileLookupMixin, Agent):
             storage_adapter=storage_adapter,
             citation_registry=citation_registry,
             suggestion_generator=self.get_suggestion_generator(),
-            typesafe_screener=self.get_typesafe_screener(),
         )

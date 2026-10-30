@@ -57,7 +57,6 @@ class RefusalStream:
     model: str | None = None
     instructions: str | None = None
     suggestion_generator: SuggestionGenerator | None = None
-    typesafe_screener: Any = None
 
     def __init__(self, message: str, notice: dict[str, Any] | None = None) -> None:
         self.message = message
@@ -123,10 +122,11 @@ def observe_replies(session: TurnSession, replies: list[Any]) -> None:
 
 def restrict_agent_tools(agent_component: Any, names: list[str]) -> None:
     """Take the gate's restricted tools off a built Haystack agent; [] takes them all."""
-    from django_ai_sdk.typesafe.control import apply_control_to_agent_component
-
-    control = {"remove_tool_names": names} if names else {"strip_tools": True}
-    apply_control_to_agent_component(agent_component, control)
+    if agent_component is None:
+        return
+    tools = list(getattr(agent_component, "tools", None) or []) if names else []
+    remove = {str(n) for n in names if n}
+    agent_component.tools = [t for t in tools if str(getattr(t, "name", "") or "") not in remove]
 
 
 __all__ = [

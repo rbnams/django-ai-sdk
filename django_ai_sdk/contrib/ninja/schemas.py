@@ -94,6 +94,8 @@ class MessageResponse(Schema):
 class RunResponse(Schema):
     result: str | None = None
     thread_id: str
+    # The agent's oversight policy stopped the run: `result` is the policy's message.
+    blocked: bool = False
 
 
 class ThreadTracesResponse(Schema):

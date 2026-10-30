@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import pytest
 from asgiref.sync import sync_to_async
+from django.test import override_settings
 from django.utils import timezone
 from django_ai_sdk.errors import UserError
 from django_ai_sdk.oversight import ledger
@@ -23,10 +24,10 @@ async def a_turn(text: str = "What about my salary?", output: str = "Ask jan@exa
                  user=None) -> str:
     session = await TurnSession.start(make_agent([], None), channel="api", input=text, user=user)
     await session.gate()
-    await session.review(output)
+    await session.finish(output)
     from unittest.mock import patch
 
-    with patch("django_ai_sdk.oversight.session._enqueue_reflect"):
+    with patch("django_ai_sdk.oversight.record._enqueue_reflect"):
         return await session.close()
 
 
@@ -45,7 +46,10 @@ class TestReading:
     async def test_review_sees_the_turn_and_a_pseudonym(self):
         asker = await UserFactory.acreate()
         staff = await UserFactory.acreate(staff=True)
-        turn_id = await a_turn(user=asker)
+        with override_settings(AI_SDK_OVERSIGHT={"CAPTURE": "full"}):
+            invalidate()
+            turn_id = await a_turn(user=asker)
+        invalidate()
         page = await OversightService.list_turns(user=staff, purpose="review")
         [row] = page.items
         assert row.preview == "What about my salary?"
@@ -93,7 +97,7 @@ class TestReading:
 
         assert await total() == 2
         assert await total(label="topic", value="hr") == 1
-        assert await total(shadow_outcome="blocked") == 1
+        assert await total(report_outcome="blocked") == 1
         assert await total(review="open") == 1
         assert await total(until=timezone.now() - timedelta(days=1)) == 0
         assert await total(since=timezone.now() - timedelta(days=1)) == 2
@@ -197,7 +201,7 @@ class TestPolicies:
         staff = await UserFactory.acreate(staff=True)
         root = await UserFactory.acreate(superuser=True, staff=True)
         change = OverrideIn(target_kind="rule", target="would_block_hr", field="mode",
-                            value="enforce", note="tested in shadow")
+                            value="enforce", note="tested in report mode")
         with pytest.raises(PermissionDenied):
             await OversightService.set_override("test-guard", change, user=staff)
         policy = await OversightService.set_override("test-guard", change, user=root)
@@ -210,7 +214,7 @@ class TestPolicies:
         reset = OverrideIn(target_kind="rule", target="would_block_hr", field="mode", reset=True)
         policy = await OversightService.set_override("test-guard", reset, user=root)
         rule = next(r for r in policy["rules"] if r["name"] == "would_block_hr")
-        assert rule["mode"] == "shadow"
+        assert rule["mode"] == "report"
         assert await PolicyOverride.objects.acount() == 2
         assert (await sync_to_async(ledger.verify)()).ok
 
@@ -229,8 +233,8 @@ class TestLedgerAndInsight:
         await a_turn()
         overview = await OversightService.overview(user=staff)
         assert overview.turns == 1
-        assert overview.by_shadow_outcome == {"blocked": 1}
-        assert any(r["rule"] == "would_block_hr" and r.get("shadow") for r in overview.rules)
+        assert overview.by_report_outcome == {"blocked": 1}
+        assert any(r["rule"] == "would_block_hr" and r.get("report") for r in overview.rules)
         assert overview.labels["topic"] == {"hr": 1}
 
     async def test_verify_and_seal(self):
@@ -256,3 +260,327 @@ class TestLedgerAndInsight:
         root = await UserFactory.acreate(superuser=True, staff=True)
         assert await OversightService.forget_thread("t-1", user=root, reason="erasure request")
         assert not await OversightService.forget_thread("t-1", user=root, reason="erasure again")
+
+
+async def total(staff, **fields) -> int:
+    return (await OversightService.list_turns(TurnFilter(**fields), user=staff)).total
+
+
+@pytest.mark.django_db(transaction=True)
+class TestFilters:
+    async def test_a_label_filter_names_a_lens_only(self):
+        staff = await UserFactory.acreate(staff=True)
+        await a_turn()
+        for bad in ["topic__contains", "topic\n", "a b", "rule:hr_to_people"]:
+            with pytest.raises(UserError):
+                await total(staff, label=bad)
+        assert await total(staff, label="topic") == 1
+
+    async def test_reviewed_and_unreviewed(self):
+        staff = await UserFactory.acreate(staff=True)
+        first = await a_turn()
+        second = await a_turn("hello there", "Hi!")
+        assert await total(staff, review="reviewed") == 0
+        assert await total(staff, review="unreviewed") == 2
+        # Both turns have machine answers; only the first a person's.
+        await OversightService.add_verdict(first, VerdictIn(lens="topic", value="other"),
+                                           user=staff)
+        page = await OversightService.list_turns(TurnFilter(review="reviewed"), user=staff)
+        assert [row.id for row in page.items] == [first]
+        page = await OversightService.list_turns(TurnFilter(review="unreviewed"), user=staff)
+        assert [row.id for row in page.items] == [second]
+
+    async def test_limits_are_capped(self):
+        from django_ai_sdk.oversight.schemas import MAX_LIMIT
+
+        staff = await UserFactory.acreate(staff=True)
+        page = await OversightService.list_turns(user=staff, limit=10_000, offset=-5)
+        assert (page.limit, page.offset) == (MAX_LIMIT, 0)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestVerdicts:
+    async def test_a_call_on_a_rule_is_not_a_label(self):
+        staff = await UserFactory.acreate(staff=True)
+        await a_turn()
+        [item] = await OversightService.list_reviews(user=staff, queue="hr")
+        await OversightService.resolve_review(item.id, VerdictIn(agree=True), user=staff)
+        turn = await Turn.objects.aget(id=item.turn_id)
+        assert turn.labels["topic"] == "hr"
+        assert not [k for k in turn.labels if k.startswith("rule:")]
+        overview = await OversightService.overview(user=staff)
+        assert not [k for k in overview.labels if k.startswith("rule:")]
+        assert not [s for s in overview.lenses if s["lens"].startswith("rule:")]
+
+    async def test_a_review_is_resolved_once(self):
+        from django_ai_sdk.oversight.models import Observation
+        from django_ai_sdk.permissions import ConflictError
+
+        staff = await UserFactory.acreate(staff=True)
+        await a_turn()
+        [item] = await OversightService.list_reviews(user=staff, queue="hr")
+        await OversightService.resolve_review(item.id, VerdictIn(agree=True), user=staff)
+        with pytest.raises(ConflictError):
+            await OversightService.resolve_review(item.id, VerdictIn(agree=False), user=staff)
+        with pytest.raises(ConflictError):
+            await OversightService.resolve_review(item.id, VerdictIn(), user=staff, dismiss=True)
+        assert (await ReviewItem.objects.aget()).resolution["agree"] is True
+        assert await Observation.objects.exclude(reviewer="").acount() == 1
+
+    async def test_two_people_resolving_at_once_answer_once(self):
+        import asyncio
+
+        from django_ai_sdk.oversight.models import Observation
+        from django_ai_sdk.permissions import ConflictError
+
+        staff = await UserFactory.acreate(staff=True)
+        other = await UserFactory.acreate(staff=True)
+        await a_turn()
+        [item] = await OversightService.list_reviews(user=staff, queue="hr")
+        results = await asyncio.gather(
+            OversightService.resolve_review(item.id, VerdictIn(agree=True), user=staff),
+            OversightService.resolve_review(item.id, VerdictIn(agree=False), user=other),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(r, ConflictError) for r in results) == 1
+        assert await Observation.objects.exclude(reviewer="").acount() == 1
+
+    async def test_a_verdict_names_a_lens_of_the_policy_or_a_rule_that_matched(self):
+        from django_ai_sdk.oversight.models import Observation
+
+        staff = await UserFactory.acreate(staff=True)
+        turn_id = await a_turn()
+        with pytest.raises(UserError):
+            await OversightService.add_verdict(turn_id, VerdictIn(lens="made_up", value=True),
+                                               user=staff)
+        with pytest.raises(UserError):
+            await OversightService.add_verdict(
+                turn_id, VerdictIn(lens="rule:block_injection", agree=True), user=staff
+            )
+        assert not await Observation.objects.exclude(reviewer="").aexists()
+        obs = await OversightService.add_verdict(
+            turn_id, VerdictIn(lens="rule:hr_to_people", agree=False), user=staff
+        )
+        assert obs.value is False
+
+
+@pytest.mark.django_db(transaction=True)
+class TestNotes:
+    async def test_audit_sees_decisions_not_notes(self):
+        staff = await UserFactory.acreate(staff=True)
+        await a_turn()
+        [item] = await OversightService.list_reviews(user=staff, queue="hr")
+        await OversightService.resolve_review(
+            item.id, VerdictIn(agree=True, note="the asker is Jan"), user=staff
+        )
+        audit = await OversightService.get_turn(item.turn_id, user=staff, purpose="audit")
+        [review] = audit.reviews
+        assert review.resolution["agree"] is True
+        assert "note" not in review.resolution
+        assert all(o.rationale == "" for o in audit.observations)
+        [listed] = await OversightService.list_reviews(user=staff, status="done", purpose="audit")
+        assert "note" not in listed.resolution
+        shown = await OversightService.get_turn(item.turn_id, user=staff, purpose="review")
+        assert shown.reviews[0].resolution["note"] == "the asker is Jan"
+
+    async def test_a_text_verdict_stays_with_the_evidence(self):
+        from django_ai_sdk.oversight import Text, register
+        from django_ai_sdk.oversight.policy import Policy
+
+        @register
+        class Notes(Policy):
+            name = "test-notes"
+            lenses = [Text(name="gist", question="?", answerers=["human"])]  # noqa: RUF012
+
+        staff = await UserFactory.acreate(staff=True)
+        session = await TurnSession.start(
+            make_agent([], None, policy="test-notes"), channel="api", input="Jan?"
+        )
+        await session.gate()
+        from unittest.mock import patch
+
+        with patch("django_ai_sdk.oversight.record._enqueue_reflect"):
+            turn_id = await session.close()
+        item = await ReviewItem.objects.acreate(turn_id=turn_id, queue="notes", lens="gist")
+        await OversightService.resolve_review(
+            str(item.id), VerdictIn(value="asks about Jan's pay"), user=staff
+        )
+        await item.arefresh_from_db()
+        assert item.resolution["value"] is None
+        detail = await OversightService.get_turn(turn_id, user=staff, purpose="review")
+        assert next(o for o in detail.observations if o.reviewer).value == "asks about Jan's pay"
+        audit = await OversightService.get_turn(turn_id, user=staff, purpose="audit")
+        assert next(o for o in audit.observations if o.reviewer).value is None
+
+    async def test_a_forgotten_thread_shows_no_notes(self):
+        from unittest.mock import patch
+
+        staff = await UserFactory.acreate(staff=True)
+        root = await UserFactory.acreate(superuser=True, staff=True)
+        session = await TurnSession.start(
+            make_agent([], None), channel="api", input="What about my salary?", thread_id="t-9"
+        )
+        await session.gate()
+        await session.finish("Ask HR.")
+        with patch("django_ai_sdk.oversight.record._enqueue_reflect"):
+            turn_id = await session.close()
+        [item] = await OversightService.list_reviews(user=staff, queue="hr")
+        await OversightService.resolve_review(
+            item.id, VerdictIn(agree=True, note="Jan asked twice"), user=staff
+        )
+        await OversightService.forget_thread("t-9", user=root, reason="erasure request")
+        detail = await OversightService.get_turn(turn_id, user=staff, purpose="review")
+        assert detail.evidence_state == "shredded"
+        assert "note" not in detail.reviews[0].resolution
+        assert all(o.rationale == "" for o in detail.observations)
+        [listed] = await OversightService.list_reviews(user=staff, status="done")
+        assert "note" not in listed.resolution
+
+    async def test_a_forgotten_actor_is_a_flag_not_a_label(self):
+        asker = await UserFactory.acreate()
+        root = await UserFactory.acreate(superuser=True, staff=True)
+        turn_id = await a_turn(user=asker)
+        await OversightService.reveal(turn_id, user=root, reason="incident 42 follow-up")
+        # As if the actor's key was shredded.
+        await Turn.objects.filter(id=turn_id).aupdate(actor_ref="aead:AAAA")
+        detail = await OversightService.get_turn(turn_id, user=root)
+        assert detail.actor.startswith("u-") and detail.actor_forgotten
+
+
+@pytest.mark.django_db(transaction=True)
+class TestReadsAtScale:
+    async def test_a_polled_read_is_recorded_once(self):
+        staff = await UserFactory.acreate(staff=True)
+        turn_id = await a_turn()
+        for _ in range(3):
+            await OversightService.get_turn(turn_id, user=staff)
+            await OversightService.list_turns(user=staff)
+        await OversightService.list_turns(TurnFilter(outcome="flagged"), user=staff)
+        await OversightService.get_turn(turn_id, user=staff, purpose="audit")
+        records = [(r.action, r.purpose) async for r in AccessRecord.objects.order_by("created_at")]
+        assert records == [("view", "review"), ("list", "review"), ("list", "review"),
+                           ("view", "audit")]
+        assert (await sync_to_async(ledger.verify)()).ok
+
+    async def test_the_overview_rates_only_answers_and_filters_queues(self):
+        from unittest.mock import patch
+
+        from django_ai_sdk.oversight.models import Observation
+
+        staff = await UserFactory.acreate(staff=True)
+        turn_id = await a_turn()
+        await Observation.objects.acreate(turn_id=turn_id, lens="probe", stage="gate",
+                                          answerer="x", value=True)
+        for _ in range(3):
+            await Observation.objects.acreate(turn_id=turn_id, lens="probe", stage="gate",
+                                              answerer="x", error="timeout")
+        overview = await OversightService.overview(user=staff)
+        probe = next(s for s in overview.lenses if s["lens"] == "probe")
+        assert (probe["answers"], probe["errors"], probe["positive_rate"]) == (4, 3, 1.0)
+        assert overview.queues == {"hr": 1}
+        assert (await OversightService.overview(user=staff, policy="other")).queues == {}
+        assert not overview.sampled
+        with patch("django_ai_sdk.oversight.metrics.MAX_ROWS", 1):
+            assert (await OversightService.overview(user=staff)).sampled
+
+
+MASTER = "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s="  # base64 of b"k" * 32
+OTHER = "b29vb29vb29vb29vb29vb29vb29vb29vb29vb29vb28="  # base64 of b"o" * 32
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAnotherMasterKey:
+    """Content sealed under another MASTER_KEY is there, unreadable here: not forgotten."""
+
+    async def test_the_evidence_reads_as_unreadable_not_shredded(self):
+        from django.test import override_settings
+
+        staff = await UserFactory.acreate(staff=True)
+        with override_settings(AI_SDK_OVERSIGHT={"MASTER_KEY": MASTER}):
+            turn_id = await a_turn()
+        with override_settings(AI_SDK_OVERSIGHT={"MASTER_KEY": OTHER}):
+            detail = await OversightService.get_turn(turn_id, user=staff, purpose="review")
+        assert (detail.evidence, detail.evidence_state) == (None, "unreadable")
+
+    async def test_who_asked_reads_as_sealed_under_another_key_not_forgotten(self):
+        from django.test import override_settings
+
+        asker = await UserFactory.acreate()
+        root = await UserFactory.acreate(superuser=True, staff=True)
+        with override_settings(AI_SDK_OVERSIGHT={"MASTER_KEY": MASTER}):
+            turn_id = await a_turn(user=asker)
+            await OversightService.reveal(turn_id, user=root, reason="incident 42 follow-up")
+        with override_settings(AI_SDK_OVERSIGHT={"MASTER_KEY": OTHER}):
+            detail = await OversightService.get_turn(turn_id, user=root)
+        assert detail.actor.endswith("(sealed under another MASTER_KEY)")
+        assert not detail.actor_forgotten
+
+
+@pytest.mark.django_db(transaction=True)
+class TestForgettingNotes:
+    """What a reviewer wrote lives in the turn's evidence, and goes with it."""
+
+    async def _noted(self, thread_id: str = "") -> ReviewItem:
+        staff = await UserFactory.acreate(staff=True)
+        session = await TurnSession.start(
+            make_agent([], None), channel="api", input="What about my salary?",
+            thread_id=thread_id or None,
+        )
+        await session.gate()
+        await session.finish("Ask HR.")
+        from unittest.mock import patch
+
+        with patch("django_ai_sdk.oversight.record._enqueue_reflect"):
+            await session.close()
+        [item] = await OversightService.list_reviews(user=staff, queue="hr")
+        closed = await OversightService.resolve_review(
+            item.id, VerdictIn(agree=True, note="Jan asked twice"), user=staff
+        )
+        assert closed.resolution["note"] == "Jan asked twice"
+        return await ReviewItem.objects.select_related("turn__evidence").aget(id=item.id)
+
+    async def _notes(self, item: ReviewItem) -> dict:
+        from django_ai_sdk.oversight.tasks import load_evidence
+
+        turn = await Turn.objects.select_related("evidence__key").aget(id=item.turn_id)
+        return ((await sync_to_async(load_evidence)(turn)) or {}).get("notes") or {}
+
+    async def test_a_note_is_kept_with_the_evidence_not_on_the_item(self):
+        item = await self._noted("t-notes")
+        assert item.resolution == {"by": item.resolution["by"], "value": True, "agree": True}
+        assert await self._notes(item) == {str(item.id): "Jan asked twice"}
+
+    async def test_forgetting_a_thread_takes_its_notes(self):
+        from django_ai_sdk.oversight.tasks import shred_scope
+
+        item = await self._noted("t-notes")
+        await sync_to_async(shred_scope)("thread:t-notes")
+        assert await self._notes(item) == {}
+        await item.arefresh_from_db()
+        assert item.resolution["agree"] is True and "note" not in item.resolution
+        assert (await sync_to_async(ledger.verify)()).ok
+
+    async def test_expired_content_takes_its_notes(self):
+        from django_ai_sdk.oversight.tasks import prune
+
+        item = await self._noted()
+        # Content is kept 90 days, metadata 730: in between, only the content goes.
+        await sync_to_async(prune)(now=timezone.now() + timedelta(days=100))
+        assert await self._notes(item) == {}
+        staff = await UserFactory.acreate(staff=True)
+        detail = await OversightService.get_turn(str(item.turn_id), user=staff)
+        assert "note" not in detail.reviews[0].resolution
+
+
+@pytest.mark.django_db(transaction=True)
+class TestCheckpointCheck:
+    async def test_verify_says_when_the_latest_checkpoint_no_longer_matches(self):
+        from django_ai_sdk.oversight.models import Checkpoint
+
+        staff = await UserFactory.acreate(staff=True)
+        root = await UserFactory.acreate(superuser=True, staff=True)
+        await a_turn()
+        await OversightService.seal_now(user=root)
+        await Checkpoint.objects.all().aupdate(root_hash="0" * 64)
+        result = await OversightService.verify(user=staff)
+        assert (result.ok, result.checkpoint_ok) == (True, False)

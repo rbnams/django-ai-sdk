@@ -193,7 +193,7 @@ class StreamWriter:
         return "".join(self._content_chunks)
 
     def replace_text(self, text: str) -> None:
-        """Store `text` instead of what streamed: a redacted or withheld answer."""
+        """Store `text` instead of what streamed: a masked or withheld answer."""
         self._content_chunks = [text]
 
     def drop_reasoning(self) -> None:

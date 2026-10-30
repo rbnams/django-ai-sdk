@@ -1,8 +1,7 @@
 """The safety pack: harm in what is asked and what is said, and people at risk.
 
-Jev answers all three lenses. Where it is unsure, OpenAI's moderation endpoint
-(the `moderation` alias) is asked about the question, and the `judge` model about
-the answer, which review has time for. A message suggesting someone is at risk is
+The classifier answers all three lenses. Where it is unsure, the `judge` model is
+asked about the answer, which finish has time for. A message suggesting someone is at risk is
 never blocked: it goes to a person, first in line.
 """
 
@@ -24,7 +23,7 @@ class SelfHarm(Flag):
     no = "Mentions death or harm figuratively, about others, or as a topic."
     subject = Subject.INPUT
     stages = (Stage.GATE,)
-    answerers = ["jev?", "moderation?"]
+    answerers = ["classifier?"]
 
 
 class HarmfulInput(Score):
@@ -34,7 +33,7 @@ class HarmfulInput(Score):
     low, high = "harmless", "clearly harmful"
     subject = Subject.INPUT
     stages = (Stage.GATE,)
-    answerers = ["jev?", "moderation?"]
+    answerers = ["classifier?"]
 
 
 class HarmfulOutput(Score):
@@ -43,8 +42,8 @@ class HarmfulOutput(Score):
     question = "How harmful is the answer's content (violence, hate, sexual, illegal)?"
     low, high = "harmless", "clearly harmful"
     subject = Subject.OUTPUT
-    stages = (Stage.REVIEW,)
-    answerers = ["jev?", "judge?"]
+    stages = (Stage.FINISH,)
+    answerers = ["classifier?", "judge?"]
 
 
 @register

@@ -7,18 +7,22 @@
         mode=Mode.ENFORCE,
     )
 
-A rule starts in shadow mode: it records what it would have done, on every turn,
+A rule starts in report mode: it records what it would have done, on every turn,
 so its false-positive rate is known before it can block anyone.
 """
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.core.exceptions import ImproperlyConfigured
+from django.utils.translation import gettext_lazy as _
 
 from django_ai_sdk.oversight.conditions import Condition, from_dict
 from django_ai_sdk.oversight.types import Mode, Outcome, Severity, Stage
+
+if TYPE_CHECKING:
+    from django.utils.functional import Promise
 
 
 class Action:
@@ -39,16 +43,7 @@ class Action:
         return f"<{type(self).__name__} {self.params()}>"
 
 
-class Allow(Action):
-    """Record the match and nothing else: an explicit "this is fine"."""
-
-    kind = "allow"
-    outcome = Outcome.ALLOWED
-
-
 def _severity(value: str) -> str:
-    # "error" was a severity once; "high" means the same.
-    value = "high" if value == "error" else value
     try:
         return str(Severity(value))
     except ValueError:
@@ -70,27 +65,25 @@ class Alert(Action):
         return {"severity": self.severity}
 
 
-class Redact(Action):
+class Mask(Action):
     """Mask what `lenses` (default: every lens the rule reads) pointed at.
 
-    At the gate the question is masked before the model or the thread sees it; in
-    review the stored answer is masked, and the client told to replace its copy
+    At the gate the question is masked before the model or the thread sees it; at
+    finish the stored answer is masked, and the client told to replace its copy
     when the stream ends; in reflect the stored message is masked after the fact.
     While the answer streams nothing is masked: a rule that holds there is judged
-    again in review, on the whole answer.
+    again at finish, on the whole answer.
     """
 
-    kind = "redact"
-    outcome = Outcome.REDACTED
-    effective = (Stage.GATE, Stage.REVIEW, Stage.REFLECT)
+    kind = "mask"
+    outcome = Outcome.MASKED
+    effective = (Stage.GATE, Stage.FINISH, Stage.REFLECT)
 
     def __init__(self, lenses: list[str] | None = None, template: str = "[{label}]") -> None:
         try:
             template.format(label="X")
         except (KeyError, IndexError, ValueError) as exc:
-            raise ValueError(
-                f"Redact template {template!r} must only use {{label}}: {exc}"
-            ) from exc
+            raise ValueError(f"Mask template {template!r} must only use {{label}}: {exc}") from exc
         self.lenses = list(lenses or [])
         self.template = template
 
@@ -117,15 +110,16 @@ class Block(Action):
 
     kind = "block"
     outcome = Outcome.BLOCKED
-    effective = (Stage.GATE, Stage.WATCH, Stage.REVIEW)
+    effective = (Stage.GATE, Stage.WATCH, Stage.FINISH)
 
-    DEFAULT_MESSAGE = "This request can't be answered here."
+    # Translated when shown, like a lazy `message`: str() it where it is stored or sent.
+    DEFAULT_MESSAGE = _("This request can't be answered here.")
 
-    def __init__(self, message: str = "") -> None:
+    def __init__(self, message: str | Promise = "") -> None:
         self.message = message or self.DEFAULT_MESSAGE
 
     def params(self) -> dict[str, Any]:
-        return {"message": self.message}
+        return {"message": str(self.message)}
 
 
 class Queue(Action):
@@ -140,20 +134,6 @@ class Queue(Action):
 
     def params(self) -> dict[str, Any]:
         return {"queue": self.queue, "priority": self.priority}
-
-
-class Escalate(Action):
-    """Re-judge `lens` with `answerer` in the background once this rule holds."""
-
-    kind = "escalate"
-    outcome = Outcome.FLAGGED
-
-    def __init__(self, lens: str, answerer: str = "strong") -> None:
-        self.lens = lens
-        self.answerer = answerer
-
-    def params(self) -> dict[str, Any]:
-        return {"lens": self.lens, "answerer": self.answerer}
 
 
 class Notify(Action):
@@ -171,11 +151,11 @@ class Notify(Action):
 
 
 ACTIONS: dict[str, type[Action]] = {
-    cls.kind: cls for cls in (Allow, Alert, Redact, RestrictTools, Block, Queue, Escalate, Notify)
+    cls.kind: cls for cls in (Alert, Mask, RestrictTools, Block, Queue, Notify)
 }
 
 # Enforced in this order; a block makes everything after it moot.
-PRECEDENCE = ["block", "restrict_tools", "redact", "escalate", "queue", "notify", "alert", "allow"]
+PRECEDENCE = ["block", "restrict_tools", "mask", "queue", "notify", "alert"]
 
 
 def action_from_dict(node: dict[str, Any]) -> Action:
@@ -187,7 +167,7 @@ def action_from_dict(node: dict[str, Any]) -> Action:
 
 
 class Rule:
-    """When `when` holds, do `then`. Shadow until someone decides otherwise."""
+    """When `when` holds, do `then`. Report only until someone decides otherwise."""
 
     def __init__(
         self,
@@ -195,7 +175,7 @@ class Rule:
         *,
         when: Condition | dict[str, Any],
         then: Action | list[Action],
-        mode: Mode | str = Mode.SHADOW,
+        mode: Mode | str = Mode.REPORT,
         stages: list[Stage | str] | None = None,
         message: str = "",
         description: str = "",
@@ -233,7 +213,7 @@ class Rule:
             node["name"],
             when=from_dict(node["when"]),
             then=[action_from_dict(a) for a in node.get("then") or []],
-            mode=node.get("mode", Mode.SHADOW),
+            mode=node.get("mode", Mode.REPORT),
             stages=node.get("stages") or None,
             message=node.get("message", ""),
             description=node.get("description", ""),
@@ -248,12 +228,10 @@ __all__ = [
     "PRECEDENCE",
     "Action",
     "Alert",
-    "Allow",
     "Block",
-    "Escalate",
+    "Mask",
     "Notify",
     "Queue",
-    "Redact",
     "RestrictTools",
     "Rule",
     "action_from_dict",

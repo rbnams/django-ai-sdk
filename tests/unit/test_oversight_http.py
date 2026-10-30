@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 from django.test import AsyncClient, override_settings
 from django.urls import path
-from django_ai_sdk.oversight.models import AccessRecord, Turn
+from django_ai_sdk.oversight.models import AccessRecord, PolicyOverride, Turn
 from django_ai_sdk.oversight.policy import invalidate
 from django_ai_sdk.oversight.session import agent_key
 from tests.factories.db import UserFactory
@@ -72,7 +72,10 @@ class TestReads:
         assert (await member.get("/api/oversight/policies/")).status_code == 403
 
     async def test_the_export_is_ndjson_and_recorded(self):
-        await a_turn()
+        with override_settings(AI_SDK_OVERSIGHT={"CAPTURE": "full"}):
+            invalidate()
+            await a_turn()
+        invalidate()
         root = await browser(staff=True, superuser=True)
         response = await root.get("/api/oversight/export/?purpose=review&days=7")
         assert response.status_code == 200
@@ -125,10 +128,11 @@ class TestConsoleWrites:
         assert tried.json()["value"] is True
         assert await Turn.objects.acount() == 0  # dry runs store nothing
 
-        assert (await post(root, "policies/fruit/delete/", {"note": "done"})).status_code == 204
-        assert (await post(root, "policies/fruit/delete/")).status_code == 404
+        assert (await root.delete("/api/oversight/policies/fruit/?note=done")).status_code == 204
+        assert (await root.delete("/api/oversight/policies/fruit/")).status_code == 404
         # A policy in code is removed in code.
-        assert (await post(root, "policies/test-guard/delete/")).status_code == 400
+        assert (await root.delete("/api/oversight/policies/test-guard/")).status_code == 400
+        assert await PolicyOverride.objects.filter(note="done").aexists()
 
     async def test_assigning_an_agent(self):
         agent = make_agent([], None)
@@ -162,3 +166,45 @@ class TestConsoleWrites:
         staff = await browser(staff=True)
         assert (await post(staff, "answerers/fruit_finder/", config)).status_code == 403
         assert (await post(staff, "answerers/fruit_finder/", {"reset": True})).status_code == 403
+
+
+# A body each write accepts, so a refusal is the permission's and not the input's.
+BODIES = {
+    "reveal_oversight_actor": {"reason": "because of reasons"},
+    "add_oversight_verdict": {"lens": "topic", "value": "hr"},
+    "set_oversight_override": {"target_kind": "rule", "field": "mode"},
+    "create_oversight_policy": {"name": "fruit"},
+    "simulate_oversight_policy": {"input": "hi"},
+    "try_oversight_answerer": {"config": "judge"},
+    "forget_oversight_thread": {"reason": "because of reasons"},
+}
+
+
+@pytest.mark.django_db(transaction=True)
+class TestShape:
+    async def test_every_route_checks_a_permission(self):
+        from django_ai_sdk.contrib.ninja.oversight import routes
+
+        member = await browser()
+        for method, route, func, _ in routes._ops:
+            url = "/api" + route.replace("{", "").replace("}", "")
+            body = json.dumps(BODIES.get(func.__name__, {}))
+            response = await member.generic(method, url, body, content_type="application/json")
+            assert response.status_code == 403, (func.__name__, response.content)
+
+    async def test_policy_responses_are_typed(self):
+        staff = await browser(staff=True)
+        policy = (await staff.get("/api/oversight/policies/test-guard/")).json()
+        assert {"lenses", "rules", "sources", "rejected", "parent_labels", "aliases",
+                "agents", "stream_mode", "retention"} <= set(policy)
+        assert policy["lenses"][0]["sources"]
+        listed = (await staff.get("/api/oversight/policies/")).json()
+        assert "agent_refs" in listed[0]
+
+    async def test_a_closed_review_is_a_conflict(self):
+        await a_turn()
+        staff = await browser(staff=True)
+        [item] = (await staff.get("/api/oversight/reviews/?queue=hr")).json()
+        assert (await post(staff, f"reviews/{item['id']}/", {"agree": True})).status_code == 200
+        again = await post(staff, f"reviews/{item['id']}/", {"agree": False})
+        assert (again.status_code, again.json()["code"]) == (409, "conflict")

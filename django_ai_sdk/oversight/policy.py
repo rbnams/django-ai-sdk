@@ -30,6 +30,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django_ai_sdk.logger import get_logger
 from django_ai_sdk.oversight.conditions import from_dict, same_shape
 from django_ai_sdk.oversight.lenses import Lens, lens_from_config
+from django_ai_sdk.oversight.registry import check_rule, get_policy_class
 from django_ai_sdk.oversight.rules import Rule, action_from_dict
 from django_ai_sdk.oversight.types import Capture, Mode, Stage, Subject
 
@@ -38,13 +39,15 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-CAPTURE_ORDER = [Capture.NONE, Capture.METADATA, Capture.REDACTED, Capture.FULL]
+CAPTURE_ORDER = [Capture.NONE, Capture.METADATA, Capture.MASKED, Capture.FULL]
 
 # What the overlay may change, per target.
-LENS_FIELDS = {"enabled", "sample", "answerers", "confident", "stages"}
+LENS_FIELDS = {"enabled", "sample", "answerers", "min_confidence", "stages"}
 RULE_FIELDS = {"mode", "when", "then", "message", "stages"}
 POLICY_FIELDS = {"capture", "stream_mode", "retention"}
 RETENTION_KEYS = ("content", "metadata")
+# "live" streams the answer as it is written; "hold" sends it once finish passed it.
+STREAM_MODES = ("live", "hold")
 
 # The overlay scope for what is not one policy's: answerer aliases, agent choices.
 GLOBAL = "*"
@@ -63,6 +66,7 @@ class Policy:
     rules: list[Rule] = []  # noqa: RUF012
     # None inherits; the deployment's CAPTURE is a ceiling either way.
     capture: Capture | None = None
+    # "live" or "hold"; None inherits.
     stream_mode: str | None = None
     # Days to keep this policy's turns: {"content": 90, "metadata": 730}, either
     # key alone. Unset keys come from AI_SDK_OVERSIGHT["RETENTION"].
@@ -86,7 +90,7 @@ def pick[T: (Lens | type[Lens], Rule)](
     Start small: take what you need from the packs instead of extending them whole::
 
         lenses = pick(SecurityPack.lenses, "prompt_injection", "pii_input")
-        rules = pick(SecurityPack.rules, "block_injection", "redact_pii_in_question")
+        rules = pick(SecurityPack.rules, "block_injection", "mask_pii_in_question")
 
     Rules come back as copies, so `mode` changes the copy and the pack keeps its own.
     """
@@ -249,7 +253,7 @@ def _from_definition(
         label=str(definition.get("label") or name),
         description=str(definition.get("description") or ""),
         capture=Capture(setting("CAPTURE")),
-        stream_mode=str(setting("STREAM_MODE")),
+        stream_mode=_default_stream_mode(),
         retention=_retention(setting("RETENTION")),
         origin="db",
         extends=[str(p) for p in definition.get("extends") or []],
@@ -278,8 +282,13 @@ def _inherit(resolved: ResolvedPolicy, parent: ResolvedPolicy, parent_name: str)
         elif not value.startswith(("pack:", "db:")) and value != "settings":
             value = f"pack:{parent_name}"
         resolved.sources[key] = value
-    if parent.capture is not None and parent.sources.get("policy.capture"):
+    # What a parent set itself carries over; what it took from settings already matches.
+    if parent.sources.get("policy.capture"):
         resolved.capture = parent.capture
+    if parent.sources.get("policy.stream_mode"):
+        resolved.stream_mode = parent.stream_mode
+    if parent.sources.get("policy.retention"):
+        resolved.retention = {**resolved.retention, **parent.retention}
 
 
 def _from_code(
@@ -299,7 +308,7 @@ def _from_code(
         label=policy.label,
         description=policy.description,
         capture=Capture(setting("CAPTURE")),
-        stream_mode=str(setting("STREAM_MODE")),
+        stream_mode=_default_stream_mode(),
         retention=_retention(setting("RETENTION")),
         origin=cls.origin,
         extends=list(policy.extends),
@@ -317,11 +326,20 @@ def _from_code(
     for rule in policy.get_rules():
         resolved.rules[rule.name] = copy.copy(rule)
         _mark_definition(resolved, "rule", rule.name, origin)
+    for rule in resolved.rules.values():
+        # Against inherited lenses too, which registering could not see.
+        try:
+            check_rule(rule, resolved.lenses)
+        except ImproperlyConfigured as exc:
+            raise ImproperlyConfigured(f"Policy {name!r}: {exc}") from None
     if policy.capture is not None:
         resolved.capture = Capture(policy.capture)
         resolved.sources["policy.capture"] = origin
     if policy.stream_mode is not None:
-        resolved.stream_mode = policy.stream_mode
+        try:
+            resolved.stream_mode = _stream_mode(policy.stream_mode)
+        except ValueError as exc:
+            raise ImproperlyConfigured(f"Policy {name!r}: {exc}") from None
         resolved.sources["policy.stream_mode"] = origin
     if policy.retention:
         resolved.retention = {**resolved.retention, **_retention(policy.retention)}
@@ -347,6 +365,22 @@ def _retention(value: Any) -> dict[str, int]:
     if any(d < 1 for d in days.values()):
         raise ValueError("retention keeps data for at least a day")
     return days
+
+
+def _stream_mode(value: Any) -> str:
+    """`value`, checked: a typo such as "held" must not quietly stream live."""
+    if value not in STREAM_MODES:
+        raise ValueError(f"stream_mode {value!r} is not one of {list(STREAM_MODES)}")
+    return str(value)
+
+
+def _default_stream_mode() -> str:
+    from django_ai_sdk.oversight.conf import setting
+
+    try:
+        return _stream_mode(setting("STREAM_MODE"))
+    except ValueError as exc:
+        raise ImproperlyConfigured(f'AI_SDK_OVERSIGHT["STREAM_MODE"]: {exc}') from None
 
 
 def _entries_from_settings(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -399,12 +433,6 @@ def console_entry(entry: dict[str, Any]) -> dict[str, Any]:
         if "answerers" in value:
             specs = value["answerers"] or []
             value = {**value, "answerers": [console_config(a, kinds=INLINE_KINDS) for a in specs]}
-    elif kind == "rule" and key in {"definition", "then"}:
-        actions = (value.get("then") if isinstance(value, dict) else value) or []
-        for action in actions:
-            if isinstance(action, dict) and "answerer" in action:
-                # An escalation names an alias, never a configuration.
-                console_config(action["answerer"], kinds=[])
     return {**entry, "value": value}
 
 
@@ -450,7 +478,7 @@ def _apply_policy(resolved: ResolvedPolicy, target: str, key: str, value: Any, s
     if key == "capture":
         resolved.capture = Capture(value)
     elif key == "stream_mode":
-        resolved.stream_mode = value
+        resolved.stream_mode = _stream_mode(value)
     elif key == "retention":
         resolved.retention = {**resolved.retention, **_retention(value)}
     else:
@@ -461,6 +489,7 @@ def _apply_policy(resolved: ResolvedPolicy, target: str, key: str, value: Any, s
 def _apply_lens(resolved: ResolvedPolicy, target: str, key: str, value: Any, source: str) -> None:
     if key == "definition":
         # A lens declared outside code: settings or the console.
+        _check_replaces(resolved, "lens", target, source)
         resolved.lenses[target] = lens_from_config({**value, "name": target})
         _mark_definition(resolved, "lens", target, source)
         return
@@ -472,7 +501,7 @@ def _apply_lens(resolved: ResolvedPolicy, target: str, key: str, value: Any, sou
     lens = copy.copy(lens)
     if key == "stages":
         value = tuple(Stage(s) for s in value)
-    elif key in {"sample", "confident"}:
+    elif key in {"sample", "min_confidence"}:
         value = float(value)
         if not 0 <= value <= 1:
             raise ValueError(f"{key} must be between 0 and 1")
@@ -494,10 +523,12 @@ def _apply_lens(resolved: ResolvedPolicy, target: str, key: str, value: Any, sou
 
 def _apply_rule(resolved: ResolvedPolicy, target: str, key: str, value: Any, source: str) -> None:
     if key == "definition":
+        _check_replaces(resolved, "rule", target, source)
         rule = Rule.from_dict({**value, "name": target})
         unknown = rule.lenses() - set(resolved.lenses)
         if unknown:
             raise ValueError(f"rule reads unknown lenses {sorted(unknown)}")
+        check_rule(rule, resolved.lenses)
         resolved.rules[target] = rule
         _mark_definition(resolved, "rule", target, source)
         return
@@ -511,7 +542,11 @@ def _apply_rule(resolved: ResolvedPolicy, target: str, key: str, value: Any, sou
         code_defined = resolved.sources.get(f"rule:{target}.origin", "code") != "db"
         if code_defined and not same_shape(rule.when.to_dict(), value):
             raise ValueError("the overlay may change a code rule's thresholds, not its test")
-        rule.when = from_dict(value)
+        when = from_dict(value)
+        unknown = when.lenses() - set(resolved.lenses)
+        if unknown:
+            raise ValueError(f"rule reads unknown lenses {sorted(unknown)}")
+        rule.when = when
     elif key == "then":
         rule.then = [action_from_dict(a) for a in value]
     elif key == "stages":
@@ -520,17 +555,35 @@ def _apply_rule(resolved: ResolvedPolicy, target: str, key: str, value: Any, sou
         rule.message = str(value)
     else:
         raise ValueError(f"{key!r} is not a rule setting the overlay may change")
+    check_rule(rule, resolved.lenses)
     resolved.rules[target] = rule
     resolved.sources[f"rule:{target}.{key}"] = source
+
+
+def _check_replaces(resolved: ResolvedPolicy, kind: str, target: str, source: str) -> None:
+    """A definition may replace one from its own layer only: what code or a pack
+    declares changes with a deploy, and the overlay tunes it instead."""
+    existing = resolved.sources.get(f"{kind}:{target}.origin")
+    if existing is not None and existing.split(":", 1)[0] != source:
+        raise ValueError(
+            f"{kind} {target!r} is already declared ({existing}): tune it, "
+            "or give the new one another name"
+        )
 
 
 # name -> (resolved at, ResolvedPolicy or None when it did not load, its ancestors)
 _cache: dict[str, tuple[float, ResolvedPolicy | None, frozenset[str]]] = {}
 # name -> why it did not load
 _broken: dict[str, str] = {}
+# name -> the last resolution built with its overlay. `invalidate` keeps it: it is
+# what a turn runs when the overlay cannot be read, so one failed read never drops
+# what an operator enforced.
+_last_good: dict[str, ResolvedPolicy] = {}
 
 # (loaded at, {"answerers": {alias: config}, "agents": {agent id: policy or ""}})
 _console: tuple[float, dict[str, dict[str, Any]]] | None = None
+# The last console entries read; `invalidate` keeps them, for the same reason.
+_console_last_good: dict[str, dict[str, Any]] | None = None
 
 
 async def aconsole(*, uncached: bool = False) -> dict[str, dict[str, Any]]:
@@ -543,7 +596,7 @@ async def aconsole(*, uncached: bool = False) -> dict[str, dict[str, Any]]:
     from django_ai_sdk.oversight.answerers.base import set_console_aliases
     from django_ai_sdk.oversight.conf import setting
 
-    global _console
+    global _console, _console_last_good
     ttl = float(setting("POLICY_CACHE_SECONDS"))
     if not uncached and _console and time.monotonic() - _console[0] < ttl:
         return _console[1]
@@ -551,9 +604,12 @@ async def aconsole(*, uncached: bool = False) -> dict[str, dict[str, Any]]:
     try:
         entries = (await _aload_rows([GLOBAL]))[GLOBAL]
     except Exception:
-        # Like a broken policy, an unreadable console must never take chat down.
+        # An unreadable console must never take chat down, nor forget which agent has
+        # which policy: keep the last good read, uncached, so the next turn tries again.
         logger.opt(exception=True).warning("Oversight console entries could not be loaded")
-        return loaded
+        if _console:
+            return _console[1]
+        return _console_last_good if _console_last_good is not None else loaded
     for entry in entries:
         if entry["target_kind"] == "answerer" and entry["field"] == "definition":
             try:
@@ -567,6 +623,7 @@ async def aconsole(*, uncached: bool = False) -> dict[str, dict[str, Any]]:
     set_console_aliases(loaded["answerers"])
     if not uncached:
         _console = (time.monotonic(), loaded)
+        _console_last_good = loaded
     return loaded
 
 
@@ -580,32 +637,70 @@ async def aassigned_policy(agent_id: str) -> str | None:
 async def aget_policy(name: str, *, uncached: bool = False) -> ResolvedPolicy | None:
     """The effective policy, overlay included, cached for POLICY_CACHE_SECONDS.
 
-    None for an unknown or broken policy: a typo must never take chat down. Why it
-    broke is logged once per cache period and kept for the console (`broken`).
-    `uncached` builds it from the database without reading or filling the cache,
-    for console pages, so looking at a policy never flushes what turns use.
+    None for an unknown or broken policy: why it broke is logged once per cache
+    period and kept for the console (`broken`); the caller decides what a turn does
+    then (`TurnSession.start` follows FAIL_MODE["gate"]). When the overlay cannot
+    be read, turns run the last good resolution (kept across `invalidate`), else
+    the policy as code declares it, else None; none of it is cached, so the next
+    turn reads again. `uncached` builds it from the database without reading or
+    filling the cache, for console pages, so looking at a policy never flushes what
+    turns use; there an unreadable overlay is reported, not papered over.
     """
     from django_ai_sdk.oversight.conf import setting
+    from django_ai_sdk.oversight.registry import get_policy_class
 
     ttl = float(setting("POLICY_CACHE_SECONDS"))
     await aconsole(uncached=uncached)
     cached = None if uncached else _cache.get(name)
     if cached and time.monotonic() - cached[0] < ttl:
         return cached[1]
-    resolved: ResolvedPolicy | None
-    lineage: frozenset[str] = frozenset()
     try:
         own, ancestors = await load_overlay(name)
-        lineage = frozenset(ancestors)
-        resolved = build(name, overlay=own, ancestors=ancestors)
+    except Exception:
+        logger.opt(exception=True).warning("Oversight overlay for {!r} could not be read", name)
+        if uncached:
+            # Shown in the console; the database's own words stay in the log.
+            _broken[name] = "its console changes could not be read"
+            return None
+        if cached and cached[1] is not None:
+            return cached[1]
+        if name in _last_good:
+            return _last_good[name]
+        if get_policy_class(name) is None:
+            logger.error(
+                "Oversight policy {!r} cannot be loaded: its definition could not be read", name
+            )
+            return None
+        return _build(name)
+    resolved = _build(name, overlay=own, ancestors=ancestors)
+    if not uncached:
+        # A policy that does not build stays broken until code or the overlay changes,
+        # so that is cached too: it logs once per period, not once per turn.
+        _cache[name] = (time.monotonic(), resolved, frozenset(ancestors))
+        if resolved is not None:
+            _last_good[name] = resolved
+    return resolved
+
+
+def _build(name: str, **kwargs: Any) -> ResolvedPolicy | None:
+    """build(), or None with why kept for the console."""
+    try:
+        resolved = build(name, **kwargs)
     except Exception as exc:
+        if (
+            isinstance(exc, LookupError)
+            and not kwargs.get("overlay")
+            and get_policy_class(name) is None
+        ):
+            # No such policy (deleted, or a name nothing registers): the caller says 404.
+            # A missing parent is different: that policy exists and is broken.
+            logger.info("Oversight policy {!r} is unknown", name)
+            _broken[name] = str(exc) or type(exc).__name__
+            return None
         logger.exception("Oversight policy {!r} cannot be loaded: {}", name, exc)
         _broken[name] = str(exc) or type(exc).__name__
-        resolved = None
-    else:
-        _broken.pop(name, None)
-    if not uncached:
-        _cache[name] = (time.monotonic(), resolved, lineage)
+        return None
+    _broken.pop(name, None)
     return resolved
 
 
@@ -664,10 +759,18 @@ async def _aload_rows(names: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
     return rows
 
 
+def forget_last_good() -> None:
+    """Drop the last good resolutions too, which `invalidate` keeps — for tests."""
+    global _console_last_good
+    _last_good.clear()
+    _console_last_good = None
+
+
 def invalidate(name: str | None = None) -> None:
     """Forget cached resolutions, so the next turn reads the overlay again.
 
-    Forgetting a policy also forgets every policy that extends it.
+    Forgetting a policy also forgets every policy that extends it. The last good
+    resolutions stay: they stand in only while the overlay cannot be read.
     """
     global _console
     if name is None or name == GLOBAL:

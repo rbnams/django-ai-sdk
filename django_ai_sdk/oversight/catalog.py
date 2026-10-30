@@ -21,13 +21,13 @@ from django_ai_sdk.logger import get_logger
 from django_ai_sdk.oversight.answerers import pii
 from django_ai_sdk.oversight.examples import LENS_EXAMPLES, POLICY_EXAMPLES, RULE_EXAMPLES
 from django_ai_sdk.oversight.rules import ACTIONS
-from django_ai_sdk.oversight.types import Severity, Stage
+from django_ai_sdk.oversight.types import Severity
 
 logger = get_logger(__name__)
 
 # Parameter types the editor knows how to render.
 #   text, number, bool, choice (from `choices`), multi (several of `choices`),
-#   lines (one string per line), labelled_lines ({label: [lines]}), model, agent
+#   lines (one string per line), labelled_lines ({label: [lines]}), model
 P = dict[str, Any]
 
 
@@ -57,30 +57,15 @@ ALIAS_KINDS: list[dict[str, Any]] = [
     },
     {
         "class": "TypeSafe",
-        "label": "Jev",
-        "summary": "Answers most yes/no, label and score lenses, fast enough for the gate.",
+        "label": "TypeSafe",
+        "summary": "A hosted, paid classification service: answers yes/no, label and score "
+        "lenses, and rates each source for a lens about which sources an answer is taken "
+        "from. Needs django-ai-sdk[typesafe] and TYPESAFE_API_KEY.",
         "metered": False,
         "external": "TypeSafe",
         "params": [
-            _param("model", "model", "Jev version", "Empty uses TYPESAFE_MODEL.", kind="TypeSafe"),
+            _param("model", "model", "Model", "Empty uses TYPESAFE_MODEL.", kind="TypeSafe"),
         ],
-    },
-    {
-        "class": "Moderation",
-        "label": "OpenAI moderation",
-        "summary": "OpenAI's moderation endpoint. Only on OpenAI itself, not on a gateway.",
-        "metered": True,
-        "external": "OpenAI",
-        "params": [_param("model", "text", "Model", default="omni-moderation-latest")],
-    },
-    {
-        "class": "AgentJudge",
-        "label": "An agent",
-        "summary": "One of your agents answers, with its own prompt and model; its tools are "
-        "not run. Oversight is off inside its run.",
-        "metered": True,
-        "external": "model gateway",
-        "params": [_param("agent", "agent", "Agent", required=True)],
     },
     {
         "class": "Human",
@@ -119,17 +104,24 @@ INLINE_KINDS: list[dict[str, Any]] = [
     {
         "class": "PII",
         "label": "Personal data",
-        "summary": "Email, IBAN (mod-97), card numbers (Luhn), BSN (11-check), phone, IP, "
-        "postcode.",
+        "summary": "Email, IBAN (mod-97), card numbers (Luhn), international phone numbers, "
+        "IP addresses. Dutch BSN (11-check), phone numbers and postcodes when picked.",
         "fits": ["entities", "flag"],
         "params": [
-            _param("kinds", "multi", "Kinds", "None picked: all of them.", choices=PII_KINDS)
+            _param(
+                "kinds",
+                "multi",
+                "Kinds",
+                f"None picked: {', '.join(pii.DEFAULT_KINDS)}.",
+                choices=PII_KINDS,
+            )
         ],
     },
     {
         "class": "Secrets",
         "label": "Secrets",
-        "summary": "API keys (OpenAI, GitHub, AWS, Slack), JWTs, private keys, passwords.",
+        "summary": "API keys (sk-…, Stripe, Google, GitHub, AWS, Slack), JWTs, private keys, "
+        "passwords.",
         "fits": ["entities", "flag"],
         "params": [],
     },
@@ -191,7 +183,7 @@ LENS_KINDS = [
     {
         "kind": "entities",
         "label": "Which things",
-        "summary": "Which of your labels occur, and where, so a rule can redact them.",
+        "summary": "Which of your labels occur, and where, so a rule can mask them.",
     },
     {"kind": "text", "label": "Short text", "summary": "A summary or reason, for people to read."},
 ]
@@ -210,7 +202,6 @@ def _stage(value: str, label: str, runs: str, can: str) -> dict[str, str]:
 
 
 # The one wording of the stages: what a lens there looks at, and what a rule there can do.
-# Retro is left out: it replays turns on demand and is not a step of a live turn.
 STAGE_INFO = [
     _stage(
         "gate",
@@ -225,7 +216,7 @@ STAGE_INFO = [
         "Refuse the tool call or stop the answer.",
     ),
     _stage(
-        "review",
+        "finish",
         "Before the user sees it",
         "On the finished answer; the stream is fixed when it ends.",
         "Mask or replace the answer, or block it.",
@@ -270,7 +261,7 @@ OPS = [
     },
 ]
 
-ACTION_KINDS = [
+ACTION_KINDS: list[dict[str, Any]] = [
     {
         "kind": "block",
         "label": "Block",
@@ -278,8 +269,8 @@ ACTION_KINDS = [
         "params": [_param("message", "text", "Message shown", default="")],
     },
     {
-        "kind": "redact",
-        "label": "Redact",
+        "kind": "mask",
+        "label": "Mask",
         "summary": "Mask what the lenses found, as [IBAN].",
         "params": [_param("template", "text", "Mask", default="[{label}]")],
     },
@@ -296,15 +287,6 @@ ACTION_KINDS = [
         "params": [
             _param("queue", "text", "Queue", default="default"),
             _param("priority", "number", "Priority", default=0),
-        ],
-    },
-    {
-        "kind": "escalate",
-        "label": "Ask a stronger answerer",
-        "summary": "Re-judge a lens with another answerer in the background.",
-        "params": [
-            _param("lens", "lens", "Lens", required=True),
-            _param("answerer", "alias", "Answerer", default="strong"),
         ],
     },
     {
@@ -335,16 +317,10 @@ ACTION_KINDS = [
             )
         ],
     },
-    {
-        "kind": "allow",
-        "label": "Allow",
-        "summary": "Record that it is fine.",
-        "params": [],
-    },
 ]
-# Where each action can still change the turn; a replay never acts.
+# Where each action can still change the turn.
 for _action in ACTION_KINDS:
-    _action["stages"] = [str(s) for s in ACTIONS[_action["kind"]].effective if s is not Stage.RETRO]
+    _action["stages"] = [str(s) for s in ACTIONS[_action["kind"]].effective]
 
 
 def model_choices() -> list[dict[str, Any]]:

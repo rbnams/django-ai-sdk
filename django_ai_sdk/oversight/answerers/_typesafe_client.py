@@ -1,7 +1,8 @@
-"""Thin wrapper around TypeSafe's AsyncTypeSafeClient.
+"""Thin wrapper around TypeSafe's AsyncTypeSafeClient, for the TypeSafe answerer.
 
-Jev is not a chat model: it answers typed questions (Choice / Noul / Score)
-about a state. This module never pretends otherwise.
+TypeSafe is a hosted classification service, not a chat model: it answers typed
+questions (Choice / Noul / Score) about a state. This module never pretends otherwise,
+and never logs what a request sent or what came back.
 """
 
 from __future__ import annotations
@@ -11,13 +12,10 @@ import importlib.util
 import weakref
 from typing import TYPE_CHECKING, Any
 
-from django_ai_sdk.logger import get_logger
 from django_ai_sdk.utils import resolve_setting
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-logger = get_logger(__name__)
 
 
 def typesafe_api_key() -> str | None:
@@ -28,12 +26,12 @@ def typesafe_api_key() -> str | None:
     return str(value).strip()
 
 
-def typesafe_model() -> str:
-    """Pinned or alias model id; defaults to jev-latest."""
+def typesafe_model() -> str | None:
+    """TYPESAFE_MODEL, a pinned or alias model id; None leaves the choice to typesafe-sdk."""
     value = resolve_setting("TYPESAFE_MODEL")
     if value and str(value).strip():
         return str(value).strip()
-    return "jev-latest"
+    return None
 
 
 class TypeSafeUnavailable(RuntimeError):
@@ -75,7 +73,7 @@ async def request(
     timeout: float | None = None,
     retry: Any = None,
 ) -> dict[str, Any]:
-    """One System One request, as a JSON-safe summary.
+    """One TypeSafe request, as a JSON-safe summary.
 
     Raises TypeSafeUnavailable without a key or the package; the SDK's own errors
     pass through. `timeout` and `retry` (a RetryPolicy) override the client's.
@@ -94,31 +92,8 @@ async def request(
     return _summarize(response)
 
 
-async def evaluate(
-    state: Any,
-    questions: Mapping[str, Any],
-    *,
-    model: str | None = None,
-) -> dict[str, Any] | None:
-    """Run one System One request; return a JSON-safe summary or None on failure.
-
-    Fail-open: missing key, missing package, or API errors log and return None
-    so a chat turn is never blocked by screening.
-    """
-    if not questions:
-        return None
-    try:
-        return await request(state, questions, model=model)
-    except TypeSafeUnavailable as exc:
-        logger.warning("{}; skipping TypeSafe evaluate", exc)
-        return None
-    except Exception:
-        logger.exception("TypeSafe system_one failed; skipping screen")
-        return None
-
-
 def _summarize(response: Any) -> dict[str, Any]:
-    """Flatten a SystemOneResponse into a UI-friendly payload."""
+    """Flatten TypeSafe's response into a UI-friendly payload."""
     judgments: list[dict[str, Any]] = []
 
     for key, answer in getattr(response, "nouls", {}).items():
@@ -161,7 +136,7 @@ def _summarize(response: Any) -> dict[str, Any]:
         )
 
     return {
-        "model": getattr(response, "model", None) or typesafe_model(),
+        "model": getattr(response, "model", None) or typesafe_model() or "",
         "judgments": judgments,
     }
 

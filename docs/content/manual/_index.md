@@ -53,7 +53,6 @@ django_ai_sdk/
 ├── artifacts/            # ArtifactSchema
 ├── citations/            # CitationRegistry, formatter
 ├── suggestions/          # DefaultSuggestionGenerator
-├── typesafe/             # TypeSafe / Jev evaluate, screener protocol, tool control
 ├── tracing/              # opt-in Haystack spans persisted to the ORM
 └── management/commands/  # warmup_rag
 ```
@@ -98,7 +97,6 @@ django_ai_sdk/
   {{< card link="testing/" title="Testing" icon="check-circle" subtitle="Strategy, setup, structure, patterns" >}}
   {{< card link="test-tooling/" title="Test Tooling" icon="cog" subtitle="Fixtures, factories, and mocks" >}}
   {{< card link="tracing/" title="Tracing" icon="chart-square-bar" subtitle="Haystack spans in the ORM, token accounting" >}}
-  {{< card link="typesafe/" title="TypeSafe" icon="shield-check" subtitle="Jev evaluate, screener, tool control" >}}
   {{< card link="cli/" title="CLI" icon="terminal" subtitle="warmup_rag implementation" >}}
 {{< /cards >}}
 
@@ -110,5 +108,5 @@ django_ai_sdk/
   {{< card link="memories/" title="Memories" icon="folder" subtitle="MemoryService, documents, thread linking" >}}
   {{< card link="files/" title="Files" icon="document" subtitle="Processors, transforms, upload lifecycle" >}}
   {{< card link="workflows/" title="Workflows" icon="server" subtitle="Definition schema, models, executor" >}}
-  {{< card link="webhooks/" title="Webhooks" icon="globe-alt" subtitle="Inbound events, run_inbound, TypeSafe cards" >}}
+  {{< card link="webhooks/" title="Webhooks" icon="globe-alt" subtitle="Inbound events, run_inbound" >}}
 {{< /cards >}}

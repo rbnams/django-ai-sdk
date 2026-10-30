@@ -314,11 +314,16 @@ async def cite(answer: str, registry: SourceRegistry, agent: Agent | Run) -> lis
     logger.info("Citing a block with {} of {} sources", len(sources), len(registry))
     if not sources:
         return []
-    reply = await agent.run(
-        [ChatMessage(role="user", content=render(answer, sources))],
-        system_prompt=CITATION_PROMPT,
-        response_format=None,
-    )
+    from django_ai_sdk.agents.base import Agent  # noqa: PLC0415
+
+    asked = [ChatMessage(role="user", content=render(answer, sources))]
+    if isinstance(agent, Agent):
+        # A side task over an answer oversight judges in its own turn: not a turn of its own.
+        reply = await agent.run(
+            asked, system_prompt=CITATION_PROMPT, response_format=None, oversight=False
+        )
+    else:
+        reply = await agent.run(asked, system_prompt=CITATION_PROMPT, response_format=None)
     citations: list[Citation] = []
     outcomes: Counter[str] = Counter()  # per supporting passage
     cursor = 0
@@ -343,7 +348,7 @@ async def cite(answer: str, registry: SourceRegistry, agent: Agent | Run) -> lis
 
 
 def rebase(data: CitationsData, answer: str) -> CitationsData:
-    """`data` moved onto `answer`, the text as stored when review masked part of it.
+    """`data` moved onto `answer`, the text as stored when finish masked part of it.
 
     A citation whose quote is still at its place stays; one whose quote moved is
     found again; one whose quote is gone (it held a masked span) is dropped, and a

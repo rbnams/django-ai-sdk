@@ -1,7 +1,7 @@
 """Dry runs: what a policy would do with a message, without recording a turn.
 
 The console's test bench. A simulation runs a real TurnSession through gate,
-watch (the whole answer as one streamed piece) and review, then answers the
+watch (the whole answer as one streamed piece) and finish, then answers the
 reflect lenses on the spot (every one, whatever its sample rate), so the result
 is what a live turn would get. No turn is stored: the session is never closed,
 and a Human answerer only says where it would queue. Model calls are charged to
@@ -29,6 +29,7 @@ from django_ai_sdk.oversight.types import Answer, Stage, Subject, TurnView, wors
 
 if TYPE_CHECKING:
     from django.contrib.auth.base_user import AbstractBaseUser
+    from django.contrib.auth.models import AnonymousUser
 
     from django_ai_sdk.oversight.lenses import Lens
     from django_ai_sdk.oversight.policy import ResolvedPolicy
@@ -84,7 +85,7 @@ def _matched(match: Matched) -> dict[str, Any]:
         "mode": str(match.rule.mode),
         "actions": [action.to_dict() for action in match.rule.then],
         "acted": [action.to_dict() for action in match.acted],
-        "would": str(match.outcome(shadow=True)),
+        "would": str(match.outcome(report=True)),
         "outcome": str(match.outcome()) if match.acted else "allowed",
         "condition": match.rule.when.to_dict(),
     }
@@ -96,7 +97,7 @@ async def simulate(
     input: str,
     output: str = "",
     tool_call: dict[str, Any] | None = None,
-    user: AbstractBaseUser | None = None,
+    user: AbstractBaseUser | AnonymousUser | None = None,
 ) -> dict[str, Any] | None:
     """Run `policy` over one exchange as a turn would, and record nothing. None: no policy.
 
@@ -152,7 +153,7 @@ async def _run(
         0,
         blocked=gate.blocked,
         message=gate.message,
-        redacted=gate.redacted,
+        masked=gate.masked,
         text=gate.input,
         restrict=gate.restrict,
     )
@@ -191,18 +192,18 @@ async def _run(
 
     if not ended_at and output:
         observed, matched = len(session.observed), len(session.matched)
-        review = await session.review(output)
+        finished = await session.finish(output)
         stage_out(
-            Stage.REVIEW,
+            Stage.FINISH,
             observed,
             matched,
-            blocked=review.blocked,
-            message=review.message,
-            redacted=review.replaced and not review.blocked,
-            text=review.output,
+            blocked=finished.blocked,
+            message=finished.message,
+            masked=finished.replaced and not finished.blocked,
+            text=finished.output,
         )
-        if review.blocked:
-            ended_at = "review"
+        if finished.blocked:
+            ended_at = "finish"
 
     if not gate.blocked:
         observed, matched = len(session.observed), len(session.matched)
@@ -215,8 +216,8 @@ async def _run(
         "stages": stages,
         "ended_at": ended_at,
         "outcome": str(worst(*(m.outcome() for m in acted))) if acted else "allowed",
-        "shadow_outcome": (
-            str(worst(*(m.outcome(shadow=True) for m in session.matched)))
+        "report_outcome": (
+            str(worst(*(m.outcome(report=True) for m in session.matched)))
             if session.matched
             else "allowed"
         ),
@@ -229,7 +230,7 @@ async def _reflect(session: Any, resolved: Any) -> None:
     late = {
         o.lens.name
         for o in session.observed
-        if o.stage in {Stage.GATE, Stage.WATCH, Stage.REVIEW}
+        if o.stage in {Stage.GATE, Stage.WATCH, Stage.FINISH}
         and (
             o.answer.error == "timeout"
             or asks_again(o.answer.error, o.answer.trail[-1].error if o.answer.trail else "")
@@ -269,7 +270,7 @@ async def try_lens(lens: Lens, *, input: str, output: str = "") -> dict[str, Any
     from django_ai_sdk.oversight.stages import answer_lens
 
     view = TurnView(turn_id="console", channel="console", input=input, output=output)
-    stage = lens.stages[0] if lens.stages else Stage.REVIEW
+    stage = lens.stages[0] if lens.stages else Stage.FINISH
     if not lens.applies(view):
         answer = Answer(error="needs sources or tool results", confidence=0.0)
     elif (answer := await answer_lens(lens, view, stage, sample=False)) is None:
@@ -277,54 +278,4 @@ async def try_lens(lens: Lens, *, input: str, output: str = "") -> dict[str, Any
     return {"lens": lens.name, "kind": lens.kind, "stage": str(stage), **answer_out(answer)}
 
 
-async def replay(agent: Any, cases: list[dict[str, Any]], *, policy: str = "") -> dict[str, Any]:
-    """Replay questions through an agent as it is now, and judge the new answers.
-
-    `agent` is an agent, or its id, name or class name; each case is
-    {"input": ..., "expected": {lens: value}}. Per lens, how often the new answer
-    still gets the expected verdict. Raises ValueError when no policy applies.
-    """
-    import hashlib
-
-    from django_ai_sdk.common import ChatMessage
-    from django_ai_sdk.oversight.answerers.llm import AgentJudge
-    from django_ai_sdk.oversight.metrics import band
-    from django_ai_sdk.oversight.policy import aget_policy
-    from django_ai_sdk.oversight.session import code_policy, unobserved
-
-    if isinstance(agent, str):
-        agent = AgentJudge(agent).resolve_agent()
-    resolved = await aget_policy(policy or code_policy(agent)[0])
-    if resolved is None:
-        raise ValueError("The agent has no oversight policy; pass a policy.")
-    lenses: dict[str, Any] = {}
-    failed = 0
-    for case in cases:
-        try:
-            with unobserved():
-                output = await agent.run(
-                    [ChatMessage(role="user", content=case["input"])], tools=True
-                )
-        except Exception:
-            failed += 1
-            continue
-        digest = hashlib.sha256(case["input"].encode()).hexdigest()[:16]
-        view = TurnView(turn_id=f"replay:{digest}", input=case["input"], output=str(output or ""))
-        expected = case.get("expected") or {}
-        judged = [
-            lens
-            for name, lens in resolved.lenses.items()
-            if name in expected and (Stage.REVIEW in lens.stages or Stage.REFLECT in lens.stages)
-        ]
-        with unobserved():
-            observed = await run_lenses(judged, view, Stage.RETRO, sample=False)
-        for o in observed:
-            stats = lenses.setdefault(o.lens.name, {"expected": 0, "kept": 0, "answers": []})
-            stats["expected"] += 1
-            if o.answer.ok and band(o.answer.value) == band(expected[o.lens.name]):
-                stats["kept"] += 1
-            stats["answers"].append(o.answer.value)
-    return {"cases": len(cases), "failed": failed, "lenses": lenses}
-
-
-__all__ = ["answer_out", "replay", "simulate", "try_lens"]
+__all__ = ["answer_out", "simulate", "try_lens"]

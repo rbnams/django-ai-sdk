@@ -28,6 +28,7 @@ from django_ai_sdk.contrib.ninja.schemas import (
     Tool,
     ToolsResponse,
 )
+from django_ai_sdk.errors import Blocked
 from django_ai_sdk.logger import get_logger
 from django_ai_sdk.permissions import Operation, PermissionDenied
 from django_ai_sdk.views.permissions import aagent_permissions
@@ -266,7 +267,10 @@ async def run_agent(request: HttpRequest, agent_id: str, payload: ChatRequest) -
     agent = await AgentService.get(agent_id)
     await AgentService.has_perms(request.user, Operation.CHAT, agent=agent)
     chat_messages = agent.protocol_handler.to_chat_messages(payload.messages)
-    result = await agent.run(chat_messages, user=request.user)
+    try:
+        result = await agent.run(chat_messages, user=request.user, channel="api")
+    except Blocked as blocked:
+        return RunResponse(result=blocked.message, thread_id="", blocked=True)
     return RunResponse(result=result, thread_id="")
 
 

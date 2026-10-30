@@ -169,9 +169,16 @@ class WebhookIntegration(Integration):
 
     # -- configuration --
 
+    # Set by hand, it wins over what is computed, as on any Integration.
+    _detail: str | None = None
+
     @property
     def detail(self) -> str | None:
-        return self.missing_config() or self._missing_agent()
+        return self._detail or self.missing_config() or self._missing_agent()
+
+    @detail.setter
+    def detail(self, value: str | None) -> None:
+        self._detail = value
 
     def missing_config(self) -> str | None:
         """Reason this integration's own credentials are incomplete, or None."""

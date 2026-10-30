@@ -8,7 +8,8 @@
     ]}
 
 An exporter with `anchor=True` also receives every checkpoint: post it somewhere
-the deployment does not control and history before it can no longer be rewritten.
+the deployment does not control, and a rewrite of the history before it shows to
+anyone who compares the published root with the ledger.
 Exporters never fail a turn; errors are logged. A turn's notifications are sent
 from the task worker (`tasks.export_events`), so a slow receiver never holds a chat
 stream open.

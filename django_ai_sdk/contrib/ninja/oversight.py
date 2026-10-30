@@ -1,9 +1,13 @@
 """Oversight: the turns feed, review queues, policies, insight and the ledger.
 
-Mount behind staff auth; every endpoint checks the oversight domain's permissions
-again, and every read lands on the access log::
+The router brings no auth of its own; it runs under the API's (e.g.
+``NinjaAPI(auth=SessionAuth())``). Every endpoint's service call checks the
+``oversight`` permission domain for ``request.user``: by default staff view,
+review and audit, and only superusers reveal who asked or change policy
+(OversightDefaultPermission; override it in ``AI_SDK_PERMISSIONS``). Reads of
+turns and reviews land on the access log::
 
-    api.add_router("/", get_oversight_router(), auth=staff_auth)
+    api.add_router("/", get_oversight_router())
 """
 
 from __future__ import annotations
@@ -22,18 +26,22 @@ from django_ai_sdk.oversight.schemas import (
     AgentPolicyIn,
     AgentRow,
     AnswererIn,
+    AnswerOut,
     CheckpointOut,
     ObservationOut,
     OverrideIn,
     OverrideOut,
     Overview,
     PolicyIn,
+    PolicyOut,
     PolicySummary,
     RevealOut,
     ReviewOut,
     SimulateIn,
+    SimulateOut,
     TryAnswererIn,
     TryLensIn,
+    TryLensOut,
     TurnDetail,
     TurnFilter,
     TurnPage,
@@ -41,16 +49,13 @@ from django_ai_sdk.oversight.schemas import (
     VerifyOut,
 )
 from django_ai_sdk.oversight.services import OversightService
+from django_ai_sdk.views.schemas import ErrorResponse
 
 routes = ApiRouter()
 
 
 class ReasonIn(Schema):
     reason: str
-
-
-class NoteIn(Schema):
-    note: str = ""
 
 
 class ResolveIn(VerdictIn):
@@ -113,7 +118,10 @@ async def list_oversight_queues(request: HttpRequest) -> Any:
     return await OversightService.queues(user=request.user)
 
 
-@routes.post("/oversight/reviews/{item_id}/", response=ReviewOut)
+# 409: the item was closed already.
+@routes.post(
+    "/oversight/reviews/{item_id}/", response={200: ReviewOut, 409: ErrorResponse, **ERRORS}
+)
 async def resolve_oversight_review(request: HttpRequest, item_id: str, payload: ResolveIn) -> Any:
     verdict = VerdictIn(**payload.model_dump(exclude={"dismiss"}))
     item = await OversightService.resolve_review(
@@ -127,37 +135,36 @@ async def list_oversight_policies(request: HttpRequest) -> Any:
     return await OversightService.list_policies(user=request.user)
 
 
-@routes.get("/oversight/policies/{name}/", response=dict[str, Any])
+@routes.get("/oversight/policies/{name}/", response=PolicyOut)
 async def get_oversight_policy(request: HttpRequest, name: str) -> Any:
     return _found(await OversightService.get_policy(name, user=request.user), "Policy")
 
 
-@routes.post("/oversight/policies/{name}/overrides/", response=dict[str, Any])
+@routes.post("/oversight/policies/{name}/overrides/", response=PolicyOut)
 async def set_oversight_override(request: HttpRequest, name: str, payload: OverrideIn) -> Any:
     policy = await OversightService.set_override(name, payload, user=request.user)
     return _found(policy, "Policy")
 
 
-@routes.post("/oversight/policies/", response={201: dict[str, Any], **ERRORS})
+@routes.post("/oversight/policies/", response={201: PolicyOut, **ERRORS})
 async def create_oversight_policy(request: HttpRequest, payload: PolicyIn) -> Any:
     return 201, await OversightService.create_policy(payload, user=request.user)
 
 
-@routes.post("/oversight/policies/{name}/delete/", response={204: None, **ERRORS})
-async def delete_oversight_policy(request: HttpRequest, name: str, payload: NoteIn) -> Any:
+@routes.delete("/oversight/policies/{name}/", response={204: None, **ERRORS})
+async def delete_oversight_policy(request: HttpRequest, name: str, note: str = "") -> Any:
     _found(
-        await OversightService.delete_policy(name, user=request.user, note=payload.note) or None,
-        "Policy",
+        await OversightService.delete_policy(name, user=request.user, note=note) or None, "Policy"
     )
     return 204, None
 
 
-@routes.post("/oversight/policies/{name}/simulate/", response=dict[str, Any])
+@routes.post("/oversight/policies/{name}/simulate/", response=SimulateOut)
 async def simulate_oversight_policy(request: HttpRequest, name: str, payload: SimulateIn) -> Any:
     return _found(await OversightService.simulate(name, payload, user=request.user), "Policy")
 
 
-@routes.post("/oversight/policies/{name}/try-lens/", response=dict[str, Any])
+@routes.post("/oversight/policies/{name}/try-lens/", response=TryLensOut)
 async def try_oversight_lens(request: HttpRequest, name: str, payload: TryLensIn) -> Any:
     return _found(await OversightService.try_lens(name, payload, user=request.user), "Lens")
 
@@ -185,7 +192,7 @@ async def set_oversight_answerer(request: HttpRequest, alias: str, payload: Answ
     return await OversightService.set_answerer(alias, payload, user=request.user)
 
 
-@routes.post("/oversight/answerers-try/", response=dict[str, Any])
+@routes.post("/oversight/answerers-try/", response=AnswerOut)
 async def try_oversight_answerer(request: HttpRequest, payload: TryAnswererIn) -> Any:
     return await OversightService.try_answerer(payload, user=request.user)
 

@@ -2,6 +2,9 @@
 
     path("api/", include("django_ai_sdk.contrib.drf.urls"))
 
+Oversight has no viewset yet: its console API is Ninja only
+(`django_ai_sdk.contrib.ninja.oversight`). From DRF, call `OversightService`.
+
 Want to change one resource? Register your subclass on your own router instead and
 leave this module out; each viewset is importable from ``django_ai_sdk.contrib.drf``.
 """

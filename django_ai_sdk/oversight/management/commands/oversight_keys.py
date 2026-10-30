@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.core.management.base import BaseCommand
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.base import BaseCommand, CommandError
 
 
 class Command(BaseCommand):
@@ -15,10 +16,14 @@ class Command(BaseCommand):
         from django_ai_sdk.oversight.conf import setting, signing_name
 
         configured = setting("SIGNING_KEY")
-        if configured:
-            self.stdout.write(f"verifier key: {seal.verifier_key(signing_name(), configured)}")
-            return
+        try:
+            if configured:
+                self.stdout.write(f"verifier key: {seal.verifier_key(signing_name(), configured)}")
+                return
+            key = seal.generate_signing_key()
+            verifier = seal.verifier_key(signing_name(), key)
+        except ImproperlyConfigured as exc:
+            raise CommandError(str(exc)) from exc
         self.stdout.write(f"MASTER_KEY  = {vault.generate_master_key()!r}")
-        key = seal.generate_signing_key()
         self.stdout.write(f"SIGNING_KEY = {key!r}")
-        self.stdout.write(f"verifier key: {seal.verifier_key(signing_name(), key)}")
+        self.stdout.write(f"verifier key: {verifier}")
