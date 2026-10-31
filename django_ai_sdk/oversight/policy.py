@@ -43,7 +43,7 @@ CAPTURE_ORDER = [Capture.NONE, Capture.METADATA, Capture.MASKED, Capture.FULL]
 
 # What the overlay may change, per target.
 LENS_FIELDS = {"enabled", "sample", "answerers", "min_confidence", "stages"}
-RULE_FIELDS = {"mode", "when", "then", "message", "stages"}
+RULE_FIELDS = {"mode", "when", "then", "message", "notice", "stages"}
 POLICY_FIELDS = {"capture", "stream_mode", "retention"}
 RETENTION_KEYS = ("content", "metadata")
 # "live" streams the answer as it is written; "hold" sends it once finish passed it;
@@ -84,7 +84,10 @@ class Policy:
 
 
 def pick[T: (Lens | type[Lens], Rule)](
-    items: Iterable[T], *names: str, mode: Mode | str | None = None
+    items: Iterable[T],
+    *names: str,
+    mode: Mode | str | None = None,
+    notice: str | None = None,
 ) -> list[T]:
     """The lenses or rules called `names`, in that order, out of a pack's `lenses` or `rules`.
 
@@ -93,18 +96,21 @@ def pick[T: (Lens | type[Lens], Rule)](
         lenses = pick(SecurityPack.lenses, "prompt_injection", "pii_input")
         rules = pick(SecurityPack.rules, "block_injection", "mask_pii_in_question")
 
-    Rules come back as copies, so `mode` changes the copy and the pack keeps its own.
+    Rules come back as copies, so `mode` and `notice` change the copy and the pack keeps its own.
     """
     by_name = {item.name: item for item in items}
     missing = [name for name in names if name not in by_name]
     if missing:
         raise ImproperlyConfigured(f"Cannot pick {missing}: the choices are {sorted(by_name)}")
     picked = [copy.copy(by_name[name]) for name in names]
-    if mode is not None:
+    if mode is not None or notice is not None:
         for item in picked:
             if not isinstance(item, Rule):
-                raise TypeError("pick(mode=...) applies to rules only")
-            item.mode = Mode(mode)
+                raise TypeError("pick(mode=..., notice=...) applies to rules only")
+            if mode is not None:
+                item.mode = Mode(mode)
+            if notice is not None:
+                item.notice = notice
     return picked
 
 
@@ -577,6 +583,8 @@ def _apply_rule(resolved: ResolvedPolicy, target: str, key: str, value: Any, sou
         rule.stages = tuple(Stage(s) for s in value)
     elif key == "message":
         rule.message = str(value)
+    elif key == "notice":
+        rule.notice = str(value)
     else:
         raise ValueError(f"{key!r} is not a rule setting the overlay may change")
     check_rule(rule, resolved.lenses)

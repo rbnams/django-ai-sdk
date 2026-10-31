@@ -124,6 +124,34 @@ def current_session() -> TurnSession | None:
     return session if session is not None and not session._closed else None
 
 
+# Which action a note is told as: someone alerted weighs more for the person than a queue.
+TOLD_ORDER = ["block", "restrict_tools", "notify", "alert", "queue", "mask"]
+
+
+def rule_notes(matched: list[Matched], told: set[str]) -> list[dict[str, Any]]:
+    """What the person is told about rules that acted: each rule's `notice`, once a turn.
+
+    `kind` is the rule's strongest action that acted, for the client's icon, `also` the
+    others; `stage` where it acted: a refused tool call is told with the answer.
+    """
+    notes: list[dict[str, Any]] = []
+    for match in matched:
+        rule = match.rule
+        if not match.acted or not rule.notice or rule.name in told:
+            continue
+        told.add(rule.name)
+        kinds = [k for k in TOLD_ORDER if k in {a.kind for a in match.acted}]
+        notes.append(
+            {
+                "kind": kinds[0],
+                "also": kinds[1:],
+                "text": str(rule.notice),
+                "stage": str(match.stage),
+            }
+        )
+    return notes
+
+
 @dataclass
 class GateResult:
     """What the gate decided about the question."""
@@ -213,6 +241,8 @@ class TurnSession:
     # Whether each lens's latest answer this turn failed: a lens that failed at one
     # stage stays failed at the next, until it answers again.
     _lens_failed: dict[str, bool] = field(default_factory=dict)
+    # Rules whose notice this turn already carried: each is told once.
+    _told: set[str] = field(default_factory=set)
     # No policy could be chosen or loaded and the gate fails closed: every stage refuses.
     _unloaded: bool = False
 
@@ -988,13 +1018,17 @@ class TurnSession:
         acted = [m for m in matched if m.acted]
         level = setting("CLIENT_DETAIL")
         detail = level == "full" or (level == "staff" and self._staff_view)
-        if not acted and not detail:
+        # The answer's notice also tells what the tool calls set off: they send none.
+        notes = rule_notes([*acted, *self._tool_matches(stage, matched)], self._told)
+        if not acted and not detail and not notes:
             return None
         notice: dict[str, Any] = {
             "turn_id": self.id,
             "stage": str(stage),
             "outcome": str(worst(*(m.outcome() for m in acted))),
         }
+        if notes:
+            notice["notes"] = notes
         if blocked:
             notice["message"] = message
         if finished is not None and finished.replaced:
@@ -1047,6 +1081,7 @@ class TurnSession:
                     "mode": str(m.rule.mode),
                     "acted": [a.kind for a in m.acted],
                     "would": [a.kind for a in m.rule.then],
+                    "notice": str(m.rule.notice),
                 }
                 for m in matches
             ],

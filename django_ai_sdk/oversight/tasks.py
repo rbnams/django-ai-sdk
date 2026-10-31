@@ -430,7 +430,7 @@ async def _after_effects(
 ) -> None:
     """What an enforced reflect rule can still do: mask the stored answer, notify."""
     from django_ai_sdk.oversight.exporters import emit
-    from django_ai_sdk.oversight.session import spans_for
+    from django_ai_sdk.oversight.session import rule_notes, spans_for
 
     masks: list[tuple[list[Any], str]] = []
     rules: list[str] = []
@@ -461,6 +461,27 @@ async def _after_effects(
                 )
     if masks and turn.message_id:
         await _mask_stored(turn, view.output, masks, rules)
+    if (notes := rule_notes(matched, set())) and turn.message_id:
+        await _tell_stored(turn, notes)
+
+
+async def _tell_stored(turn: Turn, notes: list[dict[str, Any]]) -> None:
+    """Add what reflect's rules tell the person to the stored answer, for its next read."""
+    from django_ai_sdk.conversation.models import Message
+
+    message = await Message.objects.filter(id=turn.message_id).afirst()
+    if message is None or not isinstance(message.result, dict):
+        return
+    metadata = dict(message.result.get("metadata") or {})
+    notice = {
+        "turn_id": str(turn.id),
+        "stage": "reflect",
+        "outcome": str(Outcome.FLAGGED),
+        "notes": notes,
+    }
+    metadata["oversight"] = [*(metadata.get("oversight") or []), notice]
+    message.result = {**message.result, "metadata": metadata}
+    await message.asave(update_fields=["result"])
 
 
 async def _mask_stored(

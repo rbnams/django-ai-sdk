@@ -580,6 +580,7 @@ class TestChat:
             "mode": "report",
             "acted": [],
             "would": ["block"],
+            "notice": "",
         } in gate["matches"]
         assert gate["report_outcome"] == "blocked"
         assert stages["finish"]["detail"]["pending"] == ["length"]
@@ -1710,3 +1711,84 @@ class TestReflectOnce:
                 await areflect(turn_id)
         assert (await Turn.objects.aget(id=turn_id)).reflected_at is None
         assert await areflect(turn_id) == 1
+
+
+@register
+class ToldPolicy(Policy):
+    name = "test-told"
+    lenses = [  # noqa: RUF012
+        Flag(
+            name="fraud",
+            question="?",
+            stages=[Stage.GATE],
+            answerers=[Function(lambda lens, v: Answer(value="wire" in v.input))],
+        ),
+        Flag(
+            name="probe",
+            question="?",
+            stages=[Stage.GATE],
+            answerers=[Function(lambda lens, v: Answer(value="probe" in v.input))],
+        ),
+        Flag(
+            name="big",
+            question="?",
+            subject=Subject.TOOL_CALL,
+            stages=[Stage.WATCH],
+            answerers=[Function(lambda lens, v: Answer(value=v.tool_call.name == "pay"))],
+        ),
+    ]
+    rules = [  # noqa: RUF012
+        Rule(
+            "fraud_to_team",
+            when=L("fraud").is_true,
+            then=[Queue("fraud"), Alert("critical")],
+            mode=ENFORCE,
+            notice="The fraud team is alerted.",
+        ),
+        Rule("probe_in_test", when=L("probe").is_true, then=Block(), notice="Would stop it."),
+        Rule(
+            "four_eyes",
+            when=L("big").is_true,
+            then=[Block("Needs a second person."), Queue("four-eyes")],
+            mode=ENFORCE,
+            notice="A colleague approves it.",
+        ),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+class TestRuleNotices:
+    """A rule's notice tells the person what it did, even a queue they would never see."""
+
+    async def test_a_queue_is_told_at_the_gate(self):
+        notice = (await (await start("test-told", "wire it now")).gate()).notice
+        assert notice["outcome"] == "flagged"
+        assert notice["notes"] == [
+            {"kind": "alert", "also": ["queue"], "text": "The fraud team is alerted.", "stage": "gate"}
+        ]
+
+    async def test_a_rule_in_test_mode_tells_nothing(self):
+        assert (await (await start("test-told", "probe")).gate()).notice is None
+        with override_settings(AI_SDK_OVERSIGHT={"CLIENT_DETAIL": "full"}):
+            notice = (await (await start("test-told", "probe")).gate()).notice
+        assert "notes" not in notice
+        [match] = notice["detail"]["matches"]
+        assert match["notice"] == "Would stop it."
+
+    async def test_a_refused_tool_call_is_told_once_with_the_answer(self):
+        session = await start("test-told", "pay the invoice")
+        await session.gate()
+        assert await session.check_tool(ToolCall(name="pay")) == "Needs a second person."
+        assert await session.check_tool(ToolCall(name="pay")) == "Needs a second person."
+        finished = await session.finish("It waits for a colleague.")
+        assert finished.notice["notes"] == [
+            {"kind": "block", "also": ["queue"], "text": "A colleague approves it.", "stage": "watch"}
+        ]
+
+    def test_the_notice_round_trips_and_can_be_picked_and_tuned(self):
+        from django_ai_sdk.oversight.policy import pick
+
+        rule = ToldPolicy.rules[0]
+        assert Rule.from_dict(rule.to_dict()).notice == "The fraud team is alerted."
+        [picked] = pick(ToldPolicy.rules, "fraud_to_team", notice="Told.")
+        assert (picked.notice, rule.notice) == ("Told.", "The fraud team is alerted.")

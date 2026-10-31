@@ -178,6 +178,7 @@ class Rule:
         mode: Mode | str = Mode.REPORT,
         stages: list[Stage | str] | None = None,
         message: str = "",
+        notice: str = "",
         description: str = "",
     ) -> None:
         self.name = name
@@ -188,6 +189,9 @@ class Rule:
         self.stages = tuple(Stage(s) for s in stages or ())
         # Shown to the person when the rule blocks, overriding the action's own.
         self.message = message
+        # Told to the person whenever the rule acts, block or not: "The fraud team is alerted."
+        # Empty: a queue or an alert happens out of their sight.
+        self.notice = notice
         self.description = description
 
     def __repr__(self) -> str:
@@ -204,6 +208,7 @@ class Rule:
             "mode": str(self.mode),
             "stages": [str(s) for s in self.stages],
             "message": self.message,
+            "notice": self.notice,
             "description": self.description,
         }
 
@@ -216,6 +221,7 @@ class Rule:
             mode=node.get("mode", Mode.REPORT),
             stages=node.get("stages") or None,
             message=node.get("message", ""),
+            notice=node.get("notice", ""),
             description=node.get("description", ""),
         )
 

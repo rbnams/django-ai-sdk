@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -264,12 +265,33 @@ def unwrap_tool_output(raw: Any) -> tuple[bool, dict[str, Any]]:
     return False, output
 
 
+def tool_error_text(raw: Any) -> str:
+    """What a client is told about a failed call: oversight's reason, else only the code.
+
+    A tool's own error may quote what it read, so it never leaves the server. A call
+    oversight refused or skipped carries the policy's message, written for the user.
+    """
+    result = raw.get("result") if isinstance(raw, dict) else None
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            result = None
+    # Oversight's stub is exactly {"refused": reason} or {"skipped": reason}.
+    if isinstance(result, dict) and len(result) == 1:
+        reason = result.get("refused") or result.get("skipped")
+        if isinstance(reason, str) and reason:
+            return reason
+    return str(ErrorCode.TOOL_FAILED)
+
+
 def public_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
-    """A stored tool call as a client sees it: a failed result becomes its code."""
-    failed, _ = unwrap_tool_output(tool_call.get("result") or {})
+    """A stored tool call as a client sees it: a failed result becomes its reason or code."""
+    raw = tool_call.get("result") or {}
+    failed, _ = unwrap_tool_output(raw)
     if not failed:
         return tool_call
-    return {**tool_call, "result": {"error": str(ErrorCode.TOOL_FAILED)}}
+    return {**tool_call, "result": {"error": tool_error_text(raw)}}
 
 
 def error_data(code: str, ref: str) -> dict[str, Any]:
@@ -424,7 +446,7 @@ class VercelProtocolHandler(BaseProtocolHandler):
                     failed, output = unwrap_tool_output(tool_call.get("result") or {})
                     if failed:
                         part["state"] = "output-error"
-                        part["errorText"] = str(ErrorCode.TOOL_FAILED)
+                        part["errorText"] = tool_error_text(tool_call.get("result"))
                     else:
                         part["state"] = "output-available"
                         part["output"] = output
@@ -581,7 +603,7 @@ class VercelProtocolHandler(BaseProtocolHandler):
                     if failed:
                         yield ToolOutputErrorPart(
                             tool_call_id=tool_output_event.tool_call_id,
-                            error_text=str(ErrorCode.TOOL_FAILED),
+                            error_text=tool_error_text(tool_output_event.tool_output),
                         )
                     else:
                         yield ToolOutputAvailablePart(

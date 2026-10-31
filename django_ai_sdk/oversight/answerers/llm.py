@@ -13,11 +13,12 @@ constants below, in characters; a longer text keeps its start and its end):
     exchange      last 6, 500 ea  6,000     8 sources, 1,500 each [1]     8,000   -
     output        -               6,000     8 sources, 1,500 each [1]     8,000   -
     sources       -               6,000     8 sources, 1,500 each [2]     -       -
-    tool_call     -               6,000     -                             -       name, arguments [3]
+    tool_call     -               6,000 [4] -                             -       name, arguments [3]
 
     [1] this turn's sources and tool results, then the sources earlier turns found.
     [2] this turn's sources and tool results only.
     [3] the tool's name (200) and its arguments as JSON (4,000).
+    [4] unless the lens sets `reads_question = False`.
 
 A source is its title (200) and its text; a tool result counts as a source titled
 "<tool> result". With them go the judge's instructions, the lens's question and
@@ -112,8 +113,9 @@ def render_turn(lens: Lens, view: TurnView, limits: dict[str, int] | None = None
     if subject is Subject.TOOL_CALL and view.tool_call:
         call = view.tool_call
         arguments = json.dumps(call.arguments, ensure_ascii=False, default=str)
+        if lens.reads_question:
+            parts.append(f"<question>\n{_evidence(view.input, limits['input'])}\n</question>")
         parts.append(
-            f"<question>\n{_evidence(view.input, limits['input'])}\n</question>\n"
             f'<tool_call name="{_attr(call.name)}">\n'
             f"{_evidence(arguments, TOOL_ARGUMENTS_CHARS)}\n</tool_call>"
         )

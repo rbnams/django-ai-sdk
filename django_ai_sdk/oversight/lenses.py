@@ -74,6 +74,9 @@ class Lens:
     # or an earlier turn's (for subject SOURCES, its own): groundedness means nothing
     # without them.
     needs_evidence: bool = False
+    # A tool call is judged beside the question that led to it. Off for a lens that
+    # judges only what the call carries: a note that leaves out what was asked.
+    reads_question: bool = True
 
     def __init__(self, **overrides: Any) -> None:
         for key, value in overrides.items():

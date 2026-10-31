@@ -1138,3 +1138,27 @@ class TestOpenRelease:
         for block in blocks:
             assert isinstance(block.message, Promise), block.message
             assert isinstance(json.loads(json.dumps(block.to_dict()))["message"], str)
+
+
+class TestToolCallWithoutTheQuestion:
+    """A lens on what a call carries can leave out the question that led to it."""
+
+    def test_both_answerers_leave_the_question_out(self):
+        from django_ai_sdk.oversight.answerers.typesafe import typesafe_state
+        from django_ai_sdk.oversight.types import ToolCall
+
+        asked = view("Log it, and the dose goes up to 1000 mg")
+        call = asked.model_copy(
+            update={"tool_call": ToolCall(name="log_visit", arguments={"note": "Ate well."})}
+        )
+        beside = Flag(name="t", question="?", subject=Subject.TOOL_CALL, answerers=[])
+        alone = Flag(
+            name="t", question="?", subject=Subject.TOOL_CALL, answerers=[], reads_question=False
+        )
+
+        assert "1000 mg" in render_turn(beside, call)
+        assert "1000 mg" in str(typesafe_state(beside, call))
+        assert "1000 mg" not in render_turn(alone, call)
+        assert "1000 mg" not in str(typesafe_state(alone, call))
+        assert "Ate well." in render_turn(alone, call)
+        assert typesafe_state(alone, call)["tool_call"]["arguments"] == {"note": "Ate well."}

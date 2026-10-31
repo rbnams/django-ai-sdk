@@ -316,7 +316,8 @@ class Classifier(Answerer):
                 for h in view.history[-self.HISTORY :]
             ]
         # An answer is judged against what was asked, as a model judge reads it too.
-        state["user_message"] = self.text(view.input, self.TEXT_CHARS)
+        if subject is not Subject.TOOL_CALL or lens.reads_question:
+            state["user_message"] = self.text(view.input, self.TEXT_CHARS)
         if subject in {Subject.OUTPUT, Subject.EXCHANGE}:
             state["assistant_reply"] = self.text(view.output, self.TEXT_CHARS)
         # An answer is judged against what earlier turns found too; a search on its own.
