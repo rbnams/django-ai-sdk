@@ -1792,3 +1792,13 @@ class TestRuleNotices:
         assert Rule.from_dict(rule.to_dict()).notice == "The fraud team is alerted."
         [picked] = pick(ToldPolicy.rules, "fraud_to_team", notice="Told.")
         assert (picked.notice, rule.notice) == ("Told.", "The fraud team is alerted.")
+
+    async def test_each_tool_call_keeps_its_own_answer(self):
+        session = await start("test-told", "pay the invoice")
+        await session.gate()
+        assert await session.check_tool(ToolCall(name="pay")) == "Needs a second person."
+        assert await session.check_tool(ToolCall(name="note")) is None
+        await session.finish("Done.")
+        turn = await closed_turn(session)
+        rows = [o async for o in Observation.objects.filter(turn=turn, lens="big")]
+        assert sorted(o.value for o in rows) == [False, True]

@@ -975,6 +975,8 @@ class TurnSession:
 
         Watch asks the same lenses again and again: per lens it keeps one answer,
         the latest, unless an earlier one found something and the latest did not.
+        A tool call's lens is the exception: each call is its own subject, so the
+        record keeps one answer per call, in the order the calls came.
         Every stage keeps each lens's latest failure state.
         """
         for o in observed:
@@ -982,7 +984,7 @@ class TurnSession:
                 # A tool call's lens judges that call alone: its failure is the call's.
                 self._lens_failed[o.lens.name] = o.errored
             kept = o
-            if stage is Stage.WATCH:
+            if stage is Stage.WATCH and o.lens.subject is not Subject.TOOL_CALL:
                 index = next(
                     (
                         i
