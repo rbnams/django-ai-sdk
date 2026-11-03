@@ -1002,12 +1002,12 @@ class Stream:
             session.on_tool_results = refused_results
         stopped: FinishResult | None = None
         session_finished = False
+        # Every notice this turn sent, stored on the message so a reloaded thread
+        # shows them again, also when the stream fails or the client goes away.
+        sent: list[dict[str, Any]] = []
 
         try:
             yield MessageStartEvent(message_id=message_id)
-            # Every notice this turn sent, stored on the message so a reloaded
-            # thread shows them again.
-            sent: list[dict[str, Any]] = []
             if session is not None:
                 for notice in session.notices:
                     sent.append(notice)
@@ -1111,6 +1111,8 @@ class Stream:
                     pipeline_error,
                 )
                 if stream_writer:
+                    if sent:
+                        stream_writer.message.metadata["oversight"] = stored_notices(sent)
                     stream_writer.add_chunk(get_error_chunk(pipeline_error, info))
                     if session is not None:
                         _store_unchecked(stream_writer)
@@ -1187,6 +1189,8 @@ class Stream:
                 critical_error,
             )
             if stream_writer and not _finalize_called:
+                if sent:
+                    stream_writer.message.metadata["oversight"] = stored_notices(sent)
                 stream_writer.add_chunk(get_error_chunk(critical_error, info))
                 if session is not None and not session_finished:
                     _store_unchecked(stream_writer)
@@ -1206,6 +1210,8 @@ class Stream:
                 except (TimeoutError, asyncio.CancelledError, Exception):
                     pass
             if stream_writer and not _finalize_called:
+                if sent:
+                    stream_writer.message.metadata["oversight"] = stored_notices(sent)
                 if session is not None and not session_finished:
                     _store_unchecked(stream_writer)
                 self.message_result = await stream_writer.finalize("cancelled")

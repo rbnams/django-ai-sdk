@@ -761,6 +761,51 @@ class TestHold:
                 await task
         assert [(m.content, m.finish_reason) for m in storage.stored] == [("", "cancelled")]
 
+    async def test_a_disconnect_keeps_the_notices_already_sent(self):
+        import asyncio
+
+        from django_ai_sdk.views.schemas import Message
+
+        async def slow(lens, view):
+            await asyncio.sleep(0.5)
+            return True
+
+        @register
+        class SlowNotices(Policy):
+            name = "test-held-slow-notices"
+            stream_mode = "hold"
+            lenses = [
+                Flag(
+                    name="bad",
+                    question="?",
+                    subject=Subject.OUTPUT,
+                    stages=[Stage.FINISH],
+                    answerers=[Function(slow)],
+                )
+            ]
+            rules = [Rule("withhold", when=L("bad").is_true, then=Block("No."), mode=ENFORCE)]
+
+        storage = Storage()
+        agent = make_agent(["The secret plan is X."], storage, policy="test-held-slow-notices")
+        message = Message.model_validate(
+            {"role": "user", "parts": [{"type": "text", "text": "plan?"}]}
+        )
+        settings = {"FINISH_DEADLINE_MS": 5000, "CLIENT_DETAIL": "full"}
+        with override_settings(AI_SDK_OVERSIGHT=settings):
+            response = await agent.as_view([message])
+
+            async def consume():
+                async for _ in response.streaming_content:
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.sleep(0.25)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        # The gate's notice reached the client before it left: a reload shows it again.
+        assert [n["stage"] for n in storage.stored[0].metadata["oversight"]] == ["gate"]
+
     async def test_the_end_of_an_answer_is_watched(self):
         # Too short for a watch check while it streams; finish watches what is left.
         storage = Storage()
